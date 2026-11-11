@@ -6,6 +6,13 @@ from enum import Enum
 from typing import Any
 from pydantic import BaseModel, Field
 
+from symposium_studio.models.growth import (
+    CandidateEditEvaluation,
+    CreativeDirectorGateReview,
+    GrowthObjectiveProposal,
+    RelevanceAssessment,
+)
+
 
 class ResearchMode(str, Enum):
     INEXPENSIVE = "inexpensive"
@@ -34,9 +41,18 @@ class AgentProposal(BaseModel):
 class ModeratorChallenge(BaseModel):
     challenge_id: str
     target_proposal_id: str
-    issue_type: str  # disagreement | unsupported_assumption | factuality_check | pacing_conflict
+    issue_type: str  # disagreement | unsupported_assumption | factuality_check | pacing_conflict | asr_confidence_hazard
     description: str
     resolution: str
+
+
+class DebateTurn(BaseModel):
+    round_number: int
+    speaker_agent_id: str
+    target_agent_id: str | None = None
+    message: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    decision_impact: str = ""
 
 
 class StoryboardBeat(BaseModel):
@@ -76,10 +92,18 @@ class SymposiumSession(BaseModel):
     session_id: str
     project_id: str
     mode: ResearchMode
-    backend_used: str = "deterministic_local"
+    backend_used: str = "deterministic_analytical"
+    llm_calls_count: int = 0
     participating_agents: list[str] = Field(default_factory=list)
     proposals: list[AgentProposal] = Field(default_factory=list)
+    debate_turns: list[DebateTurn] = Field(default_factory=list)
     challenges: list[ModeratorChallenge] = Field(default_factory=list)
     decisions: list[SymposiumDecision] = Field(default_factory=list)
+    revision_history: list[str] = Field(default_factory=list)
+    relevance_assessment: RelevanceAssessment | None = None
+    candidate_evaluations: list[CandidateEditEvaluation] = Field(default_factory=list)
+    growth_objective: GrowthObjectiveProposal | None = None
+    creative_director_review: CreativeDirectorGateReview | None = None
+    prior_learnings_applied: list[str] = Field(default_factory=list)
     storyboard: Storyboard
     created_at: str

@@ -39,12 +39,20 @@ class PublicEngagementMetrics(BaseModel):
     """Strictly platform-scoped public metrics; private analytics are never fabricated."""
 
     platform: ResearchPlatform
-    metric_source: str = Field(description="official_api | user_supplied | curated_structural_benchmark")
+    metric_source: str = Field(
+        description="official_api | official_public_rss | official_oembed_public | user_supplied | curated_structural_benchmark"
+    )
     views: int | None = None
     likes: int | None = None
     comments: int | None = None
     shares_or_reposts: int | None = None
     subscribers_or_followers_at_capture: int | None = None
+    channel_baseline_views: int | None = None
+    audience_normalized_ratio: float | None = Field(
+        default=None,
+        description="Views divided by channel baseline views (or subscriber baseline) when available.",
+    )
+    views_per_day: float | None = None
     published_at: str | None = None
     captured_at: str | None = None
     # Note: retention & CTR intentionally omitted unless supplied from authorized analytics
@@ -84,8 +92,9 @@ class ViralContentItem(BaseModel):
     platform_relative_score: float = Field(
         ge=0.0,
         le=100.0,
-        description="Percentile/momentum score strictly computed within the same platform and cohort.",
+        description="Percentile/momentum score strictly computed within the same platform and cohort (0.0 if unscored).",
     )
+    score_basis: str = "unscored_structural_benchmark"  # audience_normalized_breakout | within_platform_normalized | unscored_structural_benchmark
     provenance_type: str = "curated_public_study"  # curated_public_study | official_api | explicit_import
 
 

@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -88,12 +88,43 @@ class ViralImportRequest(BaseModel):
 class GrowthMetricRequest(BaseModel):
     platform: str
     views_or_impressions: int
+    first_7d_views: int | None = None
     likes_or_reactions: int = 0
     comments: int = 0
     shares: int = 0
+    new_subscribers_or_followers: int = 0
+    avg_view_duration_sec: float | None = None
+    watch_time_minutes: float | None = None
+    authorized_ctr_pct: float | None = None
+    authorized_retention_pct: float | None = None
     telegram_clicks: int = 0
     telegram_joins: int = 0
+    measurement_mode: str = "cumulative"
+    external_post_id: str | None = None
+    subscriber_or_member_count: int | None = None
     notes: str = ""
+
+
+class DiscoverRequest(BaseModel):
+    target_count: int = 100
+    categories: list[str] | None = None
+    query: str | None = None
+
+
+class InspectUrlRequest(BaseModel):
+    url: str
+
+
+class StyleCloneRequest(BaseModel):
+    reference_video_path: str
+
+
+class TelegramSyncRequest(BaseModel):
+    chat_id: str
+
+
+class GrowthImportRequest(BaseModel):
+    records: list[dict[str, Any]]
 
 
 def create_app(config: StudioConfig | None = None) -> FastAPI:
@@ -119,6 +150,7 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             "status": "ok",
             "version": "0.2.0",
             "workspaces_root": str(cfg.workspaces_root),
+            "llm_backend": studio.symposium.llm.detect_backend(),
             "adapters": [c.model_dump(mode="json") for c in studio.animations.list_capabilities()],
             "connectors": studio.research.connector_statuses(),
             "agents_count": len(AGENT_ROSTER),
@@ -201,6 +233,31 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
         )
         saved = studio.research.add_item(item)
         return saved.model_dump(mode="json")
+
+    @app.post("/api/research/discover")
+    def discover_research(req: DiscoverRequest = DiscoverRequest()) -> dict[str, Any]:
+        return studio.discover_live_research(
+            target_count=req.target_count,
+            categories=req.categories,
+            query=req.query,
+        )
+
+    @app.post("/api/research/inspect-url")
+    def inspect_research_url(req: InspectUrlRequest) -> dict[str, Any]:
+        item = studio.inspect_research_url(req.url)
+        if not item:
+            raise HTTPException(status_code=404, detail="Could not retrieve public YouTube oEmbed metadata for URL.")
+        return item.model_dump(mode="json")
+
+    @app.post("/api/projects/{project_id}/style-from-reference")
+    def clone_style(project_id: str, req: StyleCloneRequest) -> dict[str, Any]:
+        ref = Path(req.reference_video_path)
+        if not ref.exists():
+            raise HTTPException(status_code=404, detail=f"Reference video not found: {ref}")
+        try:
+            return studio.apply_reference_style(project_id, ref)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     @app.get("/api/research/reports")
     def list_reports() -> list[dict[str, Any]]:
@@ -304,13 +361,70 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             project_id=project_id,
             platform=req.platform,
             views_or_impressions=req.views_or_impressions,
+            first_7d_views=req.first_7d_views,
             likes_or_reactions=req.likes_or_reactions,
             comments=req.comments,
             shares=req.shares,
+            new_subscribers_or_followers=req.new_subscribers_or_followers,
+            avg_view_duration_sec=req.avg_view_duration_sec,
+            watch_time_minutes=req.watch_time_minutes,
+            authorized_ctr_pct=req.authorized_ctr_pct,
+            authorized_retention_pct=req.authorized_retention_pct,
             telegram_clicks=req.telegram_clicks,
             telegram_joins=req.telegram_joins,
+            measurement_mode=req.measurement_mode,
+            external_post_id=req.external_post_id,
+            subscriber_or_member_count=req.subscriber_or_member_count,
             notes=req.notes,
         ).model_dump(mode="json")
+
+    @app.post("/api/growth/{project_id}/evaluate")
+    def evaluate_experiments(project_id: str) -> dict[str, Any]:
+        evaluated = studio.evaluate_growth_experiments(project_id)
+        return {"project_id": project_id, "evaluated_count": len(evaluated), "experiments": evaluated}
+
+    @app.get("/api/growth/experiments")
+    def list_growth_experiments(
+        q: str | None = None,
+        platform: str | None = None,
+        project_id: str | None = None,
+        limit: int = Query(default=50, le=200),
+    ) -> list[dict[str, Any]]:
+        return studio.search_experiments(query=q, platform=platform, project_id=project_id, limit=limit)
+
+    @app.post("/api/growth/{project_id}/telegram-sync")
+    def sync_telegram(project_id: str, req: TelegramSyncRequest) -> dict[str, Any]:
+        try:
+            return studio.growth.sync_telegram_channel_stats(project_id, req.chat_id).model_dump(mode="json")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/growth/{project_id}/import")
+    def import_growth(project_id: str, req: GrowthImportRequest) -> dict[str, Any]:
+        try:
+            snaps = studio.growth.import_analytics_records(project_id, req.records)
+            return {"imported_count": len(snaps), "snapshots": [s.model_dump(mode="json") for s in snaps]}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/funnel/{link_id}/event")
+    def funnel_event(link_id: str, clicks_delta: int = 1, conversions_delta: int = 0) -> dict[str, Any]:
+        studio.db.record_funnel_event(link_id, clicks_delta=clicks_delta, conversions_delta=conversions_delta)
+        links = [l for l in studio.db.list_funnel_links() if l["link_id"] == link_id]
+        if not links:
+            raise HTTPException(status_code=404, detail="Funnel link not found.")
+        return links[0]
+
+    @app.get("/r/{link_id}")
+    def redirect_funnel_link(link_id: str) -> RedirectResponse:
+        links = [l for l in studio.db.list_funnel_links() if l["link_id"] == link_id]
+        if not links:
+            raise HTTPException(status_code=404, detail="Funnel link not found.")
+        target = str(links[0].get("tagged_url", ""))
+        if not target.startswith("https://t.me/"):
+            raise HTTPException(status_code=400, detail="Unsafe redirect target outside https://t.me/ rejected.")
+        studio.db.record_funnel_event(link_id, clicks_delta=1)
+        return RedirectResponse(url=target, status_code=302)
 
     @app.get("/api/growth")
     def get_growth(project_id: str | None = None) -> dict[str, Any]:

@@ -23,8 +23,20 @@ from symposium_studio.models.animation import (
 )
 
 
+def _safe_script_json(payload: dict) -> str:
+    """Serialize JSON safely for inline <script> embedding (neutralizes closing script/HTML chars)."""
+    return (
+        json.dumps(payload)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def _build_canvas_html(spec: SceneSpec) -> str:
-    spec_json = json.dumps(spec.model_dump(mode="json"))
+    spec_json = _safe_script_json(spec.model_dump(mode="json"))
     bg_css = "transparent" if spec.transparent_background else spec.theme_palette.get("bg", "#0B1020")
     return f"""<!DOCTYPE html>
 <html>
@@ -408,6 +420,135 @@ function renderTimeline(t, dur, box) {{
   ctx.restore();
 }}
 
+function renderSystemArchitecture(t, dur, box) {{
+  const {{ padX, padY, cardW, cardH }} = box;
+  const stages = (SPEC.parameters && SPEC.parameters.stages) || [
+    {{ name: 'Ingest', metric: '1.2k req/s', color: '#38BDF8' }},
+    {{ name: 'Queue', metric: 'p99 4ms', color: '#F59E0B' }},
+    {{ name: 'Compute', metric: '6x workers', color: '#34D399' }},
+    {{ name: 'Storage', metric: 'Vector DB', color: '#A78BFA' }},
+  ];
+  const n = Math.max(2, stages.length);
+  const yCenter = padY + cardH * 0.50;
+  const sideMargin = Math.min(230, Math.max(190, cardW * 0.14));
+  const startX = padX + sideMargin;
+  const endX = padX + cardW - sideMargin;
+  const span = Math.max(120, endX - startX);
+  const cardWBox = Math.min(248, (cardW - 140) / (n + 0.55));
+  const cardHBox = 148;
+  const rate = Number((SPEC.parameters && SPEC.parameters.packet_rate_hz) || 1.6);
+
+  ctx.save();
+  // Connecting backbone bus
+  ctx.strokeStyle = 'rgba(148,163,184,0.35)';
+  ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(startX, yCenter); ctx.lineTo(endX, yCenter); ctx.stroke();
+
+  // Traveling animated packets
+  for (let p = 0; p < 4; p++) {{
+    const frac = ((t * rate * 0.28) + p * 0.25) % 1.0;
+    const px = startX + span * frac;
+    ctx.fillStyle = '#38BDF8';
+    ctx.beginPath(); ctx.arc(px, yCenter, 10, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(56,189,248,0.22)';
+    ctx.beginPath(); ctx.arc(px, yCenter, 22, 0, Math.PI * 2); ctx.fill();
+  }}
+
+  stages.forEach((st, idx) => {{
+    const frac = n <= 1 ? 0.5 : idx / (n - 1);
+    const cx = startX + span * frac;
+    const bx = cx - cardWBox / 2;
+    const by = yCenter - cardHBox / 2;
+    const pulse = 0.5 + 0.5 * Math.sin(t * rate * Math.PI - idx * 0.9);
+    const col = st.color || '#38BDF8';
+    drawRoundedRect(bx, by, cardWBox, cardHBox, 18, 'rgba(15,23,42,0.96)', col, 2.5 + pulse * 1.5);
+    ctx.fillStyle = col;
+    ctx.font = '700 18px Menlo, monospace';
+    ctx.fillText('0' + (idx + 1), bx + 20, by + 34);
+    ctx.fillStyle = '#F8FAFC';
+    ctx.font = '700 24px Helvetica Neue';
+    ctx.fillText(String(st.name || 'Stage').slice(0, 16), bx + 20, by + 76);
+    ctx.fillStyle = '#CBD5E1';
+    ctx.font = '500 18px Menlo, monospace';
+    ctx.fillText(String(st.metric || '').slice(0, 18), bx + 20, by + 114);
+    if (idx < n - 1) {{
+      const nextCx = startX + span * ((idx + 1) / (n - 1));
+      drawArrow(cx + cardWBox/2 + 8, yCenter, nextCx - cardWBox/2 - 8, yCenter, '#94A3B8', 3);
+    }}
+  }});
+
+  ctx.fillStyle = '#94A3B8';
+  ctx.font = '500 20px Helvetica Neue';
+  const footerText = String((SPEC.parameters && SPEC.parameters.footer_label) || ('Signal Flow: ' + stages.map((s) => String(s.name || 'Stage')).join('  ->  ')));
+  ctx.fillText(footerText.slice(0, 90), padX + 52, padY + cardH - 46);
+  ctx.restore();
+}}
+
+function renderWaveInterference(t, dur, box) {{
+  const {{ padX, padY, cardW, cardH }} = box;
+  const k1 = Number((SPEC.parameters && SPEC.parameters.k1) || 3.0);
+  const k2 = Number((SPEC.parameters && SPEC.parameters.k2) || 3.7);
+  const w1 = Number((SPEC.parameters && SPEC.parameters.omega1) || 4.2);
+  const w2 = Number((SPEC.parameters && SPEC.parameters.omega2) || 4.9);
+  const phi = Number((SPEC.parameters && SPEC.parameters.phase_rad) || 0.0);
+
+  const x0 = padX + 60;
+  const plotW = cardW - 120;
+  const rows = [
+    {{ yMid: padY + cardH * 0.28, amp: 44, peakMult: 0.65, color: '#38BDF8', label: 'y1(x,t) = A sin(k1*x - w1*t)', fn: (xn) => Math.sin(k1 * xn * Math.PI * 2 - w1 * t) }},
+    {{ yMid: padY + cardH * 0.52, amp: 44, peakMult: 0.65, color: '#F59E0B', label: 'y2(x,t) = A sin(k2*x - w2*t + phi)', fn: (xn) => Math.sin(k2 * xn * Math.PI * 2 - w2 * t + phi) }},
+    {{ yMid: padY + cardH * 0.81, amp: 38, peakMult: 1.30, color: '#34D399', label: 'Superposition y(x,t) = y1 + y2 (Beat Envelope)', fn: (xn) => Math.sin(k1 * xn * Math.PI * 2 - w1 * t) + Math.sin(k2 * xn * Math.PI * 2 - w2 * t + phi) }},
+  ];
+
+  ctx.save();
+  rows.forEach((row) => {{
+    ctx.strokeStyle = 'rgba(148,163,184,0.22)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(x0, row.yMid); ctx.lineTo(x0 + plotW, row.yMid); ctx.stroke();
+
+    ctx.fillStyle = row.color;
+    ctx.font = '600 20px Menlo, monospace';
+    ctx.fillText(row.label, x0, row.yMid - row.amp * row.peakMult - 20);
+
+    ctx.strokeStyle = row.color;
+    ctx.lineWidth = row.color === '#34D399' ? 4.5 : 3;
+    ctx.beginPath();
+    for (let i = 0; i <= 180; i++) {{
+      const xn = i / 180;
+      const px = x0 + xn * plotW;
+      const py = row.yMid - row.amp * 0.65 * row.fn(xn);
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }}
+    ctx.stroke();
+  }});
+  ctx.restore();
+}}
+
+function renderKineticCallout(t, dur, box) {{
+  const {{ padX, padY, cardW, cardH }} = box;
+  const p = easeInOut(clamp01(t / Math.min(1.1, Math.max(0.4, dur))));
+  const head = String((SPEC.parameters && SPEC.parameters.headline) || SPEC.title || 'Key Insight');
+  const sub = String((SPEC.parameters && SPEC.parameters.subtitle) || 'Evidence-backed visual callout');
+  const cx = padX + cardW / 2;
+  const cy = padY + cardH * 0.52;
+
+  ctx.save();
+  const scale = 0.92 + 0.08 * p;
+  ctx.translate(cx, cy);
+  ctx.scale(scale, scale);
+  drawRoundedRect(-cardW * 0.38, -110, cardW * 0.76, 220, 22, 'rgba(15,23,42,0.96)', '#F59E0B', 3.5);
+  ctx.fillStyle = '#F59E0B';
+  ctx.font = '700 20px Menlo, monospace';
+  ctx.fillText('KEY TAKEAWAY', -cardW * 0.34, -56);
+  ctx.fillStyle = '#F8FAFC';
+  ctx.font = '800 42px Helvetica Neue';
+  ctx.fillText(head.slice(0, 46), -cardW * 0.34, 8);
+  ctx.fillStyle = '#CBD5E1';
+  ctx.font = '500 24px Helvetica Neue';
+  ctx.fillText(sub.slice(0, 68), -cardW * 0.34, 62);
+  ctx.restore();
+}}
+
 window.renderAtTime = function(t, dur) {{
   ctx.clearRect(0, 0, W, H);
   const fade = Math.min(1, t / 0.35, Math.max(0.0, (dur - t) / 0.35));
@@ -422,8 +563,14 @@ window.renderAtTime = function(t, dur) {{
     renderRlcCircuit(t, dur, box);
   }} else if (SPEC.template_id === 'binary_tree_trace') {{
     renderTreeTrace(t, dur, box);
-  }} else {{
+  }} else if (SPEC.template_id === 'system_architecture_flow') {{
+    renderSystemArchitecture(t, dur, box);
+  }} else if (SPEC.template_id === 'wave_interference_sim') {{
+    renderWaveInterference(t, dur, box);
+  }} else if (SPEC.template_id === 'narrative_timeline') {{
     renderTimeline(t, dur, box);
+  }} else {{
+    renderKineticCallout(t, dur, box);
   }}
 }};
 

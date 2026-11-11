@@ -118,7 +118,11 @@ def build_timeline_from_storyboard(
     for idx, beat in enumerate(storyboard.beats):
         src_start = max(0.0, beat.source_start_sec)
         src_end = min(analysis.probe.duration_sec, max(src_start + 1.0, beat.source_end_sec))
-        dur = round(src_end - src_start, 3)
+        raw_dur = round(src_end - src_start, 3)
+        spd = 1.0
+        if beat.target_duration_sec > 0.5 and abs(raw_dur - beat.target_duration_sec) / max(1.0, raw_dur) > 0.03:
+            spd = round(max(0.85, min(1.30, raw_dur / beat.target_duration_sec)), 3)
+        dur = round(raw_dur / spd, 3)
         tl_start = round(cur_t, 3)
         tl_end = round(cur_t + dur, 3)
 
@@ -132,7 +136,7 @@ def build_timeline_from_storyboard(
             source_end_sec=src_end,
             timeline_start_sec=tl_start,
             timeline_end_sec=tl_end,
-            playback_speed=1.0,
+            playback_speed=spd,
             crop_center_x=_crop_x_for_window(analysis, src_start, src_end),
             zoom_scale=round(zoom, 3),
             label=f"{beat.role}: {beat.visual_treatment}",
@@ -140,7 +144,7 @@ def build_timeline_from_storyboard(
         )
         clips.append(clip)
 
-        # Map verbatim captions into output timeline
+        # Map verbatim captions into output timeline (synced to playback_speed)
         for seg in analysis.transcript.segments:
             captions.extend(
                 _split_segment_into_short_cues(
@@ -148,7 +152,7 @@ def build_timeline_from_storyboard(
                     clip_src_start=src_start,
                     clip_src_end=src_end,
                     clip_tl_start=tl_start,
-                    speed=1.0,
+                    speed=spd,
                     max_words=4 if is_vertical else 6,
                     style_preset=style.caption_preset,
                 )
@@ -208,6 +212,20 @@ def build_timeline_from_storyboard(
             )
         cur_t = tl_end
 
+    # Attach subtle ambient music bed ducked automatically under speech when synthesized
+    if "ambient_bed" in sfx_map and cur_t > 1.0:
+        audio_events.append(
+            AudioNode(
+                audio_id=f"mus_{uuid.uuid4().hex[:6]}",
+                source_path=sfx_map["ambient_bed"],
+                role="music",
+                timeline_start_sec=0.0,
+                duration_sec=round(cur_t, 3),
+                gain_db=-20.0,
+                duck_under_speech=True,
+            )
+        )
+
     # Platform-specific safe caption settings
     cap_settings = CaptionSettings(
         enabled=True,
@@ -251,45 +269,91 @@ def build_vertical_short_timelines(
     max_variants: int = 3,
     sfx_paths: dict[str, str] | None = None,
 ) -> list[RenderTimeline]:
-    """Create distinct vertical 9:16 edit plans for Shorts / TikTok / Reels from top self-contained highlights."""
+    """Create genuinely distinct vertical 9:16 edit plans (Hook / Mechanism / Payoff) across the video."""
     ranked = sorted(
         analysis.highlights,
         key=lambda h: (h.scores.audience_curiosity + h.scores.context_dependency + h.scores.visual_opportunity),
         reverse=True,
     )
     chosen = ranked[:max_variants] if ranked else []
+
+    # If video is longer than ~45s and fewer than max_variants distinct highlights exist, partition clean non-overlapping slices
+    total_dur = float(analysis.probe.duration_sec or 0.0)
+    if len(chosen) < max_variants and total_dur >= 24.0:
+        from symposium_studio.models.media import HighlightProposal, HighlightScoreBreakdown
+
+        seg_len = min(35.0, max(12.0, total_dur / max_variants))
+        existing_starts = [round(h.start_sec, 1) for h in chosen]
+        for slot in range(max_variants):
+            if len(chosen) >= max_variants:
+                break
+            st = round(slot * (total_dur / max_variants), 2)
+            en = round(min(total_dur, st + seg_len), 2)
+            if any(abs(st - es) < 4.0 for es in existing_starts) or en - st < 8.0:
+                continue
+            chosen.append(
+                HighlightProposal(
+                    highlight_id=f"hl_slice_{slot}",
+                    start_sec=st,
+                    end_sec=en,
+                    duration_sec=round(en - st, 2),
+                    role="payoff" if slot == max_variants - 1 else "short_candidate",
+                    title=f"Short Segment {slot + 1}",
+                    transcript_excerpt="",
+                    scores=HighlightScoreBreakdown(
+                        information_density=0.75,
+                        novelty=0.72,
+                        story_relevance=0.78,
+                        audience_curiosity=0.72,
+                        educational_value=0.78,
+                        emotional_intensity=0.65,
+                        visual_opportunity=0.75,
+                        context_dependency=0.78,
+                        composite_score=0.75,
+                    ),
+                )
+            )
+            existing_starts.append(round(st, 1))
+
+    role_labels = ["Hook Cut", "Mechanism Breakdown", "Payoff & Takeaway"]
     out: list[RenderTimeline] = []
-    for v_idx, hl in enumerate(chosen):
+    for v_idx, hl in enumerate(chosen[:max_variants]):
         from symposium_studio.models.symposium import StoryboardBeat
 
+        tag = role_labels[v_idx] if v_idx < len(role_labels) else f"Variant {v_idx + 1}"
+        # Composite animation on either explicit visual highlight or Variant #1 (#0 is hook, #1 is mechanism)
+        attach_anim = animation_result is not None and (
+            (v_idx == 0 and hl.visual_opportunity_type is not None)
+            or (v_idx == 1 and animation_result is not None)
+        )
         sb = Storyboard(
             storyboard_id=f"sb_short_{v_idx}_{uuid.uuid4().hex[:5]}",
             project_id=project_id,
             target_format=platform_format.value,
-            selected_strategy=f"Short-Form Viral Hook ({platform_format.value})",
-            target_duration_sec=min(48.0, max(18.0, hl.duration_sec)),
+            selected_strategy=f"Short-Form {tag} ({platform_format.value})",
+            target_duration_sec=min(48.0, max(12.0, hl.duration_sec)),
             beats=[
                 StoryboardBeat(
                     beat_index=0,
-                    role="hook",
+                    role="hook" if v_idx == 0 else "animation_explainer" if attach_anim else "payoff",
                     source_start_sec=hl.start_sec,
                     source_end_sec=min(hl.end_sec, hl.start_sec + 45.0),
                     target_duration_sec=min(45.0, hl.duration_sec),
                     visual_treatment="face_tracked_vertical_with_animation",
-                    animation_template=hl.visual_opportunity_type if v_idx == 0 else None,
+                    animation_template=hl.visual_opportunity_type if attach_anim else None,
                     caption_directive="kinetic_caption_pop",
-                    audio_directive="speech_loudness_polish",
+                    audio_directive="speech_loudness_polish+ducked_ambient_bed",
                     evidence_ids=[hl.highlight_id],
                 )
             ],
         )
         tl = build_timeline_from_storyboard(
             project_id=project_id,
-            title=f"{base_title} [{platform_format.value} #{v_idx + 1}]",
+            title=f"{base_title} [{platform_format.value} #{v_idx + 1}: {tag}]",
             analysis=analysis,
             storyboard=sb,
             style_name="short_form_viral",
-            animation_result=animation_result if v_idx == 0 else None,
+            animation_result=animation_result if attach_anim else None,
             platform_format=platform_format,
             sfx_paths=sfx_paths,
         )
@@ -410,6 +474,39 @@ def apply_iterative_edit(timeline: RenderTimeline, instruction: str) -> tuple[Re
     if "disable caption" in low or "remove caption" in low:
         tl.caption_settings.enabled = False
         changes.append("Disabled burned-in captions.")
+
+    if "speed up" in low or "faster" in low or "1.1x" in low or "slow down" in low or "slower" in low:
+        factor = 0.94 if ("slow down" in low or "slower" in low) else 1.12
+        cur = 0.0
+        for clip in tl.clips:
+            old_dur = max(0.2, clip.timeline_end_sec - clip.timeline_start_sec)
+            clip.playback_speed = round(max(0.75, min(1.5, clip.playback_speed * factor)), 3)
+            new_dur = round((clip.source_end_sec - clip.source_start_sec) / clip.playback_speed, 3)
+            old_start = clip.timeline_start_sec
+            clip.timeline_start_sec = round(cur, 3)
+            clip.timeline_end_sec = round(cur + new_dur, 3)
+            ratio = new_dur / old_dur
+            for cap in tl.captions:
+                if cap.start_sec >= old_start - 0.01 and cap.start_sec < old_start + old_dur + 0.01:
+                    cap.start_sec = round(cur + (cap.start_sec - old_start) * ratio, 3)
+                    cap.end_sec = round(max(cap.start_sec + 0.2, cur + (cap.end_sec - old_start) * ratio), 3)
+            cur += new_dur
+        changes.append(f"Adjusted clip playback speeds by {factor}x and rescaled caption sync timestamps.")
+
+    if "cross dissolve" in low or "dissolve" in low or "dip to black" in low or "dip black" in low:
+        t_type = "dip_black" if "dip" in low else "cross_dissolve"
+        for c_i, clip in enumerate(tl.clips):
+            if c_i > 0:
+                clip.transition_in = TransitionSpec(type=t_type, duration_sec=0.22)
+        changes.append(f"Set segment transition_in to `{t_type}`.")
+
+    if "remove overlay" in low or "disable overlay" in low:
+        tl.overlays = []
+        changes.append("Cleared all animation/graphic overlays.")
+
+    if "mute music" in low or "no music" in low or "remove music" in low:
+        tl.audio_events = [a for a in tl.audio_events if a.role != "music"]
+        changes.append("Removed background music bed tracks.")
 
     if not changes:
         changes.append(f"Recorded revision note: {instruction}")

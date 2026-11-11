@@ -115,6 +115,74 @@ def build_scene_spec(
             ],
         )
 
+    if template_id == "system_architecture_flow":
+        return SceneSpec(
+            scene_id=scene_id,
+            title=title or "Distributed Ingestion & Streaming Pipeline Flow",
+            domain=AnimationDomain.PROGRAMMING,
+            template_id=template_id,
+            factuality_mode=FactualityMode.FACTUAL_SCIENTIFIC,
+            duration_sec=duration_sec,
+            width=width,
+            height=height,
+            fps=fps,
+            transparent_background=transparent_background,
+            preferred_adapter=preferred_adapter,
+            scientific_notes=[
+                "Stage-by-stage packet flow illustrating queue buffering, worker compute, and cold storage.",
+                "Throughput & stage latency bars reflect configured simulation parameters.",
+            ],
+            parameters={
+                "stages": params.get(
+                    "stages",
+                    [
+                        {"name": "Ingest Edge", "metric": "1.2k req/s", "color": "#38BDF8"},
+                        {"name": "Queue Buffer", "metric": "p99 4.2 ms", "color": "#F59E0B"},
+                        {"name": "Worker Pool", "metric": "6x parallel", "color": "#34D399"},
+                        {"name": "Vector Index", "metric": "HNSW persist", "color": "#A78BFA"},
+                    ],
+                ),
+                "packet_rate_hz": 1.8,
+                **params,
+            },
+            elements=[
+                SceneElementSpec(element_id="pipeline_nodes", kind="node_stage", label="Pipeline Stages"),
+                SceneElementSpec(element_id="packet_bus", kind="data_packet", label="Animated Packet Flow"),
+            ],
+        )
+
+    if template_id == "wave_interference_sim":
+        return SceneSpec(
+            scene_id=scene_id,
+            title=title or "Acoustic & Electromagnetic Wave Superposition",
+            domain=AnimationDomain.PHYSICS,
+            template_id=template_id,
+            factuality_mode=FactualityMode.FACTUAL_SCIENTIFIC,
+            duration_sec=duration_sec,
+            width=width,
+            height=height,
+            fps=fps,
+            transparent_background=transparent_background,
+            preferred_adapter=preferred_adapter,
+            scientific_notes=[
+                "Linear superposition principle: y_sum(x,t) = A1*sin(k1*x - w1*t) + A2*sin(k2*x - w2*t + phi).",
+                "Demonstrates constructive vs destructive beat envelope cleanly.",
+            ],
+            parameters={
+                "k1": 3.0,
+                "k2": 3.7,
+                "omega1": 4.2,
+                "omega2": 4.9,
+                "phase_rad": 0.0,
+                **params,
+            },
+            elements=[
+                SceneElementSpec(element_id="wave_a", kind="sinusoid", label="Carrier Wave y1(x,t)"),
+                SceneElementSpec(element_id="wave_b", kind="sinusoid", label="Detuned Wave y2(x,t)"),
+                SceneElementSpec(element_id="wave_sum", kind="superposition", label="Superposition y1 + y2"),
+            ],
+        )
+
     if template_id == "narrative_timeline":
         return SceneSpec(
             scene_id=scene_id,

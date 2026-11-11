@@ -91,10 +91,17 @@ export default function App() {
   const [newProjStyle, setNewProjStyle] = useState('educational_explainer');
   const [instructText, setInstructText] = useState('');
   const [animTemplate, setAnimTemplate] = useState('em_induction_faraday');
+  const [animParamsJson, setAnimParamsJson] = useState('{}');
+  const [inspectUrl, setInspectUrl] = useState('');
+  const [refStylePath, setRefStylePath] = useState('');
+  const [tgChatId, setTgChatId] = useState('@symposium_lab');
   const [showSafeZone, setShowSafeZone] = useState(true);
   const [threadsStyle, setThreadsStyle] = useState('educational');
   const [searchTerm, setSearchTerm] = useState('');
   const [searchHits, setSearchHits] = useState<any[]>([]);
+  const [expQuery, setExpQuery] = useState('');
+  const [expPlatformFilter, setExpPlatformFilter] = useState('');
+  const [expSearchResults, setExpSearchResults] = useState<any[] | null>(null);
 
   async function refreshBase() {
     try {
@@ -155,6 +162,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    setExpSearchResults(null);
     if (activePid) loadProjectDetails(activePid);
   }, [activePid]);
 
@@ -182,6 +190,42 @@ export default function App() {
     if (researchQuery) params.set('q', researchQuery);
     if (categoryFilter) params.set('category', categoryFilter);
     setViralItems(await apiGet(`/api/research/items?${params.toString()}`));
+  }
+
+  async function handleSearchExperiments() {
+    const params = new URLSearchParams();
+    if (expQuery.trim()) params.set('q', expQuery.trim());
+    if (expPlatformFilter) params.set('platform', expPlatformFilter);
+    setExpSearchResults(await apiGet(`/api/growth/experiments?${params.toString()}`));
+  }
+
+  async function handleDiscoverLive() {
+    setBusy(true);
+    setStatusMsg('Discovering live multi-niche creator feeds (~100 videos)...');
+    try {
+      const res = await apiPost<any>('/api/research/discover', { target_count: 100 });
+      await handleSearchResearch();
+      setStatusMsg(`Discovered ${res.discovered_count} real public videos across ${res.categories_covered?.length || 0} categories`);
+    } catch (e: any) {
+      setStatusMsg(`Discovery error: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleInspectUrl() {
+    if (!inspectUrl.trim()) return;
+    setBusy(true);
+    try {
+      await apiPost('/api/research/inspect-url', { url: inspectUrl.trim() });
+      setInspectUrl('');
+      await handleSearchResearch();
+      setStatusMsg('Inspected public YouTube URL via oEmbed');
+    } catch (e: any) {
+      setStatusMsg(`Inspect error: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function runAction(label: string, fn: () => Promise<void>) {
@@ -294,7 +338,9 @@ export default function App() {
                 <h2>Engine Health & Capabilities</h2>
                 {health ? (
                   <div style={{ display: 'grid', gap: 8 }}>
-                    <div className="muted">Symposium Agents: <strong>{health.agents_count}</strong> · Workspaces: <code>{health.workspaces_root}</code></div>
+                    <div className="muted">
+                      Symposium Agents: <strong>{health.agents_count}</strong> · LLM: <code>{health.llm_backend || 'deterministic_analytical'}</code> · Workspaces: <code>{health.workspaces_root}</code>
+                    </div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                       {health.adapters.map((a: any) => (
                         <span key={a.adapter_id} className={`pill ${a.available ? 'pill-green' : ''}`}>
@@ -330,24 +376,38 @@ export default function App() {
 
           {tab === 'research' && (
             <div style={{ display: 'grid', gap: 16 }}>
-              <div className="card" style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-                <input placeholder="Search viral mechanics across all categories (gaming, comedy, tech, documentary, threads)..." value={researchQuery} onChange={(e) => setResearchQuery(e.target.value)} />
-                <select style={{ maxWidth: 220 }} value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
-                  <option value="">All Categories</option>
-                  {['entertainment','gaming','comedy','science','technology','engineering','programming','education','business','startups','sports','lifestyle','personal_storytelling','documentaries','popular_culture','internet_trends'].map((c) => (
-                    <option key={c} value={c}>{c}</option>
-                  ))}
-                </select>
-                <button className="btn btn-primary" onClick={handleSearchResearch}><Search size={14} /> Search</button>
+              <div className="card" style={{ display: 'grid', gap: 10 }}>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <input placeholder="Search viral mechanics across all categories (gaming, comedy, tech, documentary, threads)..." value={researchQuery} onChange={(e) => setResearchQuery(e.target.value)} />
+                  <select style={{ maxWidth: 220 }} value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+                    <option value="">All Categories</option>
+                    {['entertainment','gaming','comedy','science','technology','engineering','programming','education','business','startups','sports','lifestyle','personal_storytelling','documentaries','popular_culture','internet_trends'].map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                  <button className="btn" onClick={handleSearchResearch}><Search size={14} /> Search</button>
+                  <button className="btn btn-primary" disabled={busy} onClick={handleDiscoverLive}>Discover Live (~100)</button>
+                </div>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <input placeholder="Inspect explicit YouTube URL via oEmbed (https://www.youtube.com/watch?v=...)" value={inspectUrl} onChange={(e) => setInspectUrl(e.target.value)} />
+                  <button className="btn" disabled={busy || !inspectUrl.trim()} onClick={handleInspectUrl}>Inspect URL</button>
+                </div>
               </div>
               <div className="grid-2">
                 {viralItems.map((it) => (
                   <div className="card" key={it.item_id}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                      <span className="pill">{it.platform}</span>
-                      <span className="pill pill-amber">{it.category} · score {it.platform_relative_score}</span>
+                      <span className="pill">{it.platform} · {it.creator}</span>
+                      <span className={`pill ${it.metrics?.views ? 'pill-green' : 'pill-amber'}`}>
+                        {it.category} · {it.metrics?.views ? `score ${it.platform_relative_score} (${it.metrics.audience_normalized_ratio ?? '-'}x base)` : 'unscored archetype'}
+                      </span>
                     </div>
                     <h3>{it.title}</h3>
+                    {it.metrics?.views && (
+                      <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+                        Views: {Number(it.metrics.views).toLocaleString()} · Channel median: {it.metrics.channel_baseline_views ? Number(it.metrics.channel_baseline_views).toLocaleString() : 'n/a'} · {it.metrics.metric_source}
+                      </div>
+                    )}
                     <p className="muted"><strong>Hook:</strong> {it.opening_hook_structure}</p>
                     <p className="muted"><strong>Editing:</strong> {it.editing_style}</p>
                     {it.reusable_techniques?.map((t: any) => (
@@ -367,15 +427,180 @@ export default function App() {
               {symposium ? (
                 <>
                   <div className="card">
-                    <h2>Selected Strategy ({symposium.mode} mode · {symposium.participating_agents?.length} agents)</h2>
-                    <p><strong>{symposium.storyboard?.selected_strategy}</strong> — Target Duration: {symposium.storyboard?.target_duration_sec}s</p>
+                    <h2>Selected Strategy ({symposium.mode} · {symposium.participating_agents?.length} agents · backend: {symposium.backend_used})</h2>
+                    <p><strong>{symposium.storyboard?.selected_strategy}</strong> — Target Duration: {symposium.storyboard?.target_duration_sec}s · LLM calls: {symposium.llm_calls_count || 0}</p>
                     {symposium.decisions?.map((d: any) => (
                       <div key={d.decision_id} style={{ padding: '8px 0', borderTop: '1px solid var(--border)' }}>
                         <strong>{d.topic}:</strong> {d.chosen_option}
                         <div className="muted">{d.rationale} (Evidence: {d.evidence_refs?.join(', ')})</div>
                       </div>
                     ))}
+                    {symposium.challenges?.length > 0 && (
+                      <div style={{ marginTop: 10 }}>
+                        <h3>Moderator Audit & Conflict Resolutions ({symposium.challenges.length})</h3>
+                        {symposium.challenges.map((c: any) => (
+                          <div key={c.challenge_id} style={{ padding: '6px 0', borderTop: '1px solid var(--border)', fontSize: 12.5 }}>
+                            <span className="pill pill-rose">{c.issue_type}</span> {c.description}
+                            <div className="muted"><strong>Resolution:</strong> {c.resolution}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {symposium.revision_history?.length > 0 && (
+                      <div style={{ marginTop: 10 }}>
+                        <h4>Revision Log</h4>
+                        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5 }}>
+                          {symposium.revision_history.map((rev: string, i: number) => <li key={i}>{rev}</li>)}
+                        </ul>
+                      </div>
+                    )}
                   </div>
+
+                  {(symposium.growth_objective || symposium.creative_director_review) && (
+                    <div className="card">
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                        <h2 style={{ margin: 0 }}>Growth Objective, Relevance & Creative Director Gate</h2>
+                        {symposium.creative_director_review && (
+                          <span className={`pill ${symposium.creative_director_review.approved ? 'pill-green' : 'pill-rose'}`}>
+                            {symposium.creative_director_review.approved ? 'CD Gate Approved' : 'Revision Required'} · Rank #{symposium.creative_director_review.scorecard_rank}
+                          </span>
+                        )}
+                      </div>
+                      {symposium.relevance_assessment && (
+                        <div style={{ marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid var(--border)' }}>
+                          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 6 }}>
+                            <span className="pill">Timeliness: {symposium.relevance_assessment.topic_timeliness}</span>
+                            <span className="pill pill-amber">Momentum: {Number(symposium.relevance_assessment.momentum_score).toFixed(2)}</span>
+                          </div>
+                          <div><strong>Why Viewers Care Today:</strong> <span className="muted">{symposium.relevance_assessment.why_viewer_cares_today}</span></div>
+                          <div><strong>Long-Term Relevance:</strong> <span className="muted">{symposium.relevance_assessment.long_term_relevance_note}</span></div>
+                          {(symposium.relevance_assessment.limitations || []).length > 0 && (
+                            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                              Note: {symposium.relevance_assessment.limitations.join(' ')}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {symposium.growth_objective && (
+                        <div className="grid-2" style={{ gap: 12 }}>
+                          <div>
+                            <div style={{ marginBottom: 6 }}>
+                              <strong>Target Core + Accessible Audience:</strong>
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                                {(symposium.growth_objective.target_audience || []).map((aud: string) => (
+                                  <span className="pill" key={aud}>{aud}</span>
+                                ))}
+                              </div>
+                            </div>
+                            <p style={{ margin: '6px 0' }}><strong>Accessible Entry Hook:</strong> <span className="muted">{symposium.growth_objective.accessible_entry_hook}</span></p>
+                            <p style={{ margin: '6px 0' }}><strong>Content Hypothesis:</strong> <span className="muted">{symposium.growth_objective.content_hypothesis}</span></p>
+                            <p style={{ margin: '6px 0' }}><strong>Expected Viewer Value:</strong> <span className="muted">{symposium.growth_objective.expected_viewer_value}</span></p>
+                          </div>
+                          <div>
+                            <p style={{ margin: '0 0 6px' }}><strong>Selected Hook Strategy:</strong> <span className="muted">{symposium.growth_objective.selected_hook_strategy}</span></p>
+                            {(symposium.growth_objective.retention_risk_analysis || []).length > 0 && (
+                              <div style={{ marginBottom: 8 }}>
+                                <strong>Retention Risk Analysis:</strong>
+                                <ul style={{ margin: '4px 0 0', paddingLeft: 18, fontSize: 12.5 }}>
+                                  {symposium.growth_objective.retention_risk_analysis.map((risk: string, i: number) => (
+                                    <li className="muted" key={i}>{risk}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {(symposium.prior_learnings_applied || []).length > 0 && (
+                              <div>
+                                <strong>Prior Experiment Learnings Applied:</strong>
+                                <ul style={{ margin: '4px 0 0', paddingLeft: 18, fontSize: 12.5 }}>
+                                  {symposium.prior_learnings_applied.map((item: string, i: number) => (
+                                    <li className="muted" key={i}>{item}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      {symposium.creative_director_review && (
+                        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 4 }}>
+                            {(symposium.creative_director_review.checked_criteria || []).map((c: string) => (
+                              <span className="pill pill-green" key={c}>{c}</span>
+                            ))}
+                          </div>
+                          {symposium.creative_director_review.revision_notes && (
+                            <div className="muted" style={{ fontSize: 12 }}>{symposium.creative_director_review.revision_notes}</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {(symposium.candidate_evaluations || []).length > 0 && (
+                    <div className="card">
+                      <h2>Candidate Edit Performance Predictions (11-Factor Ranking)</h2>
+                      <p className="muted" style={{ marginTop: 0 }}>
+                        Uncertainty-bounded editorial ranking (0.00-1.00). Never fabricates view counts or guarantees virality.
+                      </p>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Rank / Candidate</th>
+                            <th>Composite & CI</th>
+                            <th>11-Factor Scorecard</th>
+                            <th>Evidence Rationale</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {symposium.candidate_evaluations.map((cand: any, idx: number) => {
+                            const sc = cand.scorecard || {};
+                            const ci = cand.confidence_interval || {};
+                            return (
+                              <tr key={cand.candidate_id}>
+                                <td>
+                                  <div>
+                                    <strong>#{idx + 1} {cand.strategy_name}</strong>{' '}
+                                    {cand.selected && <span className="pill pill-green">Selected</span>}
+                                  </div>
+                                  <div className="muted">{cand.editing_style} · {cand.target_duration_sec}s</div>
+                                </td>
+                                <td>
+                                  <div><strong>{Number(cand.composite_score).toFixed(3)}</strong></div>
+                                  <div className="muted">CI [{Number(ci.low ?? 0).toFixed(2)}, {Number(ci.high ?? 0).toFixed(2)}]</div>
+                                  <div className="muted">±{Number(ci.uncertainty ?? 0).toFixed(2)}</div>
+                                  {Number(cand.historical_lift_applied || 0) !== 0 && (
+                                    <div className="pill pill-amber" style={{ marginTop: 4 }}>
+                                      Hist lift {cand.historical_lift_applied > 0 ? '+' : ''}{Number(cand.historical_lift_applied).toFixed(3)}
+                                    </div>
+                                  )}
+                                </td>
+                                <td>
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                    <span className="pill">Hook {Number(sc.hook_strength ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Rel {Number(sc.topic_relevance ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Clarity {Number(sc.clarity ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Info {Number(sc.information_density ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Curiosity {Number(sc.curiosity ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Emotion {Number(sc.emotional_engagement ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Story {Number(sc.narrative_progression ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Visual {Number(sc.visual_quality ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Audience {Number(sc.audience_compatibility ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Share {Number(sc.shareability ?? 0).toFixed(2)}</span>
+                                    <span className="pill">Evergreen {Number(sc.estimated_long_term_relevance ?? 0).toFixed(2)}</span>
+                                  </div>
+                                </td>
+                                <td>
+                                  <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12 }}>
+                                    {(cand.evidence_rationale || []).map((ev: string, i: number) => <li key={i}>{ev}</li>)}
+                                  </ul>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                   <div className="grid-2">
                     {symposium.proposals?.map((p: any) => (
                       <div className="card" key={p.proposal_id}>
@@ -461,7 +686,7 @@ export default function App() {
                 </div>
                 <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
                   <input
-                    placeholder='Iterative AI instruction (e.g., "Make the opening more engaging" or "Make the captions smaller" or "Turn this into three shorts")'
+                    placeholder='Iterative AI instruction (e.g., "Make captions smaller", "Speed up 1.12x", "Cross dissolve", "Turn into 3 shorts")'
                     value={instructText}
                     onChange={(e) => setInstructText(e.target.value)}
                   />
@@ -471,6 +696,25 @@ export default function App() {
                     onClick={() => runAction('Apply Agent Instruction', () => apiPost(`/api/projects/${activePid}/instruct`, { instruction: instructText }))}
                   >
                     Apply Instruction
+                  </button>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+                  {['Make captions smaller', 'Speed up 1.12x', 'Cross dissolve', 'Mute music', 'Turn this into three shorts'].map((preset) => (
+                    <button key={preset} className="btn" disabled={busy || !activePid} onClick={() => setInstructText(preset)}>{preset}</button>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
+                  <input
+                    placeholder="Clone editing style from reference video path..."
+                    value={refStylePath}
+                    onChange={(e) => setRefStylePath(e.target.value)}
+                  />
+                  <button
+                    className="btn"
+                    disabled={busy || !activePid || !refStylePath.trim()}
+                    onClick={() => runAction('Clone Reference Style', () => apiPost(`/api/projects/${activePid}/style-from-reference`, { reference_video_path: refStylePath.trim() }))}
+                  >
+                    Clone Reference Style
                   </button>
                 </div>
               </div>
@@ -512,14 +756,36 @@ export default function App() {
                 <div style={{ display: 'grid', gap: 10 }}>
                   <select value={animTemplate} onChange={(e) => setAnimTemplate(e.target.value)}>
                     <option value="em_induction_faraday">Physics: Electromagnetic Induction (Faraday's Law)</option>
+                    <option value="wave_interference_sim">Physics: Wave Interference & Beat Superposition</option>
                     <option value="rlc_signal_flow">Electrical Eng: RLC Circuit & Waveform</option>
                     <option value="binary_tree_trace">Programming: Binary Search Tree Trace</option>
+                    <option value="system_architecture_flow">Systems: Distributed Ingestion Pipeline Flow</option>
                     <option value="narrative_timeline">Storytelling: Engineering Milestone Timeline</option>
+                    <option value="kinetic_callout">Editorial: Kinetic Key Takeaway Callout</option>
                   </select>
+                  <textarea
+                    rows={3}
+                    placeholder='Editable SceneSpec parameters JSON (e.g. {"freq_hz": 2.2})'
+                    value={animParamsJson}
+                    onChange={(e) => setAnimParamsJson(e.target.value)}
+                    style={{ fontFamily: 'monospace', fontSize: 12 }}
+                  />
                   <button
                     className="btn btn-primary"
                     disabled={busy || !activePid}
-                    onClick={() => runAction('Generate Original Animation', () => apiPost(`/api/projects/${activePid}/animate`, { template_id: animTemplate, duration_sec: 6.5 }))}
+                    onClick={() => runAction('Generate Original Animation', async () => {
+                      let parsedParams: Record<string, any> = {};
+                      try {
+                        parsedParams = JSON.parse(animParamsJson || '{}');
+                      } catch {
+                        parsedParams = {};
+                      }
+                      await apiPost(`/api/projects/${activePid}/animate`, {
+                        template_id: animTemplate,
+                        duration_sec: 6.5,
+                        parameters: parsedParams,
+                      });
+                    })}
                   >
                     Generate Editable SceneSpec & Render
                   </button>
@@ -619,13 +885,165 @@ export default function App() {
 
           {tab === 'growth' && (
             <div className="card">
-              <h2>Growth Intelligence & Telegram Funnel Conversion</h2>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, gap: 10, flexWrap: 'wrap' }}>
+                <h2 style={{ margin: 0 }}>Growth Intelligence & Telegram Funnel Conversion</h2>
+                {activePid && (
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button
+                      className="btn btn-amber"
+                      disabled={busy}
+                      onClick={() => runAction('Evaluate Growth Experiments', () => apiPost(`/api/growth/${activePid}/evaluate`, {}))}
+                    >
+                      Evaluate Experiments
+                    </button>
+                    <input style={{ width: 170 }} value={tgChatId} onChange={(e) => setTgChatId(e.target.value)} placeholder="@channel_handle" />
+                    <button
+                      className="btn"
+                      disabled={busy}
+                      onClick={() => runAction('Sync Telegram Bot API', () => apiPost(`/api/growth/${activePid}/telegram-sync`, { chat_id: tgChatId }))}
+                    >
+                      Sync Telegram
+                    </button>
+                  </div>
+                )}
+              </div>
               {growthData ? (
                 <>
                   <p className="muted">{growthData.note}</p>
+                  {growthData.warnings?.length > 0 && (
+                    <div style={{ marginBottom: 10 }}>
+                      {growthData.warnings.map((w: string, i: number) => <div className="pill pill-rose" key={i}>{w}</div>)}
+                    </div>
+                  )}
                   <div style={{ display: 'grid', gap: 10, marginBottom: 14 }}>
                     {growthData.recommendations.map((r: string, i: number) => <div className="pill pill-green" key={i}>{r}</div>)}
                   </div>
+                  {(growthData.platform_summaries || []).length > 0 && (
+                    <table style={{ marginBottom: 14 }}>
+                      <thead><tr><th>Platform</th><th>Views (Latest)</th><th>Engagements</th><th>Eng. Rate</th><th>Snapshots</th><th>TG Members</th></tr></thead>
+                      <tbody>
+                        {growthData.platform_summaries.map((s: any) => (
+                          <tr key={s.platform}>
+                            <td>{s.platform}</td>
+                            <td>{Number(s.total_views_or_impressions).toLocaleString()}</td>
+                            <td>{s.total_engagements}</td>
+                            <td>{s.engagement_rate_pct}%</td>
+                            <td>{s.snapshots}</td>
+                            <td>{s.latest_member_count ?? '-'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  {(growthData.target_progress || []).length > 0 && (
+                    <div style={{ marginBottom: 16 }}>
+                      <h3>Platform Growth Targets (1.0x Baseline · 1.5x Intermediate · 2.0x Stretch)</h3>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Platform</th>
+                            <th>Samples</th>
+                            <th>Median 7d Views</th>
+                            <th>Median Ratio vs Baseline</th>
+                            <th>Reached 1.5x / 2.0x</th>
+                            <th>Sample Confidence</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {growthData.target_progress.map((tp: any) => (
+                            <tr key={tp.platform}>
+                              <td><strong>{tp.platform}</strong></td>
+                              <td>{tp.published_samples}</td>
+                              <td>{tp.median_first_7d_views != null ? Number(tp.median_first_7d_views).toLocaleString() : '-'}</td>
+                              <td>{tp.median_ratio_vs_baseline != null ? `${tp.median_ratio_vs_baseline}x` : '-'}</td>
+                              <td>{tp.reached_1_5x_count} / {tp.reached_2_0x_count}</td>
+                              <td>
+                                <span className={`pill ${tp.sample_confidence === 'meaningful_multi_video_sample' ? 'pill-green' : 'pill-amber'}`}>
+                                  {tp.sample_confidence}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  <div style={{ marginBottom: 16 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8, flexWrap: 'wrap' }}>
+                      <h3 style={{ margin: 0 }}>
+                        {expSearchResults !== null ? `Experiment Ledger Search (${expSearchResults.length})` : `Experiment History & Learned Hypotheses (${(growthData.experiments || []).length})`}
+                      </h3>
+                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        <input
+                          style={{ width: 190 }}
+                          value={expQuery}
+                          onChange={(e) => setExpQuery(e.target.value)}
+                          placeholder="Search experiments/hypotheses"
+                        />
+                        <select style={{ width: 145 }} value={expPlatformFilter} onChange={(e) => setExpPlatformFilter(e.target.value)}>
+                          <option value="">All platforms</option>
+                          <option value="youtube">youtube</option>
+                          <option value="youtube_shorts">youtube_shorts</option>
+                          <option value="tiktok">tiktok</option>
+                          <option value="instagram_reels">instagram_reels</option>
+                          <option value="threads">threads</option>
+                        </select>
+                        <button className="btn" disabled={busy} onClick={handleSearchExperiments}>Search Ledger</button>
+                        {expSearchResults !== null && (
+                          <button className="btn" onClick={() => setExpSearchResults(null)}>Project View</button>
+                        )}
+                      </div>
+                    </div>
+                    {(expSearchResults ?? growthData.experiments ?? []).length > 0 ? (
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Platform / Strategy</th>
+                            <th>Prediction</th>
+                            <th>7d Views & Baseline</th>
+                            <th>Tier & Verdict</th>
+                            <th>Learned Hypotheses</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(expSearchResults ?? growthData.experiments ?? []).map((ex: any) => (
+                            <tr key={ex.experiment_id}>
+                              <td>
+                                <div><strong>{ex.platform}</strong> · {ex.strategy_name}</div>
+                                <div className="muted">{ex.title} ({ex.editing_style})</div>
+                              </td>
+                              <td>
+                                <div>{Number(ex.predicted_composite_score).toFixed(3)}</div>
+                                <div className="muted">±{Number(ex.predicted_uncertainty).toFixed(2)}</div>
+                              </td>
+                              <td>
+                                <div>{ex.first_7d_views != null ? `${Number(ex.first_7d_views).toLocaleString()} views` : 'Awaiting views'}</div>
+                                <div className="muted">
+                                  {ex.creator_baseline_median_views != null ? `Base ${Number(ex.creator_baseline_median_views).toLocaleString()}` : 'No baseline yet'}
+                                  {ex.ratio_vs_creator_median != null ? ` (${ex.ratio_vs_creator_median}x)` : ''}
+                                </div>
+                              </td>
+                              <td>
+                                <div className={`pill ${ex.outcome_verdict === 'outperformed' ? 'pill-green' : ex.outcome_verdict === 'underperformed' ? 'pill-rose' : 'pill-amber'}`}>
+                                  {ex.outcome_verdict}
+                                </div>
+                                <div className="muted" style={{ fontSize: 11.5, marginTop: 4 }}>{ex.growth_tier_reached}</div>
+                              </td>
+                              <td>
+                                {(ex.learned_hypotheses || []).length > 0 ? (
+                                  <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12 }}>
+                                    {ex.learned_hypotheses.map((h: string, i: number) => <li key={i}>{h}</li>)}
+                                  </ul>
+                                ) : <span className="muted">Pending evaluation after post-publication data</span>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : <p className="muted">Run AI Symposium on this project to log pre-publication hypotheses and track post-publication results.</p>}
+                  </div>
+
                   <table>
                     <thead><tr><th>Platform</th><th>Campaign Slug</th><th>Tagged Funnel URL</th><th>Clicks</th><th>Joins</th></tr></thead>
                     <tbody>

@@ -67,14 +67,33 @@ def synthesize_sfx(preset_id: str, out_path: Path, duration_sec: float = 0.65, s
         return _write_wav(out_path, sig, sample_rate)
 
     # Subtle ambient harmonic pad bed
+    return synthesize_ambient_bed(out_path, duration_sec=max(3.0, duration_sec), mood="tech_focus", sample_rate=sample_rate)
+
+
+def synthesize_ambient_bed(
+    out_path: Path,
+    duration_sec: float = 20.0,
+    mood: str = "tech_focus",
+    sample_rate: int = 48000,
+) -> Path:
+    """Synthesize a clean, royalty-free continuous ambient underscore bed for sidechain ducking."""
     dur = max(3.0, duration_sec)
     n = int(round(dur * sample_rate))
     t = np.linspace(0.0, dur, n, endpoint=False)
-    fade = np.minimum(1.0, np.minimum(t / 0.4, (dur - t) / 0.4))
+    fade = np.minimum(1.0, np.minimum(t / 0.5, (dur - t) / 0.5))
+
+    if mood == "warm_documentary":
+        freqs = (130.81, 196.0, 246.94, 329.63)  # C3 maj7 warmth
+    elif mood == "cinematic_pulse":
+        freqs = (98.0, 146.83, 220.0, 293.66)    # G2 sus2 energy
+    else:
+        freqs = (110.0, 164.81, 220.0, 277.18)   # A2 clean tech pad
+
+    lfo = 0.78 + 0.22 * np.sin(2.0 * np.pi * 0.22 * t)
     pad = (
-        0.35 * np.sin(2 * np.pi * 110.0 * t)
-        + 0.25 * np.sin(2 * np.pi * 164.81 * t)
-        + 0.20 * np.sin(2 * np.pi * 220.0 * t)
-        + 0.15 * np.sin(2 * np.pi * 277.18 * t)
+        0.38 * np.sin(2 * np.pi * freqs[0] * t)
+        + 0.26 * np.sin(2 * np.pi * freqs[1] * t)
+        + 0.20 * np.sin(2 * np.pi * freqs[2] * t)
+        + 0.14 * np.sin(2 * np.pi * freqs[3] * t)
     )
-    return _write_wav(out_path, pad * fade * 0.12, sample_rate)
+    return _write_wav(out_path, pad * fade * lfo * 0.16, sample_rate)

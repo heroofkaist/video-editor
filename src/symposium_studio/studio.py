@@ -9,6 +9,7 @@ from typing import Any
 
 from symposium_studio.config import StudioConfig
 from symposium_studio.engines.analysis import run_full_media_analysis
+from symposium_studio.engines.analysis.styles import analyze_reference_style
 from symposium_studio.engines.animation import AnimationEngineRegistry, build_scene_spec
 from symposium_studio.engines.distribution import (
     build_social_repurposing_bundle,
@@ -142,6 +143,34 @@ class SymposiumStudio:
     # ------------------------------------------------------------------
     # Research & Symposium
     # ------------------------------------------------------------------
+    def discover_live_research(
+        self,
+        target_count: int = 100,
+        categories: list[str] | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        """Discover real public multi-niche creator videos via official RSS / Data API v3."""
+        return self.research.discover_cohort(target_count=target_count, categories=categories, query=query)
+
+    def inspect_research_url(self, url: str) -> ViralContentItem | None:
+        return self.research.inspect_youtube_url(url)
+
+    def apply_reference_style(self, project_id: str, reference_video_path: Path) -> dict[str, Any]:
+        """Analyze a reference edit's tempo/luminance/saturation signature and apply its matched EditingStyleProfile."""
+        profile = analyze_reference_style(reference_video_path)
+        with self.workspaces.track_run(
+            project_id, "apply_reference_style", {"reference_video": str(reference_video_path)}
+        ) as (manifest, run):
+            manifest.project.editing_style = profile.name.value
+            self.workspaces.add_decision(
+                run,
+                step="style_clone",
+                actor="creative_director",
+                decision=f"Applied cloned editing style `{profile.name.value}` ({profile.display_name})",
+                rationale=f"Matched cut interval / visual signature from {reference_video_path.name}.",
+            )
+        return {"project_id": project_id, "editing_style": profile.name.value, "profile": profile.model_dump(mode="json")}
+
     def run_research_report(
         self,
         project_id: str,
@@ -184,6 +213,8 @@ class SymposiumStudio:
             report = self.run_research_report(project_id, "content_proposal", keywords)
 
         with self.workspaces.track_run(project_id, "run_symposium", {"mode": mode.value}) as (manifest, run):
+            prior_exps = self.db.list_experiments(limit=300)
+            research_pool = self.db.list_viral_items(limit=120)
             session = self.symposium.run_symposium(
                 project_id=project_id,
                 analysis=analysis,
@@ -192,12 +223,22 @@ class SymposiumStudio:
                 mode=mode,
                 target_min_sec=target_min_sec,
                 target_max_sec=target_max_sec,
+                prior_experiments=prior_exps,
+                research_items=research_pool,
             )
             ws_dir = Path(manifest.project.workspace_dir)
             sym_path = ws_dir / "symposium" / f"{session.session_id}.json"
             sym_path.write_text(session.model_dump_json(indent=2), encoding="utf-8")
             sb_path = ws_dir / "storyboards" / f"{session.storyboard.storyboard_id}.json"
             sb_path.write_text(session.storyboard.model_dump_json(indent=2), encoding="utf-8")
+
+            self.growth.record_experiment_from_production(
+                project_id=project_id,
+                title=manifest.project.name,
+                creator_niche=manifest.project.creator_niche,
+                session=session,
+                research_report=report,
+            )
 
             a1 = self.workspaces.register_asset(manifest, run.run_id, AssetRole.SYMPOSIUM_LOG, sym_path)
             a2 = self.workspaces.register_asset(manifest, run.run_id, AssetRole.STORYBOARD, sb_path)
@@ -414,6 +455,10 @@ class SymposiumStudio:
                 tmpl = "rlc_signal_flow"
             elif "tree" in low or "algorithm" in low or "data structure" in low:
                 tmpl = "binary_tree_trace"
+            elif "architecture" in low or "pipeline" in low or "microservice" in low:
+                tmpl = "system_architecture_flow"
+            elif "wave" in low or "interference" in low or "superposition" in low:
+                tmpl = "wave_interference_sim"
             elif "timeline" in low or "story" in low:
                 tmpl = "narrative_timeline"
             anim = self.generate_animation(project_id, template_id=tmpl)
@@ -518,6 +563,31 @@ class SymposiumStudio:
             run.output_asset_ids.extend([a1.asset_id, a2.asset_id])
         return bundle
 
+    def evaluate_growth_experiments(self, project_id: str) -> list[dict[str, Any]]:
+        """Evaluate post-publication metrics vs historical platform medians and extract learned hypotheses."""
+        exps = self.growth.evaluate_project_experiments(project_id)
+        return [e.model_dump(mode="json") for e in exps]
+
+    def search_experiments(
+        self,
+        query: str | None = None,
+        platform: str | None = None,
+        project_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Search recorded content growth experiments & learned hypotheses via FTS5 or platform filters."""
+        if query:
+            hits = self.db.search_all(query, limit=limit * 2, project_id=project_id)
+            exp_ids = [h["entity_id"] for h in hits if h["entity_type"] == "experiment"]
+            pool = {e.experiment_id: e for e in self.db.list_experiments(project_id=project_id, platform=platform, limit=300)}
+            matched = [pool[eid].model_dump(mode="json") for eid in exp_ids if eid in pool]
+            if matched:
+                return matched[:limit]
+        return [
+            e.model_dump(mode="json")
+            for e in self.db.list_experiments(project_id=project_id, platform=platform, limit=limit)
+        ]
+
     def write_production_report(self, project_id: str) -> dict[str, Any]:
         manifest = self.workspaces.get_manifest(project_id)
         analysis = self.load_analysis(project_id)
@@ -551,6 +621,10 @@ class SymposiumStudio:
             ],
             "symposium_decisions": [d.model_dump(mode="json") for d in session.decisions],
             "moderator_challenges": [c.model_dump(mode="json") for c in session.challenges],
+            "relevance_assessment": session.relevance_assessment.model_dump(mode="json") if session.relevance_assessment else None,
+            "candidate_evaluations": [c.model_dump(mode="json") for c in session.candidate_evaluations],
+            "growth_objective": session.growth_objective.model_dump(mode="json") if session.growth_objective else None,
+            "creative_director_review": session.creative_director_review.model_dump(mode="json") if session.creative_director_review else None,
             "qa_reports": qa_reports,
             "assets": [a.model_dump(mode="json") for a in manifest.assets],
             "limitations": [
@@ -600,6 +674,8 @@ class SymposiumStudio:
         symposium_mode: ResearchMode = ResearchMode.STANDARD,
         animation_template: str | None = None,
         telegram_channel: str = "@symposium_lab",
+        discover_live_research: bool = False,
+        short_variants_per_platform: int = 1,
     ) -> dict[str, Any]:
         """Execute complete end-to-end pipeline from raw footage to multi-platform campaign."""
         manifest = self.create_project(name=name, creator_niche=creator_niche, editing_style=editing_style)
@@ -607,6 +683,9 @@ class SymposiumStudio:
         self.ingest_video(pid, video_path)
         analysis = self.analyze_project(pid)
         keywords = [k for t in analysis.topics for k in t.keywords][:6]
+        discovery_summary = None
+        if discover_live_research:
+            discovery_summary = self.discover_live_research(target_count=100, query=" ".join(keywords[:3]) or None)
         research_rep = self.run_research_report(pid, "content_proposal", keywords)
         session = self.run_symposium_conference(pid, mode=symposium_mode, style_name=editing_style)
 
@@ -616,7 +695,7 @@ class SymposiumStudio:
             "em_induction_faraday",
         )
         anim = self.generate_animation(pid, template_id=chosen_tmpl, duration_sec=6.5)
-        renders = self.build_and_render_deliverables(pid)
+        renders = self.build_and_render_deliverables(pid, short_variants_per_platform=short_variants_per_platform)
         social = self.generate_social_and_telegram(pid, telegram_channel=telegram_channel)
         report = self.write_production_report(pid)
 
@@ -625,6 +704,7 @@ class SymposiumStudio:
             "workspace_dir": manifest.project.workspace_dir,
             "detected_language": analysis.transcript.detected_language,
             "highlights_count": len(analysis.highlights),
+            "discovery": discovery_summary,
             "research_report_id": research_rep.report_id,
             "symposium_session_id": session.session_id,
             "animation": anim.model_dump(mode="json"),

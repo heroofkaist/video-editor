@@ -11,6 +11,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Protocol
 
+from symposium_studio.models.growth import ContentExperimentRecord
 from symposium_studio.models.project import AssetRecord, ProjectRecord, RunRecord
 from symposium_studio.models.research import ResearchReport, ViralContentItem
 from symposium_studio.models.social import FunnelLink, GrowthMetricSnapshot
@@ -140,6 +141,18 @@ class StudioDatabase:
                     telegram_clicks INTEGER NOT NULL,
                     telegram_joins INTEGER NOT NULL,
                     recorded_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS growth_experiments (
+                    experiment_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    outcome_verdict TEXT NOT NULL,
+                    growth_tier_reached TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
 
@@ -509,6 +522,68 @@ class StudioDatabase:
                     "SELECT payload_json FROM growth_metrics ORDER BY recorded_at DESC"
                 ).fetchall()
             return [GrowthMetricSnapshot.model_validate_json(r["payload_json"]) for r in rows]
+
+    def upsert_experiment(self, exp: ContentExperimentRecord) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO growth_experiments (
+                    experiment_id, project_id, platform, strategy_name,
+                    outcome_verdict, growth_tier_reached, published_at, updated_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(experiment_id) DO UPDATE SET
+                    strategy_name = excluded.strategy_name,
+                    outcome_verdict = excluded.outcome_verdict,
+                    growth_tier_reached = excluded.growth_tier_reached,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    exp.experiment_id,
+                    exp.project_id,
+                    exp.platform,
+                    exp.strategy_name,
+                    exp.outcome_verdict,
+                    exp.growth_tier_reached,
+                    exp.published_at,
+                    exp.updated_at,
+                    exp.model_dump_json(),
+                ),
+            )
+            body = " | ".join(
+                [
+                    exp.platform,
+                    exp.editing_style,
+                    exp.strategy_name,
+                    exp.hook_strategy,
+                    exp.content_hypothesis,
+                    exp.outcome_verdict,
+                    exp.growth_tier_reached,
+                    " ".join(exp.learned_hypotheses),
+                ]
+            )
+            self._upsert_fts(conn, "experiment", exp.experiment_id, exp.project_id, f"[{exp.platform}] {exp.title}", body)
+
+    def list_experiments(
+        self,
+        project_id: str | None = None,
+        platform: str | None = None,
+        limit: int = 200,
+    ) -> list[ContentExperimentRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if platform:
+            clauses.append("platform = ?")
+            params.append(platform)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT payload_json FROM growth_experiments {where} ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [ContentExperimentRecord.model_validate_json(r["payload_json"]) for r in rows]
 
     def search_all(self, query: str, limit: int = 25, project_id: str | None = None) -> list[dict[str, Any]]:
         cleaned = " ".join(tok for tok in query.strip().split() if tok)

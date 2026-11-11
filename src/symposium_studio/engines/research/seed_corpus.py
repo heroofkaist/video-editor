@@ -48,7 +48,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="Observed repeatedly in long-form gaming challenge videos that hold narrative momentum across technical systems.",
         confidence=0.91,
-        platform_relative_score=92.0,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
     ViralContentItem(
@@ -83,7 +84,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="Timing analysis of short-form comedic delivery shows silence contrast amplifies twist comprehension.",
         confidence=0.89,
-        platform_relative_score=90.5,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
     ViralContentItem(
@@ -118,7 +120,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="Standard pattern in high-trust documentary storytelling across history, investigative, and science essays.",
         confidence=0.93,
-        platform_relative_score=94.0,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
     ViralContentItem(
@@ -153,7 +156,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="Recurring format in high-clarity technical Shorts that convert viewers to deep-dive long-form videos.",
         confidence=0.94,
-        platform_relative_score=95.0,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
     ViralContentItem(
@@ -188,7 +192,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="High share/save tendency in Reels and personal creator stories where specificity beats polished hype.",
         confidence=0.88,
-        platform_relative_score=89.0,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
     ViralContentItem(
@@ -223,7 +228,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="Widely used in sports analysis and hardware teardown reels to make micro-phenomena legible.",
         confidence=0.90,
-        platform_relative_score=88.5,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
     ViralContentItem(
@@ -258,7 +264,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="Aligned with Threads 500-char conversational norms and reply-thread discovery behavior.",
         confidence=0.91,
-        platform_relative_score=91.0,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
     ViralContentItem(
@@ -293,7 +300,8 @@ CURATED_CROSS_NICHE_CORPUS: list[ViralContentItem] = [
         ],
         evidence="Core structural pattern across high-retention essayists in entertainment, pop culture, and science.",
         confidence=0.92,
-        platform_relative_score=93.0,
+        platform_relative_score=0.0,
+        score_basis="unscored_structural_benchmark",
         provenance_type="curated_public_study",
     ),
 ]

@@ -124,12 +124,21 @@ class GrowthMetricSnapshot(BaseModel):
     snapshot_id: str
     project_id: str
     platform: str
+    measurement_mode: str = "cumulative"  # cumulative | delta
+    external_post_id: str | None = None
     views_or_impressions: int
+    first_7d_views: int | None = None
     likes_or_reactions: int = 0
     comments: int = 0
     shares: int = 0
+    new_subscribers_or_followers: int = 0
+    avg_view_duration_sec: float | None = None
+    watch_time_minutes: float | None = None
+    authorized_ctr_pct: float | None = None
+    authorized_retention_pct: float | None = None
     telegram_clicks: int = 0
     telegram_joins: int = 0
+    subscriber_or_member_count: int | None = None
     data_provenance: str = "authorized_analytics_import"
     recorded_at: str
     notes: str = ""

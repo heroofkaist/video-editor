@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from symposium_studio.engines.effects.library import EFFECTS_CATALOG
-from symposium_studio.engines.effects.sfx_synth import synthesize_sfx
+from symposium_studio.engines.effects.sfx_synth import synthesize_ambient_bed, synthesize_sfx
 from symposium_studio.engines.production.captions import write_ass, write_srt
 from symposium_studio.models.timeline import RenderTimeline, TargetPlatformFormat
 
@@ -22,7 +22,28 @@ def ensure_project_sfx(effects_dir: Path) -> dict[str, str]:
         if not p.exists():
             synthesize_sfx(preset, p)
         sfx_map[preset] = str(p.resolve())
+    bed_path = effects_dir / "ambient_bed.wav"
+    if not bed_path.exists():
+        synthesize_ambient_bed(bed_path, duration_sec=24.0, mood="tech_focus")
+    sfx_map["ambient_bed"] = str(bed_path.resolve())
     return sfx_map
+
+
+def _build_atempo_chain(speed: float) -> str:
+    """Decompose arbitrary playback_speed into chained FFmpeg atempo stages in [0.5, 2.0]."""
+    spd = max(0.25, min(4.0, float(speed)))
+    if abs(spd - 1.0) < 1e-3:
+        return ""
+    stages: list[str] = []
+    cur = spd
+    while cur > 2.0:
+        stages.append("atempo=2.0")
+        cur /= 2.0
+    while cur < 0.5:
+        stages.append("atempo=0.5")
+        cur *= 2.0
+    stages.append(f"atempo={cur:.4f}")
+    return "," + ",".join(stages)
 
 
 def _color_filter_for_style(style_profile: str) -> str:
@@ -55,26 +76,40 @@ def render_timeline(
         tmp = Path(tmpdir)
         clip_files: list[Path] = []
 
-        # 1. Render each source segment with face-tracked reframing + subtle editorial zoom + color polish
+        # 1. Render each source segment with face-tracked reframing + speed + non-drifting transition + color polish
         for idx, clip in enumerate(timeline.clips):
             clip_out = tmp / f"seg_{idx:03d}.mp4"
             dur = max(0.25, clip.source_end_sec - clip.source_start_sec)
+            spd = max(0.25, min(4.0, float(clip.playback_speed or 1.0)))
             z = max(1.0, clip.zoom_scale)
+            speed_vf = f"setpts=(PTS-STARTPTS)/{spd:.4f}," if abs(spd - 1.0) >= 1e-3 else ""
+            trans_vf = ""
+            if clip.transition_in and clip.transition_in.type != "cut" and idx > 0:
+                td = min(0.35, max(0.12, float(clip.transition_in.duration_sec or 0.22)))
+                trans_vf = f",fade=t=in:st=0:d={td:.2f}"
+
             if is_vertical:
                 # Crop 9:16 window around tracked face center_x_norm, then apply optional punch zoom
                 vf = (
+                    f"{speed_vf}"
                     f"crop=min(iw\\,ih*9/16):ih:"
                     f"max(0\\,min(iw-min(iw\\,ih*9/16)\\,iw*{clip.crop_center_x:.4f}-min(iw\\,ih*9/16)/2)):0,"
                     f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
-                    f"crop={w}:{h},setsar=1,{grade_vf}"
+                    f"crop={w}:{h},setsar=1,{grade_vf}{trans_vf}"
                 )
             else:
                 vf = (
+                    f"{speed_vf}"
                     f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
-                    f"crop={w}:{h},setsar=1,{grade_vf}"
+                    f"crop={w}:{h},setsar=1,{grade_vf}{trans_vf}"
                 )
 
-            af = "highpass=f=80,acompressor=threshold=-20dB:ratio=2.4:attack=10:release=120,loudnorm=I=-14:TP=-1.5:LRA=11"
+            atempo_chain = _build_atempo_chain(spd)
+            af = (
+                f"highpass=f=80{atempo_chain},"
+                "acompressor=threshold=-20dB:ratio=2.4:attack=10:release=120,"
+                "loudnorm=I=-14:TP=-1.5:LRA=11"
+            )
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-ss", f"{clip.source_start_sec:.3f}",
@@ -148,12 +183,46 @@ def render_timeline(
             filter_parts.append(f"{v_label}ass='{_escape_ffmpeg_path(ass_path)}'{next_v}")
             v_label = next_v
 
-        # Mix SFX audio tracks cleanly without attenuating speech
+        # Mix SFX + optional sidechain-ducked ambient music beds without attenuating speech
         sfx_inputs_labels: list[str] = []
-        for s_i, au in enumerate(timeline.audio_events):
+        music_events = [au for au in timeline.audio_events if au.role == "music" and Path(au.source_path).exists()]
+        sfx_events = [au for au in timeline.audio_events if au.role != "music" and Path(au.source_path).exists()]
+        has_ducked_music = any(au.duck_under_speech for au in music_events)
+
+        if has_ducked_music:
+            filter_parts.append(f"{a_label}asplit=2[a_main][a_sc]")
+            speech_mix_label = "[a_main]"
+        else:
+            speech_mix_label = a_label
+
+        ducked_total = sum(1 for au in music_events if au.duck_under_speech)
+        ducked_seen = 0
+        for m_i, au in enumerate(music_events):
             au_path = Path(au.source_path)
-            if not au_path.exists():
-                continue
+            inputs.extend(["-stream_loop", "-1", "-i", str(au_path)])
+            gain_mult = round(10.0 ** (au.gain_db / 20.0), 3)
+            m_pre = f"[mus_pre_{m_i}]"
+            m_lbl = f"[mus_{m_i}]"
+            filter_parts.append(
+                f"[{input_idx}:a]aresample=48000,aformat=channel_layouts=stereo,volume={gain_mult}{m_pre}"
+            )
+            if au.duck_under_speech:
+                ducked_seen += 1
+                if ducked_seen >= ducked_total:
+                    sc_in = "[a_sc]"
+                else:
+                    filter_parts.append(f"[a_sc]asplit=2[a_sc_{m_i}][a_sc]")
+                    sc_in = f"[a_sc_{m_i}]"
+                filter_parts.append(
+                    f"{m_pre}{sc_in}sidechaincompress=threshold=0.025:ratio=6:attack=35:release=320:level_in=1{m_lbl}"
+                )
+            else:
+                filter_parts.append(f"{m_pre}anull{m_lbl}")
+            sfx_inputs_labels.append(m_lbl)
+            input_idx += 1
+
+        for s_i, au in enumerate(sfx_events):
+            au_path = Path(au.source_path)
             inputs.extend(["-i", str(au_path)])
             delay_ms = max(0, int(round(au.timeline_start_sec * 1000)))
             s_lbl = f"[sfx_{s_i}]"
@@ -166,7 +235,7 @@ def render_timeline(
             input_idx += 1
 
         if sfx_inputs_labels:
-            all_a = a_label + "".join(sfx_inputs_labels)
+            all_a = speech_mix_label + "".join(sfx_inputs_labels)
             filter_parts.append(
                 f"{all_a}amix=inputs={1 + len(sfx_inputs_labels)}:duration=first:normalize=0,"
                 f"loudnorm=I=-14:TP=-1.5:LRA=11[a_final]"
@@ -226,11 +295,11 @@ def render_thumbnail(
         )
         base = Image.open(raw_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
 
-    # Dark left gradient scrim for legible typography
+    # Dark left gradient scrim kept compact so subject & right-hand board stay crisp
     overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    for x in range(720):
-        alpha = int(205 * max(0.0, 1.0 - x / 720.0))
+    for x in range(520):
+        alpha = int(215 * max(0.0, 1.0 - x / 520.0))
         draw.line([(x, 0), (x, 720)], fill=(11, 16, 32, alpha))
 
     combined = Image.alpha_composite(base, overlay)
@@ -238,43 +307,43 @@ def render_thumbnail(
 
     font_path = "/System/Library/Fonts/HelveticaNeue.ttc"
     try:
-        title_font = ImageFont.truetype(font_path, 66)
-        badge_font = ImageFont.truetype(font_path, 28)
+        title_font = ImageFont.truetype(font_path, 48)
+        badge_font = ImageFont.truetype(font_path, 22)
     except Exception:
         title_font = ImageFont.load_default()
         badge_font = ImageFont.load_default()
 
-    # Badge pill dynamically sized to actual badge string
-    badge_txt = badge[:28].strip().upper()
+    # Badge pill dynamically sized to fit inside safe left margin (<= 330px)
+    badge_txt = badge[:24].strip().upper()
     bbox = d.textbbox((0, 0), badge_txt, font=badge_font)
-    badge_w = max(180, (bbox[2] - bbox[0]) + 44)
-    d.rounded_rectangle([58, 74, 58 + badge_w, 128], radius=24, fill=(56, 189, 248, 240))
-    d.text((80, 86), badge_txt, font=badge_font, fill=(11, 16, 32, 255))
+    badge_w = min(335, max(160, (bbox[2] - bbox[0]) + 36))
+    d.rounded_rectangle([48, 68, 48 + badge_w, 114], radius=22, fill=(56, 189, 248, 240))
+    d.text((66, 78), badge_txt, font=badge_font, fill=(11, 16, 32, 255))
 
-    # Wrap headline neatly onto max 3 lines within left safe column (<= 580px)
+    # Wrap headline cleanly within left third (<= 330px) to avoid overlapping off-center faces
     words = headline.strip().split()
     lines: list[str] = []
     cur = ""
     for w in words:
         cand = (cur + " " + w).strip()
         cand_w = d.textbbox((0, 0), cand, font=title_font)[2]
-        if cand_w <= 560 or not cur:
+        if cand_w <= 330 or not cur:
             cur = cand
         else:
             lines.append(cur)
             cur = w
-        if len(lines) == 3:
+        if len(lines) == 4:
             break
-    if cur and len(lines) < 3:
+    if cur and len(lines) < 4:
         lines.append(cur)
 
-    y = 178
+    y = 152
     for ln in lines:
-        d.text((62, y + 3), ln, font=title_font, fill=(0, 0, 0, 225))
-        d.text((58, y), ln, font=title_font, fill=(248, 250, 252, 255))
-        y += 84
+        d.text((51, y + 3), ln, font=title_font, fill=(0, 0, 0, 225))
+        d.text((48, y), ln, font=title_font, fill=(248, 250, 252, 255))
+        y += 62
 
-    # Accent bottom stripe
-    d.rectangle([58, 632, 540, 646], fill=(245, 158, 11, 255))
+    # Accent bottom stripe within left third
+    d.rectangle([48, 636, 360, 648], fill=(245, 158, 11, 255))
     combined.convert("RGB").save(out_png, format="PNG")
     return out_png

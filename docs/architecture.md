@@ -13,14 +13,14 @@
     |                    |                    |                    |
     v                    v                    v                    v
 [1. Research]      [2. AI Symposium]   [3. Production]      [4. Distribution & Growth]
-- Viral DB (FTS5)  - 7 Research Agents - MLX/Faster Whisper - YouTube SEO + Thumbnail
-- Cross-Niche      - 11 Creative Agents- PySceneDetect      - Threads (6 tone profiles)
-  Pattern Engine   - Moderator Checks  - OpenCV Face Track  - Telegram Funnel + Polls
-- Official APIs    - 12-Step Traceable - OTIO + RenderGraph - Isolated Publishers
-  + Explicit         Storyboard          - Animation Registry   (export/draft/approved)
-  Imports                                (Chromium, Motion    - Growth Intelligence
-                                          Canvas, Manim,
-                                          Matplotlib, Blender)
+- Viral DB (FTS5)  - 7 Research Agents - Whisper / Metal    - YouTube SEO + Thumbnail
+- Multi-Niche RSS  - 11 Creative Agents- PySceneDetect      - Threads (6 tone profiles)
+  Audience Norm.   - Relevance Check   - OpenCV Face Track  - Telegram Funnel + Polls
+- Official APIs    - 11-Factor Cand.   - OTIO + RenderGraph - Closed-Loop Experiments
+  + Explicit         Ranking (with CI) - Animation Registry   (1.0x -> 1.5x -> 2.0x
+  Imports          - Growth Objective    (Chromium, Motion    per platform cohort &
+                     + CD Gate Review    Canvas, Manim,       prediction calibration)
+                                         Matplotlib, Blender)
 ```
 
 ## Workspace Structure (`workspaces/<slug>/`)

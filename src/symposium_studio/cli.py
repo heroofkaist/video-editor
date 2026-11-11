@@ -85,6 +85,57 @@ def cmd_research_search(
     _emit([i.model_dump(mode="json") for i in items])
 
 
+@cli.command("research-discover")
+def cmd_research_discover(
+    target_count: int = typer.Option(100, help="Target number of real public videos to fetch across niches"),
+    category: list[str] | None = typer.Option(None, help="Optional category filters"),
+    query: str | None = typer.Option(None, help="Optional YouTube Data API query"),
+) -> None:
+    """Discover real public multi-niche creator videos via official Atom feeds / Data API v3."""
+    studio = SymposiumStudio()
+    _emit(studio.discover_live_research(target_count=target_count, categories=category or None, query=query))
+
+
+@cli.command("research-inspect")
+def cmd_research_inspect(url: str) -> None:
+    """Inspect a public YouTube URL via official oEmbed metadata."""
+    studio = SymposiumStudio()
+    item = studio.inspect_research_url(url)
+    _emit(item.model_dump(mode="json") if item else {"error": "Could not inspect URL"})
+
+
+@cli.command("style-clone")
+def cmd_style_clone(project_id: str, reference_video: Path) -> None:
+    """Extract editing pace & color signature from a reference video and apply it to the project."""
+    studio = SymposiumStudio()
+    _emit(studio.apply_reference_style(project_id, reference_video))
+
+
+@cli.command("telegram-sync")
+def cmd_telegram_sync(project_id: str, chat_id: str) -> None:
+    """Fetch official subscriber count via TELEGRAM_BOT_TOKEN (requires bot admin/channel access)."""
+    studio = SymposiumStudio()
+    _emit(studio.growth.sync_telegram_channel_stats(project_id, chat_id).model_dump(mode="json"))
+
+
+@cli.command("growth-experiments")
+def cmd_growth_experiments(
+    q: str | None = typer.Option(None, help="Full-text query across experiments and learned hypotheses"),
+    platform: str | None = typer.Option(None, help="Filter by platform (youtube, youtube_shorts, tiktok, instagram_reels, threads)"),
+    project_id: str | None = typer.Option(None, help="Filter by project ID"),
+) -> None:
+    """Search recorded content growth experiments & learned improvement hypotheses."""
+    studio = SymposiumStudio()
+    _emit(studio.search_experiments(query=q, platform=platform, project_id=project_id))
+
+
+@cli.command("growth-evaluate")
+def cmd_growth_evaluate(project_id: str) -> None:
+    """Compare published post metrics against creator same-platform baselines & extract learned hypotheses."""
+    studio = SymposiumStudio()
+    _emit({"project_id": project_id, "experiments": studio.evaluate_growth_experiments(project_id)})
+
+
 @cli.command("symposium")
 def cmd_symposium(
     project_id: str,

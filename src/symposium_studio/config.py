@@ -15,6 +15,10 @@ class SafetyPolicy(BaseModel):
         default=False,
         description="Must be explicitly opted in before sending raw source media or transcripts to third-party cloud APIs.",
     )
+    allow_cloud_ai_reasoning: bool = Field(
+        default=False,
+        description="Opt-in gate allowing Symposium LLM agents to send scrubbed highlight metadata/summaries to cloud LLM APIs.",
+    )
     allow_remotion_adapter: bool = Field(
         default=False,
         description="Opt-in flag acknowledging Remotion's source-available company license restrictions.",
@@ -41,6 +45,9 @@ class StudioConfig(BaseModel):
     )
     ollama_url: str = Field(default="http://localhost:11434")
     ollama_model: str | None = Field(default=None)
+    local_llm_url: str | None = Field(default=None)
+    local_llm_model: str | None = Field(default=None)
+    cloud_llm_model: str | None = Field(default=None)
     safety: SafetyPolicy = Field(default_factory=SafetyPolicy)
 
     @classmethod
@@ -55,8 +62,12 @@ class StudioConfig(BaseModel):
             whisper_model=os.environ.get("SYMPOSIUM_WHISPER_MODEL", "mlx-community/whisper-small-mlx"),
             ollama_url=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
             ollama_model=os.environ.get("SYMPOSIUM_OLLAMA_MODEL"),
+            local_llm_url=os.environ.get("SYMPOSIUM_LOCAL_LLM_URL"),
+            local_llm_model=os.environ.get("SYMPOSIUM_LOCAL_LLM_MODEL"),
+            cloud_llm_model=os.environ.get("SYMPOSIUM_CLOUD_LLM_MODEL"),
             safety=SafetyPolicy(
                 allow_external_media_upload=os.environ.get("SYMPOSIUM_ALLOW_CLOUD_UPLOAD") == "1",
+                allow_cloud_ai_reasoning=os.environ.get("SYMPOSIUM_ALLOW_CLOUD_AI") == "1",
                 allow_remotion_adapter=os.environ.get("SYMPOSIUM_ALLOW_REMOTION") == "1",
             ),
         )
