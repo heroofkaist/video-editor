@@ -1,0 +1,18 @@
+name: Bug Report
+description: Report a defect in Symposium Studio
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce (CLI command / API endpoint / UI tab)
+  - type: input
+    id: env
+    attributes:
+      label: OS, Python version, FFmpeg version

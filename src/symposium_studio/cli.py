@@ -1,0 +1,186 @@
+"""Machine-readable CLI (`symposium`) for operators and external AI agents."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import typer
+import uvicorn
+
+from symposium_studio.models.research import ContentCategory
+from symposium_studio.models.symposium import ResearchMode
+from symposium_studio.studio import SymposiumStudio
+
+cli = typer.Typer(help="Symposium Studio — Open-source AI content production & growth CLI.")
+
+
+def _emit(data: Any) -> None:
+    typer.echo(json.dumps(data, indent=2, default=str))
+
+
+@cli.command("health")
+def cmd_health() -> None:
+    """Check studio configuration, animation adapters, and platform connectors."""
+    studio = SymposiumStudio()
+    _emit(
+        {
+            "workspaces_root": str(studio.config.workspaces_root),
+            "db_path": str(studio.config.db_path),
+            "adapters": [c.model_dump(mode="json") for c in studio.animations.list_capabilities()],
+            "connectors": studio.research.connector_statuses(),
+        }
+    )
+
+
+@cli.command("projects")
+def cmd_list_projects() -> None:
+    """List all workspace projects."""
+    studio = SymposiumStudio()
+    _emit([p.model_dump(mode="json") for p in studio.db.list_projects()])
+
+
+@cli.command("create")
+def cmd_create(
+    name: str,
+    niche: str = typer.Option("science_engineering", help="Creator niche"),
+    style: str = typer.Option("educational_explainer", help="Default editing style profile"),
+) -> None:
+    """Create a structured project workspace."""
+    studio = SymposiumStudio()
+    manifest = studio.create_project(name=name, creator_niche=niche, editing_style=style)
+    _emit(manifest.model_dump(mode="json"))
+
+
+@cli.command("ingest")
+def cmd_ingest(project_id: str, video_path: Path) -> None:
+    """Ingest source media into project workspace with SHA256 verification."""
+    studio = SymposiumStudio()
+    _emit(studio.ingest_video(project_id, video_path))
+
+
+@cli.command("analyze")
+def cmd_analyze(
+    project_id: str,
+    language: str | None = typer.Option(None, help="Optional ISO language hint (en, ru, kk, ko)"),
+    whisper_model: str | None = typer.Option(None, help="Local Whisper model override"),
+) -> None:
+    """Run local transcription, diarization, PySceneDetect, face tracking, and highlight scoring."""
+    studio = SymposiumStudio()
+    bundle = studio.analyze_project(project_id, language=language, whisper_model=whisper_model)
+    _emit(bundle.model_dump(mode="json"))
+
+
+@cli.command("research-search")
+def cmd_research_search(
+    query: str | None = typer.Option(None),
+    platform: str | None = typer.Option(None),
+    category: str | None = typer.Option(None),
+    limit: int = typer.Option(15),
+) -> None:
+    """Search the cross-niche Viral Intelligence Database."""
+    studio = SymposiumStudio()
+    items = studio.research.search_patterns(query=query, platform=platform, category=category, limit=limit)
+    _emit([i.model_dump(mode="json") for i in items])
+
+
+@cli.command("symposium")
+def cmd_symposium(
+    project_id: str,
+    mode: ResearchMode = typer.Option(ResearchMode.STANDARD),
+    style: str | None = typer.Option(None),
+) -> None:
+    """Run the multi-agent AI Symposium deliberation and generate storyboard."""
+    studio = SymposiumStudio()
+    session = studio.run_symposium_conference(project_id, mode=mode, style_name=style)
+    _emit(session.model_dump(mode="json"))
+
+
+@cli.command("animate")
+def cmd_animate(
+    project_id: str,
+    template: str = typer.Option("em_induction_faraday"),
+    duration: float = typer.Option(6.5),
+    adapter: str | None = typer.Option(None),
+) -> None:
+    """Generate an editable SceneSpec and render an original animation."""
+    studio = SymposiumStudio()
+    res = studio.generate_animation(
+        project_id=project_id,
+        template_id=template,
+        duration_sec=duration,
+        preferred_adapter=adapter,
+    )
+    _emit(res.model_dump(mode="json"))
+
+
+@cli.command("render")
+def cmd_render(project_id: str, short_variants: int = typer.Option(1)) -> None:
+    """Build OTIO timelines, render YouTube 16:9 + Shorts/TikTok/Reels 9:16, thumbnail, and QA reports."""
+    studio = SymposiumStudio()
+    _emit(studio.build_and_render_deliverables(project_id, short_variants_per_platform=short_variants))
+
+
+@cli.command("instruct")
+def cmd_instruct(project_id: str, instruction: str) -> None:
+    """Apply an iterative natural-language editing or campaign instruction."""
+    studio = SymposiumStudio()
+    _emit(studio.apply_agent_instruction(project_id, instruction))
+
+
+@cli.command("repurpose")
+def cmd_repurpose(
+    project_id: str,
+    telegram_channel: str = typer.Option("@symposium_lab"),
+    threads_max_chars: int = typer.Option(280),
+) -> None:
+    """Generate YouTube metadata, Threads posts, Shorts/Reels copy, and Telegram funnel campaign."""
+    studio = SymposiumStudio()
+    bundle = studio.generate_social_and_telegram(
+        project_id, telegram_channel=telegram_channel, threads_max_chars=threads_max_chars
+    )
+    _emit(bundle.model_dump(mode="json"))
+
+
+@cli.command("campaign")
+def cmd_campaign(
+    name: str,
+    video_path: Path,
+    niche: str = typer.Option("science_engineering"),
+    style: str = typer.Option("educational_explainer"),
+    mode: ResearchMode = typer.Option(ResearchMode.STANDARD),
+    telegram_channel: str = typer.Option("@symposium_lab"),
+) -> None:
+    """Run the full end-to-end production pipeline from raw footage to multi-platform deliverables."""
+    studio = SymposiumStudio()
+    res = studio.run_campaign_pipeline(
+        name=name,
+        video_path=video_path,
+        creator_niche=niche,
+        editing_style=style,
+        symposium_mode=mode,
+        telegram_channel=telegram_channel,
+    )
+    _emit(res)
+
+
+@cli.command("search")
+def cmd_search(query: str, project_id: str | None = typer.Option(None)) -> None:
+    """Full-text search across projects, transcripts, research reports, viral patterns, and assets."""
+    studio = SymposiumStudio()
+    _emit(studio.db.search_all(query, project_id=project_id))
+
+
+@cli.command("serve")
+def cmd_serve(host: str = "127.0.0.1", port: int = 8420) -> None:
+    """Launch the Symposium Studio FastAPI backend & Web UI server."""
+    uvicorn.run("symposium_studio.api.app:app", host=host, port=port, reload=False)
+
+
+def main() -> None:
+    cli()
+
+
+if __name__ == "__main__":
+    main()

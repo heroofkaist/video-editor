@@ -1,0 +1,14 @@
+name: Feature or Adapter Proposal
+description: Propose a new animation adapter, platform connector, agent, or effect
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed capability & rationale
+    validations:
+      required: true
+  - type: input
+    id: license
+    attributes:
+      label: Dependency license (if introducing a new library)

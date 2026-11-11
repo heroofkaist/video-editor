@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symposium-studio"
+version = "0.2.0"
+description = "Open-source AI content production, creative symposium, programmatic animation, multi-platform video editing, and community growth studio."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+  { name = "Symposium Studio Contributors" }
+]
+keywords = ["video-editing", "ai-agents", "opentimelineio", "ffmpeg", "animation", "content-creation", "youtube", "shorts", "telegram"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Video :: Non-Linear Editor",
+]
+dependencies = [
+  "pydantic>=2.7",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "python-multipart>=0.0.9",
+  "httpx>=0.27",
+  "typer>=0.12",
+  "rich>=13.7",
+  "numpy>=1.26",
+  "scipy>=1.13",
+  "pillow>=10.3",
+  "matplotlib>=3.9",
+  "av>=13.0",
+  "scenedetect>=0.6.4",
+  "opencv-python-headless>=4.10",
+  "opentimelineio>=0.17",
+  "playwright>=1.46",
+]
+
+[project.optional-dependencies]
+apple-silicon = [
+  "mlx-whisper>=0.4.0",
+]
+whisper-cpu = [
+  "faster-whisper>=1.0.0",
+]
+manim = [
+  "manim>=0.18.0",
+]
+vision = [
+  "mediapipe>=0.10.14",
+]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "httpx>=0.27",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+symposium = "symposium_studio.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

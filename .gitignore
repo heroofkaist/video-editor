@@ -1,0 +1,50 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Node / Web UI
+web/node_modules/
+web/.next/
+web/dist/
+web/out/
+node_modules/
+*.tsbuildinfo
+npm-debug.log*
+
+# Studio runtime data & generated media (never commit personal media or renders)
+workspaces/
+projects/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.aiff
+*.flac
+*.sqlite
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets & env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# macOS
+.DS_Store
