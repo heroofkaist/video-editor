@@ -85,7 +85,8 @@ def render_timeline(
         tmp = Path(tmpdir)
         clip_files: list[Path] = []
 
-        # 1. Render each source segment with face-tracked reframing + speed + non-drifting transition + color polish
+        # 1. Render each source segment with portrait-biased reframing, smooth zoom motion, speed, and color polish
+        fps_int = int(round(timeline.fps))
         for idx, clip in enumerate(timeline.clips):
             clip_out = tmp / f"seg_{idx:03d}.mp4"
             dur = max(0.25, clip.source_end_sec - clip.source_start_sec)
@@ -97,20 +98,32 @@ def render_timeline(
                 td = min(0.35, max(0.12, float(clip.transition_in.duration_sec or 0.22)))
                 trans_vf = f",fade=t=in:st=0:d={td:.2f}"
 
+            push_fx = next((fx for fx in clip.effects if fx.preset_id == "smooth_push_in"), None)
+            out_frames = max(2, int(round((dur / spd) * fps_int)))
+
             if is_vertical:
-                # Crop 9:16 window around tracked face center_x_norm, then apply optional punch zoom
-                vf = (
-                    f"{speed_vf}"
+                base_crop = (
                     f"crop=min(iw\\,ih*9/16):ih:"
                     f"max(0\\,min(iw-min(iw\\,ih*9/16)\\,iw*{clip.crop_center_x:.4f}-min(iw\\,ih*9/16)/2)):0,"
-                    f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
-                    f"crop={w}:{h},setsar=1,{grade_vf}{trans_vf}"
+                )
+            else:
+                base_crop = ""
+
+            if push_fx is not None:
+                z_delta = float((push_fx.parameters or {}).get("zoom_delta", 0.06))
+                vf = (
+                    f"{speed_vf}fps={fps_int},{base_crop}"
+                    f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                    f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.32,"
+                    f"zoompan=z='{z:.3f}+{z_delta:.3f}*min(1\\,on/{out_frames})':"
+                    f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*0.34':d=1:s={w}x{h}:fps={fps_int},"
+                    f"setsar=1,{grade_vf}{trans_vf}"
                 )
             else:
                 vf = (
-                    f"{speed_vf}"
+                    f"{speed_vf}{base_crop}"
                     f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
-                    f"crop={w}:{h},setsar=1,{grade_vf}{trans_vf}"
+                    f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.34,setsar=1,{grade_vf}{trans_vf}"
                 )
 
             atempo_chain = _build_atempo_chain(spd)
@@ -126,7 +139,7 @@ def render_timeline(
                 "-i", clip.source_path,
                 "-vf", vf,
                 "-af", af,
-                "-r", str(int(round(timeline.fps))),
+                "-r", str(fps_int),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
                 str(clip_out),
@@ -168,22 +181,77 @@ def render_timeline(
             if not ov_path.exists():
                 continue
             ov_dur = max(0.5, ov.timeline_end_sec - ov.timeline_start_sec)
-            inputs.extend(["-i", str(ov_path)])
-            ov_w = max(120, int(round(w * ov.w_norm)))
-            ov_h = max(120, int(round(h * ov.h_norm)))
-            ov_x = int(round(w * ov.x_norm))
-            ov_y = int(round(h * ov.y_norm))
-            scaled = f"[ov_s_{ov_i}]"
+            sfx_ext = ov_path.suffix.lower()
+            is_static_img = sfx_ext in {".png", ".jpg", ".jpeg", ".webp"}
+            is_loop_vid = sfx_ext in {".mp4", ".gif", ".webm"}
+            if is_static_img:
+                inputs.extend(["-loop", "1", "-t", f"{ov_dur + 0.15:.3f}", "-i", str(ov_path)])
+            elif is_loop_vid:
+                inputs.extend(["-stream_loop", "-1", "-t", f"{ov_dur + 0.15:.3f}", "-i", str(ov_path)])
+            else:
+                inputs.extend(["-i", str(ov_path)])
+
             next_v = f"[v_ov_{ov_i}]"
-            filter_parts.append(
-                f"[{input_idx}:v]setpts=PTS-STARTPTS+{ov.timeline_start_sec:.3f}/TB,"
-                f"scale={ov_w}:{ov_h}:force_original_aspect_ratio=decrease,"
-                f"format=yuva420p{scaled}"
-            )
-            filter_parts.append(
-                f"{v_label}{scaled}overlay=x={ov_x}:y={ov_y}:shortest=0:"
-                f"enable='between(t,{ov.timeline_start_sec:.3f},{ov.timeline_end_sec:.3f})'{next_v}"
-            )
+            if ov.mode == "cutaway_blur_fill":
+                fg_w = int(round(w * (0.90 if is_vertical else 0.84)))
+                fg_h = int(round(h * (0.62 if is_vertical else 0.78)))
+                mbg_lbl = f"[ov_mbg_{ov_i}]"
+                mfg_lbl = f"[ov_mfg_{ov_i}]"
+                bg_lbl = f"[ov_bg_{ov_i}]"
+                fg_lbl = f"[ov_fg_{ov_i}]"
+                cut_lbl = f"[ov_cut_{ov_i}]"
+                filter_parts.append(
+                    f"[{input_idx}:v]fps={fps_int},setpts=PTS-STARTPTS,split=2{mbg_lbl}{mfg_lbl}"
+                )
+                filter_parts.append(
+                    f"{mbg_lbl}scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+                    f"gblur=sigma=28,eq=brightness=-0.22:saturation=1.15{bg_lbl}"
+                )
+                filter_parts.append(
+                    f"{mfg_lbl}scale={fg_w}:{fg_h}:force_original_aspect_ratio=decrease,"
+                    f"scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+                    f"pad=iw+12:ih+12:6:6:color=black@0.88{fg_lbl}"
+                )
+                filter_parts.append(
+                    f"{bg_lbl}{fg_lbl}overlay=(W-w)/2:(H-h)/2,"
+                    f"setpts=PTS-STARTPTS+{ov.timeline_start_sec:.3f}/TB,"
+                    f"format=yuva420p{cut_lbl}"
+                )
+                filter_parts.append(
+                    f"{v_label}{cut_lbl}overlay=x=0:y=0:eof_action=pass:"
+                    f"enable='between(t,{ov.timeline_start_sec:.3f},{ov.timeline_end_sec:.3f})'{next_v}"
+                )
+            elif ov.mode == "corner_sticker_clean":
+                ov_w = max(160, int(round(w * ov.w_norm)))
+                ov_h = max(140, int(round(h * ov.h_norm)))
+                ov_x = int(round(w * ov.x_norm))
+                ov_y = int(round(h * ov.y_norm))
+                scaled = f"[ov_s_{ov_i}]"
+                filter_parts.append(
+                    f"[{input_idx}:v]fps={fps_int},setpts=PTS-STARTPTS+{ov.timeline_start_sec:.3f}/TB,"
+                    f"scale={ov_w}:{ov_h}:force_original_aspect_ratio=decrease,"
+                    f"scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+                    f"pad=iw+8:ih+8:4:4:color=white@0.88,format=yuva420p{scaled}"
+                )
+                filter_parts.append(
+                    f"{v_label}{scaled}overlay=x={ov_x}:y={ov_y}:eof_action=pass:"
+                    f"enable='between(t,{ov.timeline_start_sec:.3f},{ov.timeline_end_sec:.3f})'{next_v}"
+                )
+            else:
+                ov_w = max(120, int(round(w * ov.w_norm)))
+                ov_h = max(120, int(round(h * ov.h_norm)))
+                ov_x = int(round(w * ov.x_norm))
+                ov_y = int(round(h * ov.y_norm))
+                scaled = f"[ov_s_{ov_i}]"
+                filter_parts.append(
+                    f"[{input_idx}:v]setpts=PTS-STARTPTS+{ov.timeline_start_sec:.3f}/TB,"
+                    f"scale={ov_w}:{ov_h}:force_original_aspect_ratio=decrease,"
+                    f"format=yuva420p{scaled}"
+                )
+                filter_parts.append(
+                    f"{v_label}{scaled}overlay=x={ov_x}:y={ov_y}:eof_action=pass:"
+                    f"enable='between(t,{ov.timeline_start_sec:.3f},{ov.timeline_end_sec:.3f})'{next_v}"
+                )
             v_label = next_v
             input_idx += 1
 

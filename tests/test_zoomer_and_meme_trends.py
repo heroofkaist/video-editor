@@ -656,3 +656,194 @@ def test_add_click_sounds_to_timeline_and_render_route(tmp_path: Path, monkeypat
     assert body["youtube_click_count"] >= 2
     assert Path(body["video_path"]).is_file()
     assert body["qa"]["passed"] is True
+
+
+def test_tenor_animated_meme_filter_and_cutaway_blur_render(monkeypatch: Any, tmp_path: Path) -> None:
+    """Verify Tenor/meme-api sourcing skips 1-frame stubs and renders clean cutaway_blur_fill + corner stickers."""
+    from symposium_studio.engines.production.renderer import render_timeline
+    from symposium_studio.engines.research.connectors import _derive_meme_reaction_queries
+    from symposium_studio.models.animation import AnimationRenderResult, FactualityMode
+
+    queries = _derive_meme_reaction_queries("Ожидание vs реальность 2 года капсула Data Structures қиын")
+    q_slugs = [q for q, _ in queries]
+    assert "expectations vs reality" in q_slugs
+    assert "stressed studying" in q_slugs
+
+    stub_mp4 = tmp_path / "stub_1frame.mp4"
+    valid_mp4 = tmp_path / "valid_react.mp4"
+    src_mp4 = tmp_path / "talk_src.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=25:d=0.04",
+            "-vframes", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(stub_mp4),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=duration=1.2:size=320x240:rate=24",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(valid_mp4),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=12.0:size=640x480:rate=24",
+            "-f", "lavfi", "-i", "sine=frequency=340:duration=12.0",
+            "-c:v", "libx264", "-c:a", "aac", "-shortest", str(src_mp4),
+        ],
+        check=True,
+    )
+
+    class _MockResp:
+        def __init__(self, status_code: int, text: str = "", content: bytes = b"", payload: Any = None) -> None:
+            self.status_code = status_code
+            self.text = text
+            self.content = content
+            self._payload = payload
+
+        def json(self) -> Any:
+            return self._payload
+
+    stub_bytes = stub_mp4.read_bytes()
+    valid_bytes = valid_mp4.read_bytes()
+
+    def _mock_get(url: str, **kwargs: Any) -> _MockResp:
+        if "tenor.com/search/" in url:
+            html = (
+                'src="https://media.tenor.com/StubAAAAP1/bad-preview.mp4" '
+                'src="https://media.tenor.com/Valid12AAAPo/lock-in-gamer.mp4"'
+            )
+            return _MockResp(200, text=html)
+        if "Valid12AAAPo" in url:
+            return _MockResp(200, content=valid_bytes)
+        if "StubAAAAP1" in url:
+            return _MockResp(200, content=stub_bytes)
+        if "meme-api.com" in url:
+            return _MockResp(200, payload={"memes": []})
+        return _MockResp(404)
+
+    monkeypatch.setattr("symposium_studio.engines.research.connectors.httpx.get", _mock_get)
+
+    items = MemeTrendConnector().fetch_public_items(query="locked in semester", limit=4)
+    assert any(it.metrics.metric_source == "tenor_reaction_search" for it in items)
+    assets = download_trending_meme_assets(items, tmp_path / "memes", max_count=2)
+    assert len(assets) == 1
+    assert assets[0]["media_kind"] == "video"
+    assert "Valid12" in assets[0]["original_url"]
+
+    anim_cut = AnimationRenderResult(
+        scene_id="anim_cut_0",
+        adapter_used="meme_cutaway",
+        output_path=assets[0]["asset_path"],
+        has_alpha=False,
+        width=320,
+        height=240,
+        fps=24.0,
+        duration_sec=1.5,
+        scene_spec_path=str(tmp_path / "c0.spec.json"),
+        render_time_sec=0.0,
+        factuality_mode=FactualityMode.ARTISTIC_ILLUSTRATION,
+    )
+    pip_copy = tmp_path / "valid_pip.mp4"
+    pip_copy.write_bytes(Path(assets[0]["asset_path"]).read_bytes())
+    anim_pip = anim_cut.model_copy(update={"scene_id": "anim_cut_1", "output_path": str(pip_copy)})
+    analysis = MediaAnalysisBundle(
+        project_id="proj_cut",
+        probe=MediaProbeResult(
+            path=str(src_mp4),
+            sha256="e" * 64,
+            size_bytes=src_mp4.stat().st_size,
+            duration_sec=12.0,
+            width=640,
+            height=480,
+            fps=24.0,
+            video_codec="h264",
+            has_audio=True,
+        ),
+        transcript=TranscriptResult(
+            engine="whisper.cpp",
+            model="test",
+            detected_language="ru",
+            language_probability=0.95,
+            duration_sec=12.0,
+            segments=[
+                TranscriptSegment(
+                    segment_id="s0",
+                    start_sec=0.0,
+                    end_sec=4.8,
+                    text="Это тест монтажа!",
+                    confidence=0.35,
+                    low_confidence=True,
+                    words=[
+                        WordTimestamp(word="Это", start_sec=0.1, end_sec=0.9, probability=0.4),
+                        WordTimestamp(word="тест", start_sec=1.0, end_sec=2.0, probability=0.4),
+                        WordTimestamp(word="монтажа!", start_sec=2.1, end_sec=4.6, probability=0.4),
+                    ],
+                ),
+                TranscriptSegment(
+                    segment_id="s1",
+                    start_sec=6.0,
+                    end_sec=11.6,
+                    text="Настоящие мемы работают!",
+                    confidence=0.92,
+                    words=[
+                        WordTimestamp(word="Настоящие", start_sec=6.2, end_sec=7.8, probability=0.92),
+                        WordTimestamp(word="мемы", start_sec=8.0, end_sec=9.6, probability=0.92),
+                        WordTimestamp(word="работают!", start_sec=9.8, end_sec=11.4, probability=0.92),
+                    ],
+                ),
+            ],
+        ),
+    )
+    sb = Storyboard(
+        storyboard_id="sb_cut",
+        project_id="proj_cut",
+        selected_strategy="Cutaway Meme Edit",
+        target_duration_sec=10.5,
+        beats=[
+            StoryboardBeat(
+                beat_index=0,
+                role="hook",
+                source_start_sec=0.0,
+                source_end_sec=5.0,
+                target_duration_sec=4.8,
+                visual_treatment="jump_cut_meme",
+            ),
+            StoryboardBeat(
+                beat_index=1,
+                role="payoff",
+                source_start_sec=6.0,
+                source_end_sec=11.6,
+                target_duration_sec=5.4,
+                visual_treatment="jump_cut_meme",
+            ),
+        ],
+    )
+    sfx_map = ensure_project_sfx(tmp_path / "fx")
+    tl = build_timeline_from_storyboard(
+        project_id="proj_cut",
+        title="Cutaway Test",
+        analysis=analysis,
+        storyboard=sb,
+        style_name=EditingStyleName.ZOOMER_VLOG.value,
+        animation_result=anim_cut,
+        extra_overlays=[anim_pip],
+        sfx_paths=sfx_map,
+    )
+    modes = [o.mode for o in tl.overlays]
+    assert "cutaway_blur_fill" in modes
+    assert "corner_sticker_clean" in modes
+    assert any(fx.preset_id == "smooth_push_in" for c in tl.clips for fx in c.effects)
+
+    # Verify zoomer ASS captions suppress noisy [?] low-confidence bracket clutter
+    ass_out = write_ass(tl, tmp_path / "cut.ass")
+    assert "[?]" not in ass_out.read_text(encoding="utf-8")
+
+    # Render full 16:9 timeline including smooth_push_in zoompan + cutaway_blur_fill + corner_sticker_clean
+    out_mp4 = tmp_path / "rendered_cutaway.mp4"
+    render_timeline(tl, out_mp4, tmp_path)
+    assert out_mp4.is_file() and out_mp4.stat().st_size > 10_000

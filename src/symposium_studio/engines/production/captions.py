@@ -71,8 +71,10 @@ def write_ass(timeline: RenderTimeline, out_path: Path) -> Path:
     margin_v = max(cs.safe_margin_bottom_px, 240 if is_vertical else 75)
     margin_lr = 70 if is_vertical else 110
 
-    # PrimaryColour = Yellow/Amber highlight for karaoke, SecondaryColour = crisp White before sweep
-    outline_px = 4.2 if cs.max_words_per_line <= 4 else 3.5
+    # PrimaryColour = vibrant neon yellow-gold karaoke highlight, SecondaryColour = crisp pure white before sweep
+    outline_px = 4.8 if cs.max_words_per_line <= 4 else 3.6
+    shadow_px = 2.4 if cs.max_words_per_line <= 4 else 1.8
+    suppress_bracket_noise = timeline.style_profile in {"zoomer_vlog", "short_form_viral", "comedy"}
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {timeline.width}
@@ -82,17 +84,17 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{cs.font_name},{font_size},&H001AF0FF,&H00FFFFFF,&H00080808,&H90000000,-1,0,0,0,100,100,0,0,1,{outline_px},1.8,2,{margin_lr},{margin_lr},{margin_v},1
-Style: Uncertain,{cs.font_name},{max(22, font_size - 6)},&H0088D8FF,&H00E2E8F0,&H00120C06,&H80000000,0,1,0,0,100,100,0,0,1,2.5,1,2,{margin_lr},{margin_lr},{margin_v},1
+Style: Default,{cs.font_name},{font_size},&H001CE8FF,&H00FFFFFF,&H00080808,&HA0000000,-1,0,0,0,100,100,0.4,0,1,{outline_px},{shadow_px},2,{margin_lr},{margin_lr},{margin_v},1
+Style: Uncertain,{cs.font_name},{max(22, font_size - 4)},&H001CE8FF,&H00F8FAFC,&H000A0A0A,&H95000000,-1,0,0,0,100,100,0.2,0,1,{max(3.0, outline_px - 0.6)},{shadow_px},2,{margin_lr},{margin_lr},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events: list[str] = []
     for cue in timeline.captions:
-        style_name = "Uncertain" if cue.low_confidence else "Default"
+        style_name = "Uncertain" if (cue.low_confidence and not suppress_bracket_noise) else "Default"
         body = _format_karaoke_line(cue, cs.max_words_per_line, cs.highlight_active_word)
-        if cue.low_confidence:
+        if cue.low_confidence and not suppress_bracket_noise and cue.style_preset != "kinetic_caption_pop":
             body = f"[?] {body}"
         events.append(
             f"Dialogue: 0,{_fmt_ass_time(cue.start_sec)},{_fmt_ass_time(cue.end_sec)},{style_name},,0,0,0,,{body}"

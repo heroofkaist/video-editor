@@ -14,27 +14,127 @@ from symposium_studio.engines.analysis.transcribe import extract_mono_wav
 from symposium_studio.models.media import SilenceInterval, SpeakerTurn, TranscriptSegment
 
 
+def _smoothed_rms_db(media_path: Path) -> np.ndarray | None:
+    """Extract 100ms smoothed RMS dBFS contour via single 8kHz high-passed FFmpeg PCM pass."""
+    pcm_proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(media_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-af",
+            "highpass=f=80",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        capture_output=True,
+    )
+    raw = pcm_proc.stdout
+    if pcm_proc.returncode != 0 or len(raw) < 1600:
+        return None
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    win = 800  # 100ms windows at 8kHz
+    usable = (len(samples) // win) * win
+    if usable < win * 4:
+        return None
+    frames = samples[:usable].reshape(-1, win)
+    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-10)
+    sm_rms = np.convolve(rms, np.ones(3, dtype=np.float32) / 3.0, mode="same")
+    return 20.0 * np.log10(sm_rms + 1e-10)
+
+
+def _estimate_adaptive_silence_db(media_path: Path) -> float:
+    """Compute an adaptive silence threshold (dBFS) between room noise floor and active speech."""
+    db = _smoothed_rms_db(media_path)
+    if db is not None and len(db) >= 4:
+        p20 = float(np.percentile(db, 20))
+        p80 = float(np.percentile(db, 80))
+        if p80 - p20 >= 5.0:
+            thr = p20 + max(3.5, (p80 - p20) * 0.36)
+            return round(max(-54.0, min(-24.0, thr)), 1)
+
+    vol_proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(media_path), "-af", "highpass=f=80,volumedetect", "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+    )
+    m_max = re.search(r"max_volume:\s*([-0-9.]+)\s*dB", vol_proc.stderr or "")
+    m_mean = re.search(r"mean_volume:\s*([-0-9.]+)\s*dB", vol_proc.stderr or "")
+    if m_max and m_mean:
+        max_db = float(m_max.group(1))
+        mean_db = float(m_mean.group(1))
+        thr = max(mean_db + 2.0, max_db - 22.0) if mean_db < -28.0 else -34.0
+        return round(max(-54.0, min(-24.0, thr)), 1)
+    if m_mean:
+        mean_db = float(m_mean.group(1))
+        return round(max(-52.0, min(-26.0, mean_db + 2.5)), 1) if mean_db < -28.0 else -34.0
+    return -34.0
+
+
 def detect_silences(
     media_path: Path,
     duration_sec: float,
     noise_db: float | None = None,
     min_silence_sec: float = 0.55,
 ) -> list[SilenceInterval]:
-    if noise_db is None:
-        # Adapt threshold for quiet laptop microphones (mean volume < -28 dB)
-        vol_proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-i", str(media_path), "-af", "highpass=f=80,volumedetect", "-f", "null", "-"],
-            capture_output=True,
-            text=True,
-        )
-        m_mean = re.search(r"mean_volume:\s*([-0-9.]+)\s*dB", vol_proc.stderr or "")
-        if m_mean:
-            mean_db = float(m_mean.group(1))
-            eff_noise_db = max(-52.0, min(-30.0, round(mean_db - 2.5, 1))) if mean_db < -28.0 else -34.0
+    db = _smoothed_rms_db(media_path)
+    if db is not None and len(db) >= 6:
+        if noise_db is None:
+            p20 = float(np.percentile(db, 20))
+            p80 = float(np.percentile(db, 80))
+            if p80 - p20 >= 5.0:
+                eff_thr = round(max(-54.0, min(-24.0, p20 + max(3.5, (p80 - p20) * 0.36))), 1)
+            else:
+                eff_thr = None
         else:
-            eff_noise_db = -34.0
-    else:
-        eff_noise_db = noise_db
+            eff_thr = float(noise_db)
+
+        if eff_thr is not None:
+            silent_mask = db <= eff_thr
+            silences_rms: list[SilenceInterval] = []
+            run_start: int | None = None
+            n_frames = len(silent_mask)
+            for idx, is_sil in enumerate(silent_mask):
+                if is_sil and run_start is None:
+                    run_start = idx
+                elif not is_sil and run_start is not None:
+                    raw_s = run_start * 0.1
+                    raw_e = min(duration_sec, idx * 0.1)
+                    # Preserve tiny breathing buffer around speech edges so consonants never clip
+                    pad_s = raw_s + 0.08 if raw_s > 0.05 else 0.0
+                    pad_e = raw_e - 0.08
+                    if pad_e - pad_s >= min_silence_sec:
+                        silences_rms.append(
+                            SilenceInterval(
+                                start_sec=round(pad_s, 3),
+                                end_sec=round(pad_e, 3),
+                                duration_sec=round(pad_e - pad_s, 3),
+                            )
+                        )
+                    run_start = None
+            if run_start is not None:
+                raw_s = run_start * 0.1
+                raw_e = min(duration_sec, n_frames * 0.1)
+                pad_s = raw_s + 0.08 if raw_s > 0.05 else 0.0
+                if raw_e - pad_s >= min_silence_sec:
+                    silences_rms.append(
+                        SilenceInterval(
+                            start_sec=round(pad_s, 3),
+                            end_sec=round(raw_e, 3),
+                            duration_sec=round(raw_e - pad_s, 3),
+                        )
+                    )
+            return silences_rms
+
+    eff_noise_db = _estimate_adaptive_silence_db(media_path) if noise_db is None else noise_db
 
     cmd = [
         "ffmpeg",

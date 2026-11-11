@@ -26,7 +26,7 @@ def extract_mono_wav(media_path: Path, out_wav: Path, sample_rate: int = 16000) 
         str(media_path),
         "-vn",
         "-af",
-        "highpass=f=80,acompressor=threshold=-25dB:ratio=3:attack=5:release=100,loudnorm=I=-16:TP=-1.5",
+        "highpass=f=80,dynaudnorm=f=150:g=15,loudnorm=I=-16:TP=-1.5:LRA=9",
         "-ac",
         "1",
         "-ar",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,7 @@ from symposium_studio.engines.research import (
     infer_platform_from_url,
 )
 from symposium_studio.engines.symposium import AGENT_ROSTER, SymposiumOrchestrator
-from symposium_studio.models.animation import AnimationRenderResult, SceneSpec
+from symposium_studio.models.animation import AnimationDomain, AnimationRenderResult, FactualityMode, SceneSpec
 from symposium_studio.models.media import MediaAnalysisBundle
 from symposium_studio.models.project import AssetRole, ProjectManifest
 from symposium_studio.models.research import ContentCategory, ResearchPlatform, ResearchReport, ViralContentItem
@@ -331,7 +332,7 @@ class SymposiumStudio:
                 )
         return session, anim_res
 
-    def _meme_batch_animations(self, ws_dir: Path, max_count: int = 3) -> list[AnimationRenderResult]:
+    def _meme_batch_animations(self, ws_dir: Path, max_count: int = 4) -> list[AnimationRenderResult]:
         anim_dir = ws_dir / "animations"
         if not anim_dir.exists():
             return []
@@ -339,18 +340,23 @@ class SymposiumStudio:
         for sp in sorted(anim_dir.glob("anim_*.spec.json")):
             try:
                 spec = SceneSpec.model_validate_json(sp.read_text(encoding="utf-8"))
-                if spec.template_id != "meme_reaction_card":
+                if spec.template_id not in {"meme_reaction_card", "meme_cutaway"}:
                     continue
-                mov = anim_dir / f"{spec.scene_id}.mov"
-                mp4 = anim_dir / f"{spec.scene_id}.mp4"
-                out_file = mov if mov.exists() else mp4
-                if out_file.exists():
+                out_file = next(
+                    (
+                        anim_dir / f"{spec.scene_id}{ext}"
+                        for ext in (".mp4", ".mov", ".png", ".gif")
+                        if (anim_dir / f"{spec.scene_id}{ext}").exists()
+                    ),
+                    None,
+                )
+                if out_file is not None:
                     found.append(
                         AnimationRenderResult(
                             scene_id=spec.scene_id,
                             adapter_used=spec.preferred_adapter or "chromium_canvas",
                             output_path=str(out_file),
-                            has_alpha=mov.exists(),
+                            has_alpha=out_file.suffix.lower() in {".mov", ".png"},
                             width=spec.width,
                             height=spec.height,
                             fps=float(spec.fps),
@@ -396,16 +402,16 @@ class SymposiumStudio:
         manifest: ProjectManifest,
         analysis: MediaAnalysisBundle,
         session: SymposiumSession,
-        max_cards: int = 3,
+        max_cards: int = 4,
     ) -> tuple[list[AnimationRenderResult], list[dict[str, Any]]]:
         ws_dir = Path(manifest.project.workspace_dir)
         pid = manifest.project.project_id
         full_text = " ".join(s.text for s in analysis.transcript.segments)
-        query_seed = f"{manifest.project.name} {' '.join(k for t in analysis.topics for k in t.keywords[:4])} {full_text[:300]}"
-        live_memes = MemeTrendConnector().fetch_public_items(query=query_seed, limit=15)
+        query_seed = f"{manifest.project.name} {' '.join(k for t in analysis.topics for k in t.keywords[:6])} {full_text[:600]}"
+        live_memes = MemeTrendConnector().fetch_public_items(query=query_seed, limit=24)
         for it in live_memes:
             self.db.upsert_viral_item(it)
-        downloaded = download_trending_meme_assets(live_memes, ws_dir / "memes", max_count=max(max_cards + 1, 4))
+        downloaded = download_trending_meme_assets(live_memes, ws_dir / "memes", max_count=max(max_cards, 4))
 
         beats = session.storyboard.beats
         hl_map = {h.highlight_id: h.transcript_excerpt for h in analysis.highlights}
@@ -415,11 +421,17 @@ class SymposiumStudio:
             beat_indices = [0]
         elif len(beats) == 2:
             beat_indices = [0, 1]
+        elif max_cards >= 4 and len(beats) >= 4:
+            beat_indices = [0, 1, len(beats) - 2, len(beats) - 1]
         else:
             beat_indices = [0, len(beats) // 2, len(beats) - 1]
 
+        slot_count = min(max_cards, max(len(beat_indices), min(4, len(downloaded))))
+        anim_dir = ws_dir / "animations"
+        anim_dir.mkdir(parents=True, exist_ok=True)
         rendered_anims: list[AnimationRenderResult] = []
-        for slot_i, b_idx in enumerate(beat_indices[:max_cards]):
+        for slot_i in range(slot_count):
+            b_idx = beat_indices[slot_i % len(beat_indices)]
             beat = beats[b_idx]
             excerpt = ""
             for eid in beat.evidence_ids:
@@ -435,27 +447,74 @@ class SymposiumStudio:
                     ),
                     analysis.transcript.segments[0].text,
                 )
+
             meme_meta = downloaded[slot_i % len(downloaded)] if downloaded else {}
-            meme_topic = str(meme_meta.get("topic") or meme_meta.get("title") or "Trending Reaction")
-            top_label, reaction_text, accent = self._build_meme_card_text(slot_i, excerpt, meme_topic)
-            anim = self.generate_animation(
-                pid,
-                template_id="meme_reaction_card",
-                title=f"Meme Card #{slot_i + 1}: {meme_topic[:36]}",
-                duration_sec=3.4,
-                width=960,
-                height=720,
-                transparent_background=True,
-                parameters={
-                    "top_label": top_label,
-                    "meme_name": meme_topic[:32],
-                    "reaction_text": reaction_text,
-                    "image_path": str(meme_meta.get("image_path") or ""),
-                    "image_url": str(meme_meta.get("original_url") or ""),
-                    "accent_color": accent,
-                },
-            )
-            rendered_anims.append(anim)
+            asset_raw = str(meme_meta.get("asset_path") or meme_meta.get("image_path") or "").strip()
+            meme_topic = str(meme_meta.get("topic") or meme_meta.get("title") or "Reaction Meme")
+            src_asset = Path(asset_raw) if asset_raw else None
+
+            # Use real animated MP4/GIF or finished Reddit meme directly (clean cutaway/sticker, no SaaS UI box)
+            if src_asset is not None and src_asset.is_file():
+                scene_id = f"anim_m_{slot_i}_{uuid.uuid4().hex[:6]}"
+                ext = src_asset.suffix.lower() or ".mp4"
+                dest_asset = anim_dir / f"{scene_id}{ext}"
+                shutil.copy2(src_asset, dest_asset)
+                dur_val = float(meme_meta.get("duration_sec") or 2.2)
+                dur_val = round(max(1.5, min(3.2, dur_val)), 3)
+                spec = SceneSpec(
+                    scene_id=scene_id,
+                    template_id="meme_cutaway",
+                    domain=AnimationDomain.STORYTELLING,
+                    title=f"Meme Cutaway #{slot_i + 1}: {meme_topic[:44]}",
+                    duration_sec=dur_val,
+                    width=int(meme_meta.get("width") or 640),
+                    height=int(meme_meta.get("height") or 480),
+                    fps=30,
+                    transparent_background=False,
+                    factuality_mode=FactualityMode.ARTISTIC_ILLUSTRATION,
+                    preferred_adapter="meme_cutaway",
+                    parameters={
+                        "meme_name": meme_topic[:48],
+                        "media_kind": str(meme_meta.get("media_kind") or "video"),
+                        "source_url": str(meme_meta.get("original_url") or ""),
+                    },
+                )
+                spec_path = anim_dir / f"{scene_id}.spec.json"
+                spec_path.write_text(spec.model_dump_json(indent=2), encoding="utf-8")
+                anim = AnimationRenderResult(
+                    scene_id=scene_id,
+                    adapter_used="meme_cutaway",
+                    output_path=str(dest_asset.resolve()),
+                    has_alpha=ext in {".png", ".mov"},
+                    width=spec.width,
+                    height=spec.height,
+                    fps=30.0,
+                    duration_sec=dur_val,
+                    scene_spec_path=str(spec_path.resolve()),
+                    render_time_sec=0.0,
+                    factuality_mode=FactualityMode.ARTISTIC_ILLUSTRATION,
+                )
+                rendered_anims.append(anim)
+            else:
+                top_label, reaction_text, accent = self._build_meme_card_text(slot_i, excerpt, meme_topic)
+                anim = self.generate_animation(
+                    pid,
+                    template_id="meme_reaction_card",
+                    title=f"Meme Card #{slot_i + 1}: {meme_topic[:36]}",
+                    duration_sec=2.6,
+                    width=960,
+                    height=720,
+                    transparent_background=True,
+                    parameters={
+                        "top_label": top_label,
+                        "meme_name": meme_topic[:32],
+                        "reaction_text": reaction_text,
+                        "image_path": asset_raw,
+                        "image_url": str(meme_meta.get("original_url") or ""),
+                        "accent_color": accent,
+                    },
+                )
+                rendered_anims.append(anim)
         return rendered_anims, downloaded
 
     def build_and_render_deliverables(
@@ -475,7 +534,7 @@ class SymposiumStudio:
 
         resolved_extra = list(extra_animations or [])
         if extra_animations is None and manifest.project.editing_style == "zoomer_vlog":
-            meme_batch = self._meme_batch_animations(ws_dir, max_count=3)
+            meme_batch = self._meme_batch_animations(ws_dir, max_count=4)
             if meme_batch:
                 anim_res = meme_batch[0]
                 resolved_extra = meme_batch[1:]
@@ -970,7 +1029,7 @@ class SymposiumStudio:
         downloaded_memes: list[dict[str, Any]] = []
         extra_anims: list[AnimationRenderResult] = []
         if chosen_tmpl == "meme_reaction_card" or editing_style == "zoomer_vlog":
-            meme_anims, downloaded_memes = self._generate_zoomer_meme_cards(manifest, analysis, session, max_cards=3)
+            meme_anims, downloaded_memes = self._generate_zoomer_meme_cards(manifest, analysis, session, max_cards=4)
             anim = meme_anims[0]
             extra_anims = meme_anims[1:]
         else:

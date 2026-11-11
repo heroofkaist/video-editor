@@ -17,6 +17,8 @@ from symposium_studio.models.timeline import (
     AudioNode,
     CaptionCue,
     CaptionSettings,
+    EffectCategory,
+    EffectSpec,
     OverlayNode,
     RenderTimeline,
     TargetPlatformFormat,
@@ -67,15 +69,24 @@ def _split_segment_into_short_cues(
     cues: list[CaptionCue] = []
     compact_burst = style_preset == "kinetic_caption_pop"
     chunk_size = max(2, max_words) if compact_burst else max(3, max_words * 2)
-    for i in range(0, len(words), chunk_size):
-        grp = words[i : i + chunk_size]
+    cur_grp: list[Any] = []
+
+    def _emit_grp(grp: list[Any]) -> None:
+        if not grp:
+            return
         s_rel = max(0.0, grp[0].start_sec - clip_src_start) / speed
-        e_rel = max(s_rel + 0.22, (min(clip_src_end, grp[-1].end_sec) - clip_src_start) / speed)
+        raw_end_rel = (min(clip_src_end, grp[-1].end_sec) - clip_src_start) / speed
+        max_span = max(1.8, 0.58 * len(grp)) if compact_burst else max(2.8, 0.75 * len(grp))
+        e_rel = max(s_rel + 0.22, min(raw_end_rel, s_rel + max_span))
         mapped_words = [
             {
                 "word": w.word,
                 "start_sec": round(clip_tl_start + max(0.0, w.start_sec - clip_src_start) / speed, 3),
-                "end_sec": round(clip_tl_start + max(0.0, min(clip_src_end, w.end_sec) - clip_src_start) / speed, 3),
+                "end_sec": round(
+                    clip_tl_start
+                    + min(e_rel, max(0.0, min(clip_src_end, w.end_sec) - clip_src_start) / speed),
+                    3,
+                ),
             }
             for w in grp
         ]
@@ -90,6 +101,15 @@ def _split_segment_into_short_cues(
                 style_preset=style_preset,
             )
         )
+
+    for w in words:
+        if cur_grp:
+            gap_here = w.start_sec - cur_grp[-1].end_sec
+            if len(cur_grp) >= chunk_size or (compact_burst and gap_here > 0.55):
+                _emit_grp(cur_grp)
+                cur_grp = []
+        cur_grp.append(w)
+    _emit_grp(cur_grp)
     return cues
 
 
@@ -118,15 +138,36 @@ def _split_beat_around_silences(
         return [(src_start, src_end)]
 
     pad = 0.10
-    dead_spans: list[tuple[float, float]] = []
+    raw_dead: list[tuple[float, float]] = []
     for sil in silences:
         if sil.duration_sec < min_gap_sec:
             continue
         ds = max(src_start, sil.start_sec + pad)
         de = min(src_end, sil.end_sec - pad)
         if de - ds >= 0.16:
+            raw_dead.append((ds, de))
+
+    # Also harvest explicit silent gaps between consecutive transcript segments on soft microphones
+    seg_sorted = sorted(
+        (s for s in segments if s.end_sec >= src_start and s.start_sec <= src_end),
+        key=lambda s: s.start_sec,
+    )
+    for idx_s in range(len(seg_sorted) - 1):
+        g0 = seg_sorted[idx_s].end_sec + pad
+        g1 = seg_sorted[idx_s + 1].start_sec - pad
+        if g1 - g0 >= max(0.32, min_gap_sec):
+            ds = max(src_start, g0)
+            de = min(src_end, g1)
+            if de - ds >= 0.18:
+                raw_dead.append((ds, de))
+
+    raw_dead.sort()
+    dead_spans: list[tuple[float, float]] = []
+    for ds, de in raw_dead:
+        if dead_spans and ds <= dead_spans[-1][1] + 0.05:
+            dead_spans[-1] = (dead_spans[-1][0], max(dead_spans[-1][1], de))
+        else:
             dead_spans.append((ds, de))
-    dead_spans.sort()
 
     spoken: list[tuple[float, float]] = []
     cur = src_start
@@ -167,22 +208,39 @@ def _split_beat_around_silences(
 
 
 def _is_meme_overlay(anim: AnimationRenderResult) -> bool:
+    if anim.adapter_used in {"meme_cutaway", "meme_reaction"}:
+        return True
     hint = f"{anim.output_path} {anim.scene_spec_path}".lower()
     if "meme" in hint:
         return True
     try:
         spec_p = Path(anim.scene_spec_path)
-        if spec_p.is_file() and "meme_reaction_card" in spec_p.read_text(encoding="utf-8", errors="ignore"):
-            return True
+        if spec_p.is_file():
+            txt = spec_p.read_text(encoding="utf-8", errors="ignore")
+            if "meme_reaction_card" in txt or "meme_cutaway" in txt:
+                return True
     except Exception:
         pass
     return False
 
 
-def _overlay_placement(is_vertical: bool, crop_x: float, is_meme: bool) -> tuple[float, float, float, float, str]:
+def _overlay_placement(
+    is_vertical: bool,
+    crop_x: float,
+    is_meme: bool,
+    slot_idx: int = 0,
+    is_direct_meme_asset: bool = False,
+) -> tuple[float, float, float, float, str]:
+    if is_meme and (is_direct_meme_asset or is_vertical):
+        # Full-frame blurred-backdrop reaction cutaway on Shorts (never covers face!) or alternating YouTube slots
+        if is_vertical or slot_idx % 2 == 0:
+            return 0.0, 0.0, 1.0, 1.0, "cutaway_blur_fill"
+        if crop_x > 0.55:
+            return 0.03, 0.05, 0.27, 0.36, "corner_sticker_clean"
+        return 0.70, 0.05, 0.27, 0.36, "corner_sticker_clean"
     if is_vertical:
         if is_meme:
-            return 0.10, 0.04, 0.80, 0.28, "upper_stage_split"
+            return 0.0, 0.0, 1.0, 1.0, "cutaway_blur_fill"
         return 0.04, 0.055, 0.92, 0.34, "upper_stage_split"
     if crop_x > 0.55:
         if is_meme:
@@ -253,13 +311,39 @@ def build_timeline_from_storyboard(
             tl_start = round(cur_t, 3)
             tl_end = round(cur_t + dur, 3)
 
+            clip_effects: list[EffectSpec] = []
             if tight_cuts:
-                if subclip_counter == 0:
-                    zoom = 1.08
-                elif subclip_counter % 2 == 1:
-                    zoom = 1.0 + 0.11 * min(1.0, style.zoom_punch_intensity)
-                else:
+                phase = subclip_counter % 4
+                if phase == 0:
+                    zoom = 1.02
+                    clip_effects.append(
+                        EffectSpec(
+                            effect_id=f"fx_{uuid.uuid4().hex[:6]}",
+                            preset_id="smooth_push_in",
+                            category=EffectCategory.VISUAL,
+                            start_sec=0.0,
+                            duration_sec=dur,
+                            parameters={"zoom_delta": 0.07},
+                            editorial_purpose="Subtle smooth push-in motion on wide talking-head beat",
+                        )
+                    )
+                elif phase == 1:
+                    zoom = 1.0 + 0.15 * min(1.0, style.zoom_punch_intensity)
+                elif phase == 2:
                     zoom = 1.0
+                    clip_effects.append(
+                        EffectSpec(
+                            effect_id=f"fx_{uuid.uuid4().hex[:6]}",
+                            preset_id="smooth_push_in",
+                            category=EffectCategory.VISUAL,
+                            start_sec=0.0,
+                            duration_sec=dur,
+                            parameters={"zoom_delta": 0.055},
+                            editorial_purpose="Subtle breathing push-in before next snap cut",
+                        )
+                    )
+                else:
+                    zoom = 1.0 + 0.11 * min(1.0, style.zoom_punch_intensity)
             else:
                 zoom = 1.0 + (
                     0.07 * style.zoom_punch_intensity
@@ -281,6 +365,7 @@ def build_timeline_from_storyboard(
                 zoom_scale=round(zoom, 3),
                 label=f"{beat.role}: {beat.visual_treatment}",
                 transition_in=TransitionSpec(type=trans_type, duration_sec=trans_dur),
+                effects=clip_effects,
             )
             clips.append(clip)
 
@@ -329,7 +414,10 @@ def build_timeline_from_storyboard(
             ov_end = round(min(target_clip.timeline_end_sec - 0.1, ov_start + min(max(2.0, dur_c - 0.3), anim.duration_sec)), 3)
             if ov_end > ov_start + 0.8:
                 is_meme = _is_meme_overlay(anim)
-                ox, oy, ow, oh, omode = _overlay_placement(is_vertical, target_clip.crop_center_x, is_meme)
+                is_direct = anim.adapter_used == "meme_cutaway" or anim.output_path.lower().endswith((".mp4", ".gif", ".png", ".jpg", ".webp"))
+                ox, oy, ow, oh, omode = _overlay_placement(
+                    is_vertical, target_clip.crop_center_x, is_meme, slot_idx=0, is_direct_meme_asset=is_direct
+                )
                 overlays.append(
                     OverlayNode(
                         overlay_id=f"ov_{uuid.uuid4().hex[:6]}",
@@ -343,10 +431,12 @@ def build_timeline_from_storyboard(
                         y_norm=oy,
                         w_norm=ow,
                         h_norm=oh,
-                        label=f"Original Animation ({anim.adapter_used})",
+                        label=f"Meme Cutaway #1" if is_meme else f"Original Animation ({anim.adapter_used})",
                     )
                 )
-                sfx_key = "ui_pop" if is_meme and "ui_pop" in sfx_map else "whoosh_transition"
+                sfx_key = "vine_boom" if is_meme and "vine_boom" in sfx_map else (
+                    "ui_pop" if is_meme and "ui_pop" in sfx_map else "whoosh_transition"
+                )
                 if sfx_key in sfx_map:
                     audio_events.append(
                         AudioNode(
@@ -360,17 +450,30 @@ def build_timeline_from_storyboard(
                     )
         else:
             total_tl = max(1.0, cur_t)
-            fracs = [0.06, 0.42, 0.74] if len(anim_pool) >= 3 else ([0.10, 0.58] if len(anim_pool) == 2 else [0.18])
+            n_items = min(4, len(anim_pool))
+            if n_items >= 4:
+                fracs = [0.08, 0.33, 0.58, 0.82]
+            elif n_items == 3:
+                fracs = [0.08, 0.42, 0.74]
+            elif n_items == 2:
+                fracs = [0.12, 0.56]
+            else:
+                fracs = [0.18]
             last_ov_end = -4.0
-            for a_i, anim in enumerate(anim_pool[:3]):
+            for a_i, anim in enumerate(anim_pool[:4]):
                 target_t = total_tl * fracs[a_i]
-                ov_start = round(max(0.85, last_ov_end + 3.0, target_t), 3)
-                ov_end = round(min(total_tl - 0.6, ov_start + min(3.8, anim.duration_sec)), 3)
-                if ov_end <= ov_start + 1.0:
-                    continue
-                host_clip = next((c for c in clips if c.timeline_start_sec <= ov_start <= c.timeline_end_sec), clips[-1])
                 is_meme = _is_meme_overlay(anim) or is_zoomer
-                ox, oy, ow, oh, omode = _overlay_placement(is_vertical, host_clip.crop_center_x, is_meme)
+                is_direct = anim.adapter_used == "meme_cutaway" or anim.output_path.lower().endswith((".mp4", ".gif", ".png", ".jpg", ".webp"))
+                host_clip = next((c for c in clips if c.timeline_start_sec <= target_t <= c.timeline_end_sec), clips[-1])
+                ox, oy, ow, oh, omode = _overlay_placement(
+                    is_vertical, host_clip.crop_center_x, is_meme, slot_idx=a_i, is_direct_meme_asset=is_direct
+                )
+                # Keep full-screen meme cutaways snappy (1.55-1.85s) so pacing pops; corner stickers up to 2.6s
+                desired_dur = 1.75 if omode == "cutaway_blur_fill" else min(2.7, max(1.6, anim.duration_sec))
+                ov_start = round(max(0.85, last_ov_end + 3.0, target_t), 3)
+                ov_end = round(min(total_tl - 0.55, ov_start + desired_dur), 3)
+                if ov_end <= ov_start + 0.9:
+                    continue
                 overlays.append(
                     OverlayNode(
                         overlay_id=f"ov_{uuid.uuid4().hex[:6]}",
@@ -384,7 +487,7 @@ def build_timeline_from_storyboard(
                         y_norm=oy,
                         w_norm=ow,
                         h_norm=oh,
-                        label=f"Trending Meme Pop-up #{a_i + 1}" if is_meme else f"Original Animation ({anim.adapter_used})",
+                        label=f"Trending Meme Cutaway #{a_i + 1}" if is_meme else f"Original Animation ({anim.adapter_used})",
                     )
                 )
                 sfx_key = (
@@ -425,7 +528,7 @@ def build_timeline_from_storyboard(
         font_name="Verdana" if is_zoomer else "Helvetica Neue",
         font_size=(64 if is_zoomer else 56) if is_vertical else (56 if is_zoomer else 48),
         scale_factor=1.0,
-        safe_margin_bottom_px=280 if platform_format == TargetPlatformFormat.TIKTOK else (250 if is_vertical else 75),
+        safe_margin_bottom_px=290 if platform_format == TargetPlatformFormat.TIKTOK else (270 if is_vertical else 92),
         safe_margin_top_px=120 if is_vertical else 50,
         highlight_active_word=True,
         max_words_per_line=3 if (is_vertical and is_zoomer) else (4 if is_vertical or is_zoomer else 6),
