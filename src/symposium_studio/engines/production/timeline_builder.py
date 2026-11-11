@@ -236,8 +236,8 @@ def _overlay_placement(
         if is_vertical or slot_idx % 2 == 0:
             return 0.0, 0.0, 1.0, 1.0, "cutaway_blur_fill"
         if crop_x > 0.55:
-            return 0.03, 0.05, 0.27, 0.36, "corner_sticker_clean"
-        return 0.70, 0.05, 0.27, 0.36, "corner_sticker_clean"
+            return 0.025, 0.04, 0.22, 0.29, "corner_sticker_clean"
+        return 0.75, 0.04, 0.22, 0.29, "corner_sticker_clean"
     if is_vertical:
         if is_meme:
             return 0.0, 0.0, 1.0, 1.0, "cutaway_blur_fill"
@@ -793,6 +793,29 @@ def build_vertical_short_timelines(
             platform_format=platform_format,
             sfx_paths=sfx_paths,
         )
+        # If tight silence cuts shrank a vertical Short under ~12s on a longer source video, expand its window naturally
+        tl_dur = tl.clips[-1].timeline_end_sec if tl.clips else 0.0
+        if tl_dur < 12.0 and total_dur >= 18.0:
+            cur_span = max(1.0, sb.beats[0].source_end_sec - sb.beats[0].source_start_sec)
+            ext_span = min(40.0, max(24.0, cur_span * (15.0 / max(3.5, tl_dur))))
+            exp_start = sb.beats[0].source_start_sec
+            exp_end = min(total_dur, exp_start + ext_span)
+            if exp_end - exp_start < ext_span:
+                exp_start = max(0.0, exp_end - ext_span)
+            sb.beats[0].source_start_sec = round(exp_start, 3)
+            sb.beats[0].source_end_sec = round(exp_end, 3)
+            sb.beats[0].target_duration_sec = round(min(42.0, max(14.0, (exp_end - exp_start) * 0.65)), 2)
+            sb.target_duration_sec = sb.beats[0].target_duration_sec
+            tl = build_timeline_from_storyboard(
+                project_id=project_id,
+                title=f"{base_title} [{platform_format.value} #{v_idx + 1}: {tag}]",
+                analysis=analysis,
+                storyboard=sb,
+                style_name=style_name,
+                animation_result=chosen_anim if attach_anim else None,
+                platform_format=platform_format,
+                sfx_paths=sfx_paths,
+            )
         out.append(tl)
     return out
 

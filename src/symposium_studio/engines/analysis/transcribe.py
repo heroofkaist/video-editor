@@ -401,6 +401,23 @@ def _run_whisper_cpp_chunk(
         for w in words:
             w.start_sec = round(w.start_sec + offset_sec, 3)
             w.end_sec = round(w.end_sec + offset_sec, 3)
+        # Collapse degenerate consecutive repeated words inside word-level timestamps too
+        if len(words) >= 4:
+            filtered_words: list[WordTimestamp] = []
+            prev_norm = ""
+            rep_run = 0
+            for w in words:
+                norm_w = re.sub(r"[^\w]+", "", w.word.casefold())
+                if norm_w and norm_w == prev_norm:
+                    rep_run += 1
+                    if rep_run >= 2:
+                        trimmed_repeat = True
+                        continue
+                else:
+                    prev_norm = norm_w
+                    rep_run = 1
+                filtered_words.append(w)
+            words = filtered_words
         if trimmed_repeat:
             seg_conf = min(seg_conf, 0.42)
         low_conf = seg_conf < 0.45 or trimmed_repeat
