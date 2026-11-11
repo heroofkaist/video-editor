@@ -13,7 +13,7 @@ import {
   TrendingUp,
   Users,
 } from 'lucide-react';
-import { apiGet, apiPost, workspaceFileUrl } from './api';
+import { apiGet, apiPost, apiUpload, workspaceFileUrl } from './api';
 
 type WorkspaceTab =
   | 'home'
@@ -328,6 +328,7 @@ export default function App() {
                       <option value="short_form_viral">Short-Form Viral</option>
                       <option value="comedy">Comedy</option>
                       <option value="personal_vlog">Personal Vlog</option>
+                      <option value="zoomer_vlog">Zoomer / Gen-Z Vlog (Live Memes + Jump Cuts)</option>
                     </select>
                   </div>
                   <button className="btn btn-primary" type="submit" disabled={busy}>Create Workspace</button>
@@ -622,6 +623,36 @@ export default function App() {
 
           {tab === 'media' && (
             <div style={{ display: 'grid', gap: 16 }}>
+              <div className="card" style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                <div style={{ flex: 1, minWidth: 240 }}>
+                  <strong>Upload Video to Active Project</strong>
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    Uploads raw footage directly into <code>{activePid || 'selected project'}</code> &amp; probes media streams.
+                  </div>
+                </div>
+                <input
+                  type="file"
+                  accept="video/*,audio/*,.mov,.mp4,.mkv"
+                  disabled={busy || !activePid}
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    if (!f || !activePid) return;
+                    setBusy(true);
+                    setStatusMsg(`Uploading ${f.name}...`);
+                    try {
+                      await apiUpload(`/api/projects/${activePid}/upload`, f);
+                      await refreshBase();
+                      await loadProjectDetails(activePid);
+                      setStatusMsg(`Uploaded ${f.name}. Ready to Analyze -> Render!`);
+                    } catch (err: any) {
+                      setStatusMsg(`Upload error: ${err.message}`);
+                    } finally {
+                      setBusy(false);
+                      e.target.value = '';
+                    }
+                  }}
+                />
+              </div>
               <div className="card" style={{ display: 'flex', gap: 10 }}>
                 <input placeholder="Full-text search transcripts, assets, and research..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
                 <button className="btn btn-primary" onClick={async () => setSearchHits(await apiGet(`/api/search?q=${encodeURIComponent(searchTerm)}&project_id=${encodeURIComponent(activePid)}`))}>
@@ -699,9 +730,16 @@ export default function App() {
                   </button>
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
-                  {['Make captions smaller', 'Speed up 1.12x', 'Cross dissolve', 'Mute music', 'Turn this into three shorts'].map((preset) => (
+                  {['Make captions smaller', 'Speed up 1.12x', 'Cross dissolve', 'Mute music', 'Download click sounds from internet and add them', 'Turn this into three shorts'].map((preset) => (
                     <button key={preset} className="btn" disabled={busy || !activePid} onClick={() => setInstructText(preset)}>{preset}</button>
                   ))}
+                  <button
+                    className="btn"
+                    disabled={busy || !activePid}
+                    onClick={() => runAction('Download & Add Click SFX', () => apiPost(`/api/projects/${activePid}/sfx/clicks`, {}))}
+                  >
+                    + Click SFX (Internet)
+                  </button>
                 </div>
                 <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
                   <input
@@ -762,6 +800,7 @@ export default function App() {
                     <option value="system_architecture_flow">Systems: Distributed Ingestion Pipeline Flow</option>
                     <option value="narrative_timeline">Storytelling: Engineering Milestone Timeline</option>
                     <option value="kinetic_callout">Editorial: Kinetic Key Takeaway Callout</option>
+                    <option value="meme_reaction_card">Zoomer: Trending Meme Reaction Card</option>
                   </select>
                   <textarea
                     rows={3}

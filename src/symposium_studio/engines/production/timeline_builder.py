@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from pathlib import Path
+from typing import Any
 
 import opentimelineio as otio
 
 from symposium_studio.engines.analysis.styles import get_style_profile
 from symposium_studio.models.animation import AnimationRenderResult
-from symposium_studio.models.media import MediaAnalysisBundle, TranscriptSegment
+from symposium_studio.models.media import MediaAnalysisBundle, SilenceInterval, TranscriptSegment
 from symposium_studio.models.symposium import Storyboard
 from symposium_studio.models.timeline import (
     AudioNode,
@@ -36,10 +38,18 @@ def _split_segment_into_short_cues(
     words = [
         w
         for w in seg.words
-        if w.end_sec > clip_src_start + 0.02 and w.start_sec < clip_src_end - 0.02
+        if clip_src_start <= (w.start_sec + w.end_sec) * 0.5 < clip_src_end
     ]
     if not words:
+        if seg.words:
+            # Avoid emitting a duplicate whole-segment caption when subword midpoints fell cleanly into neighboring subclips
+            if seg.end_sec <= clip_src_start + 0.08 or seg.start_sec >= clip_src_end - 0.08:
+                return []
+            if any(clip_src_start <= (w.start_sec + w.end_sec) * 0.5 < clip_src_end for w in seg.words):
+                return []
         if seg.end_sec <= clip_src_start or seg.start_sec >= clip_src_end:
+            return []
+        if min(seg.end_sec, clip_src_end) - max(seg.start_sec, clip_src_start) < 0.28:
             return []
         s_rel = max(0.0, seg.start_sec - clip_src_start) / speed
         e_rel = max(s_rel + 0.25, (min(clip_src_end, seg.end_sec) - clip_src_start) / speed)
@@ -55,7 +65,8 @@ def _split_segment_into_short_cues(
         ]
 
     cues: list[CaptionCue] = []
-    chunk_size = max(3, max_words * 2)
+    compact_burst = style_preset == "kinetic_caption_pop"
+    chunk_size = max(2, max_words) if compact_burst else max(3, max_words * 2)
     for i in range(0, len(words), chunk_size):
         grp = words[i : i + chunk_size]
         s_rel = max(0.0, grp[0].start_sec - clip_src_start) / speed
@@ -75,7 +86,7 @@ def _split_segment_into_short_cues(
                 end_sec=round(clip_tl_start + e_rel, 3),
                 text=" ".join(w.word for w in grp),
                 words=mapped_words,
-                low_confidence=seg.low_confidence or any(w.low_confidence for w in grp),
+                low_confidence=seg.low_confidence,
                 style_preset=style_preset,
             )
         )
@@ -93,6 +104,95 @@ def _crop_x_for_window(analysis: MediaAnalysisBundle, start_sec: float, end_sec:
     return analysis.recommended_crop_center_x
 
 
+def _split_beat_around_silences(
+    src_start: float,
+    src_end: float,
+    silences: list[SilenceInterval],
+    segments: list[TranscriptSegment],
+    min_gap_sec: float,
+    target_shot_sec: float,
+    tight_cuts: bool,
+) -> list[tuple[float, float]]:
+    """Strip dead silence pauses and gently subdivide long continuous takes on natural segment breaks."""
+    if not tight_cuts or (src_end - src_start) <= 2.4:
+        return [(src_start, src_end)]
+
+    pad = 0.10
+    dead_spans: list[tuple[float, float]] = []
+    for sil in silences:
+        if sil.duration_sec < min_gap_sec:
+            continue
+        ds = max(src_start, sil.start_sec + pad)
+        de = min(src_end, sil.end_sec - pad)
+        if de - ds >= 0.16:
+            dead_spans.append((ds, de))
+    dead_spans.sort()
+
+    spoken: list[tuple[float, float]] = []
+    cur = src_start
+    for ds, de in dead_spans:
+        if ds > cur + 1.1:
+            spoken.append((round(cur, 3), round(ds, 3)))
+        cur = max(cur, de)
+    if src_end - cur >= 1.1:
+        spoken.append((round(cur, 3), round(src_end, 3)))
+    if not spoken:
+        return [(src_start, src_end)]
+
+    # Gently break long takes ONLY at clean transcript segment boundaries for dynamic jump-cut rhythm
+    max_take = max(4.6, target_shot_sec * 1.65)
+    refined: list[tuple[float, float]] = []
+    for st, en in spoken:
+        if (en - st) <= max_take:
+            refined.append((st, en))
+            continue
+        sub_cur = st
+        cand_boundaries = sorted(
+            round(seg.end_sec + 0.04, 3)
+            for seg in segments
+            if st + 1.8 < seg.end_sec < en - 1.4
+        )
+        for b in cand_boundaries:
+            if b - sub_cur >= max(2.4, target_shot_sec * 0.9):
+                refined.append((round(sub_cur, 3), b))
+                sub_cur = b
+        if en - sub_cur >= 1.1:
+            refined.append((round(sub_cur, 3), en))
+        elif refined:
+            prev_s, _ = refined[-1]
+            refined[-1] = (prev_s, en)
+        else:
+            refined.append((st, en))
+    return refined or [(src_start, src_end)]
+
+
+def _is_meme_overlay(anim: AnimationRenderResult) -> bool:
+    hint = f"{anim.output_path} {anim.scene_spec_path}".lower()
+    if "meme" in hint:
+        return True
+    try:
+        spec_p = Path(anim.scene_spec_path)
+        if spec_p.is_file() and "meme_reaction_card" in spec_p.read_text(encoding="utf-8", errors="ignore"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _overlay_placement(is_vertical: bool, crop_x: float, is_meme: bool) -> tuple[float, float, float, float, str]:
+    if is_vertical:
+        if is_meme:
+            return 0.10, 0.04, 0.80, 0.28, "upper_stage_split"
+        return 0.04, 0.055, 0.92, 0.34, "upper_stage_split"
+    if crop_x > 0.55:
+        if is_meme:
+            return 0.03, 0.05, 0.31, 0.40, "pip_top_left"
+        return 0.03, 0.06, 0.44, 0.54, "pip_top_left"
+    if is_meme:
+        return 0.66, 0.05, 0.31, 0.40, "pip_top_right"
+    return 0.49, 0.07, 0.48, 0.58, "pip_top_right"
+
+
 def build_timeline_from_storyboard(
     project_id: str,
     title: str,
@@ -102,11 +202,21 @@ def build_timeline_from_storyboard(
     animation_result: AnimationRenderResult | None = None,
     platform_format: TargetPlatformFormat = TargetPlatformFormat.YOUTUBE_LONG,
     sfx_paths: dict[str, str] | None = None,
+    extra_overlays: list[AnimationRenderResult] | None = None,
 ) -> RenderTimeline:
     style = get_style_profile(style_name)
     is_vertical = platform_format != TargetPlatformFormat.YOUTUBE_LONG
     width, height = (1080, 1920) if is_vertical else (1920, 1080)
     fps = round(min(30.0, max(24.0, analysis.probe.fps or 30.0)), 3)
+    tight_cuts = style.name.value in {"zoomer_vlog", "short_form_viral", "comedy"} or style.max_silence_gap_sec <= 0.35
+    is_zoomer = style.name.value == "zoomer_vlog"
+
+    anim_pool: list[AnimationRenderResult] = []
+    seen_anim_paths: set[str] = set()
+    for cand_anim in ([animation_result] if animation_result else []) + list(extra_overlays or []):
+        if cand_anim is not None and cand_anim.output_path not in seen_anim_paths:
+            seen_anim_paths.add(cand_anim.output_path)
+            anim_pool.append(cand_anim)
 
     clips: list[VideoClipNode] = []
     overlays: list[OverlayNode] = []
@@ -114,6 +224,7 @@ def build_timeline_from_storyboard(
     captions: list[CaptionCue] = []
     cur_t = 0.0
     sfx_map = sfx_paths or {}
+    subclip_counter = 0
 
     for idx, beat in enumerate(storyboard.beats):
         src_start = max(0.0, beat.source_start_sec)
@@ -122,95 +233,177 @@ def build_timeline_from_storyboard(
         spd = 1.0
         if beat.target_duration_sec > 0.5 and abs(raw_dur - beat.target_duration_sec) / max(1.0, raw_dur) > 0.03:
             spd = round(max(0.85, min(1.30, raw_dur / beat.target_duration_sec)), 3)
-        dur = round(raw_dur / spd, 3)
-        tl_start = round(cur_t, 3)
-        tl_end = round(cur_t + dur, 3)
+        if is_zoomer:
+            spd = round(max(1.03, min(1.12, spd if spd > 1.0 else 1.06)), 3)
 
-        zoom = 1.0 + (0.07 * style.zoom_punch_intensity if idx == 0 or beat.role == "turning_point" else 0.0)
-        trans_type = "cut" if idx == 0 else style.transition_style
-        trans_dur = 0.0 if trans_type == "cut" or idx == 0 else 0.18
-        clip = VideoClipNode(
-            clip_id=f"clip_{idx:02d}",
-            source_path=analysis.probe.path,
-            source_start_sec=src_start,
-            source_end_sec=src_end,
-            timeline_start_sec=tl_start,
-            timeline_end_sec=tl_end,
-            playback_speed=spd,
-            crop_center_x=_crop_x_for_window(analysis, src_start, src_end),
-            zoom_scale=round(zoom, 3),
-            label=f"{beat.role}: {beat.visual_treatment}",
-            transition_in=TransitionSpec(type=trans_type, duration_sec=trans_dur),
+        sub_spans = _split_beat_around_silences(
+            src_start=src_start,
+            src_end=src_end,
+            silences=analysis.silences,
+            segments=analysis.transcript.segments,
+            min_gap_sec=style.max_silence_gap_sec,
+            target_shot_sec=style.target_avg_shot_sec,
+            tight_cuts=tight_cuts,
         )
-        clips.append(clip)
 
-        # Map verbatim captions into output timeline (synced to playback_speed)
-        for seg in analysis.transcript.segments:
-            captions.extend(
-                _split_segment_into_short_cues(
-                    seg=seg,
-                    clip_src_start=src_start,
-                    clip_src_end=src_end,
-                    clip_tl_start=tl_start,
-                    speed=spd,
-                    max_words=4 if is_vertical else 6,
-                    style_preset=style.caption_preset,
-                )
-            )
+        for sub_i, (sub_s, sub_e) in enumerate(sub_spans):
+            dur = round((sub_e - sub_s) / spd, 3)
+            if dur < 0.55:
+                continue
+            tl_start = round(cur_t, 3)
+            tl_end = round(cur_t + dur, 3)
 
-        # Attach original generated animation onto designated explainer beat (or beat 1 fallback)
-        if animation_result is not None and (beat.animation_template is not None or (idx == 1 and not overlays)):
-            ov_dur = min(dur - 0.3, animation_result.duration_sec) if dur > 2.0 else dur
-            ov_start = round(tl_start + 0.25, 3)
-            ov_end = round(min(tl_end - 0.1, ov_start + max(2.0, ov_dur)), 3)
-            if ov_end > ov_start + 0.8:
-                if is_vertical:
-                    ov_x, ov_y, ov_w, ov_h = 0.04, 0.055, 0.92, 0.34
-                elif clip.crop_center_x > 0.55:
-                    ov_x, ov_y, ov_w, ov_h = 0.03, 0.07, 0.47, 0.58
+            if tight_cuts:
+                if subclip_counter == 0:
+                    zoom = 1.08
+                elif subclip_counter % 2 == 1:
+                    zoom = 1.0 + 0.11 * min(1.0, style.zoom_punch_intensity)
                 else:
-                    ov_x, ov_y, ov_w, ov_h = 0.49, 0.07, 0.48, 0.58
-                overlays.append(
-                    OverlayNode(
-                        overlay_id=f"ov_{uuid.uuid4().hex[:6]}",
-                        asset_path=animation_result.output_path,
-                        scene_spec_path=animation_result.scene_spec_path,
-                        timeline_start_sec=ov_start,
-                        timeline_end_sec=ov_end,
-                        mode="upper_stage_split" if is_vertical else "pip_top_right",
-                        opacity=1.0,
-                        x_norm=ov_x,
-                        y_norm=ov_y,
-                        w_norm=ov_w,
-                        h_norm=ov_h,
-                        label=f"Original Animation ({animation_result.adapter_used})",
+                    zoom = 1.0
+            else:
+                zoom = 1.0 + (
+                    0.07 * style.zoom_punch_intensity
+                    if (idx == 0 or beat.role == "turning_point") and sub_i == 0
+                    else 0.0
+                )
+
+            trans_type = "cut" if subclip_counter == 0 else style.transition_style
+            trans_dur = 0.0 if trans_type == "cut" or subclip_counter == 0 else 0.18
+            clip = VideoClipNode(
+                clip_id=f"clip_{subclip_counter:02d}",
+                source_path=analysis.probe.path,
+                source_start_sec=sub_s,
+                source_end_sec=sub_e,
+                timeline_start_sec=tl_start,
+                timeline_end_sec=tl_end,
+                playback_speed=spd,
+                crop_center_x=_crop_x_for_window(analysis, sub_s, sub_e),
+                zoom_scale=round(zoom, 3),
+                label=f"{beat.role}: {beat.visual_treatment}",
+                transition_in=TransitionSpec(type=trans_type, duration_sec=trans_dur),
+            )
+            clips.append(clip)
+
+            # Map verbatim captions inside trimmed sub-clip onto output timeline
+            for seg in analysis.transcript.segments:
+                captions.extend(
+                    _split_segment_into_short_cues(
+                        seg=seg,
+                        clip_src_start=sub_s,
+                        clip_src_end=sub_e,
+                        clip_tl_start=tl_start,
+                        speed=spd,
+                        max_words=3 if (is_vertical and is_zoomer) else (4 if is_vertical or is_zoomer else 6),
+                        style_preset=style.caption_preset,
                     )
                 )
-                if "whoosh_transition" in sfx_map:
+
+            if subclip_counter == 0 and ("vine_boom" in sfx_map or "sub_impact" in sfx_map):
+                hook_sfx = sfx_map["vine_boom"] if is_zoomer and "vine_boom" in sfx_map else sfx_map.get("sub_impact", sfx_map.get("vine_boom"))
+                if hook_sfx:
                     audio_events.append(
                         AudioNode(
                             audio_id=f"sfx_{uuid.uuid4().hex[:6]}",
-                            source_path=sfx_map["whoosh_transition"],
+                            source_path=hook_sfx,
                             role="sfx",
-                            timeline_start_sec=ov_start,
-                            duration_sec=0.5,
-                            gain_db=-12.0,
+                            timeline_start_sec=0.05,
+                            duration_sec=0.65,
+                            gain_db=-9.5 if is_zoomer else -11.0,
                         )
                     )
+            cur_t = tl_end
+            subclip_counter += 1
 
-        # Hook sub impact at opening
-        if idx == 0 and "sub_impact" in sfx_map:
-            audio_events.append(
-                AudioNode(
-                    audio_id=f"sfx_{uuid.uuid4().hex[:6]}",
-                    source_path=sfx_map["sub_impact"],
-                    role="sfx",
-                    timeline_start_sec=0.05,
-                    duration_sec=0.55,
-                    gain_db=-11.0,
-                )
+    # Place original animation(s) / meme pop-ups onto distinct clips with safe non-overlapping pacing
+    if anim_pool and clips:
+        multi_mode = len(anim_pool) > 1 or tight_cuts
+        if not multi_mode:
+            target_idx = next(
+                (i for i, b in enumerate(storyboard.beats) if b.animation_template is not None),
+                min(1, len(clips) - 1),
             )
-        cur_t = tl_end
+            target_clip = clips[min(target_idx, len(clips) - 1)]
+            anim = anim_pool[0]
+            dur_c = target_clip.timeline_end_sec - target_clip.timeline_start_sec
+            ov_start = round(target_clip.timeline_start_sec + 0.25, 3)
+            ov_end = round(min(target_clip.timeline_end_sec - 0.1, ov_start + min(max(2.0, dur_c - 0.3), anim.duration_sec)), 3)
+            if ov_end > ov_start + 0.8:
+                is_meme = _is_meme_overlay(anim)
+                ox, oy, ow, oh, omode = _overlay_placement(is_vertical, target_clip.crop_center_x, is_meme)
+                overlays.append(
+                    OverlayNode(
+                        overlay_id=f"ov_{uuid.uuid4().hex[:6]}",
+                        asset_path=anim.output_path,
+                        scene_spec_path=anim.scene_spec_path,
+                        timeline_start_sec=ov_start,
+                        timeline_end_sec=ov_end,
+                        mode=omode,
+                        opacity=1.0,
+                        x_norm=ox,
+                        y_norm=oy,
+                        w_norm=ow,
+                        h_norm=oh,
+                        label=f"Original Animation ({anim.adapter_used})",
+                    )
+                )
+                sfx_key = "ui_pop" if is_meme and "ui_pop" in sfx_map else "whoosh_transition"
+                if sfx_key in sfx_map:
+                    audio_events.append(
+                        AudioNode(
+                            audio_id=f"sfx_{uuid.uuid4().hex[:6]}",
+                            source_path=sfx_map[sfx_key],
+                            role="sfx",
+                            timeline_start_sec=ov_start,
+                            duration_sec=0.45,
+                            gain_db=-10.0 if is_meme else -12.0,
+                        )
+                    )
+        else:
+            total_tl = max(1.0, cur_t)
+            fracs = [0.06, 0.42, 0.74] if len(anim_pool) >= 3 else ([0.10, 0.58] if len(anim_pool) == 2 else [0.18])
+            last_ov_end = -4.0
+            for a_i, anim in enumerate(anim_pool[:3]):
+                target_t = total_tl * fracs[a_i]
+                ov_start = round(max(0.85, last_ov_end + 3.0, target_t), 3)
+                ov_end = round(min(total_tl - 0.6, ov_start + min(3.8, anim.duration_sec)), 3)
+                if ov_end <= ov_start + 1.0:
+                    continue
+                host_clip = next((c for c in clips if c.timeline_start_sec <= ov_start <= c.timeline_end_sec), clips[-1])
+                is_meme = _is_meme_overlay(anim) or is_zoomer
+                ox, oy, ow, oh, omode = _overlay_placement(is_vertical, host_clip.crop_center_x, is_meme)
+                overlays.append(
+                    OverlayNode(
+                        overlay_id=f"ov_{uuid.uuid4().hex[:6]}",
+                        asset_path=anim.output_path,
+                        scene_spec_path=anim.scene_spec_path,
+                        timeline_start_sec=ov_start,
+                        timeline_end_sec=ov_end,
+                        mode=omode,
+                        opacity=1.0,
+                        x_norm=ox,
+                        y_norm=oy,
+                        w_norm=ow,
+                        h_norm=oh,
+                        label=f"Trending Meme Pop-up #{a_i + 1}" if is_meme else f"Original Animation ({anim.adapter_used})",
+                    )
+                )
+                sfx_key = (
+                    "vine_boom"
+                    if (is_meme and a_i == 0 and "vine_boom" in sfx_map)
+                    else ("ui_pop" if (is_meme and "ui_pop" in sfx_map) else "whoosh_transition")
+                )
+                if sfx_key in sfx_map:
+                    audio_events.append(
+                        AudioNode(
+                            audio_id=f"sfx_{uuid.uuid4().hex[:6]}",
+                            source_path=sfx_map[sfx_key],
+                            role="sfx",
+                            timeline_start_sec=ov_start,
+                            duration_sec=0.55 if sfx_key == "vine_boom" else 0.35,
+                            gain_db=-9.5 if is_meme else -12.0,
+                        )
+                    )
+                last_ov_end = ov_end
 
     # Attach subtle ambient music bed ducked automatically under speech when synthesized
     if "ambient_bed" in sfx_map and cur_t > 1.0:
@@ -221,7 +414,7 @@ def build_timeline_from_storyboard(
                 role="music",
                 timeline_start_sec=0.0,
                 duration_sec=round(cur_t, 3),
-                gain_db=-20.0,
+                gain_db=-19.0 if is_zoomer else -20.0,
                 duck_under_speech=True,
             )
         )
@@ -229,16 +422,16 @@ def build_timeline_from_storyboard(
     # Platform-specific safe caption settings
     cap_settings = CaptionSettings(
         enabled=True,
-        font_name="Helvetica Neue",
-        font_size=56 if is_vertical else 48,
+        font_name="Verdana" if is_zoomer else "Helvetica Neue",
+        font_size=(64 if is_zoomer else 56) if is_vertical else (56 if is_zoomer else 48),
         scale_factor=1.0,
         safe_margin_bottom_px=280 if platform_format == TargetPlatformFormat.TIKTOK else (250 if is_vertical else 75),
         safe_margin_top_px=120 if is_vertical else 50,
         highlight_active_word=True,
-        max_words_per_line=4 if is_vertical else 6,
+        max_words_per_line=3 if (is_vertical and is_zoomer) else (4 if is_vertical or is_zoomer else 6),
     )
 
-    return RenderTimeline(
+    tl = RenderTimeline(
         timeline_id=f"tl_{uuid.uuid4().hex[:8]}",
         project_id=project_id,
         revision=1,
@@ -258,6 +451,132 @@ def build_timeline_from_storyboard(
             f"Target platform: {platform_format.value} ({width}x{height} @ {fps}fps).",
         ],
     )
+    if any(k in sfx_map for k in ("mouse_click", "mouse_double_click", "mechanical_click", "switch_click")):
+        tl, _ = add_click_sounds_to_timeline(tl, sfx_map, style_name=style.name.value, replace_existing=True, bump_revision=False)
+    return tl
+
+
+CLICK_SFX_PRIORITY = ("mouse_click", "mechanical_click", "switch_click", "mouse_double_click")
+_EXCLUDED_NON_CLICK_SFX = {"ambient_bed", "vine_boom", "whoosh_transition", "sub_impact", "riser_tension"}
+
+
+def add_click_sounds_to_timeline(
+    timeline: RenderTimeline,
+    click_paths: dict[str, str],
+    style_name: str | None = None,
+    min_spacing_sec: float | None = None,
+    replace_existing: bool = True,
+    bump_revision: bool = True,
+) -> tuple[RenderTimeline, list[dict[str, Any]]]:
+    """Place internet-downloaded click SFX at punch cuts, overlay entries/exits, and kinetic caption hooks."""
+    available: dict[str, str] = {}
+    for k, p in (click_paths or {}).items():
+        if k in _EXCLUDED_NON_CLICK_SFX:
+            continue
+        if Path(p).is_file():
+            available[k] = str(Path(p).resolve())
+    if not available:
+        return timeline.model_copy(deep=True), []
+
+    tl = timeline.model_copy(deep=True)
+    if bump_revision:
+        tl.revision += 1
+    if replace_existing:
+        tl.audio_events = [a for a in tl.audio_events if not str(a.audio_id).startswith("clk_")]
+
+    ordered_keys = [k for k in CLICK_SFX_PRIORITY if k in available] + [
+        k for k in sorted(available) if k not in CLICK_SFX_PRIORITY
+    ]
+    eff_style = style_name or tl.style_profile or "educational_explainer"
+    fast_edit = eff_style in {"zoomer_vlog", "short_form_viral", "comedy"}
+    spacing = float(min_spacing_sec) if min_spacing_sec is not None else (2.0 if fast_edit else 3.6)
+
+    tl_end = max((c.timeline_end_sec for c in tl.clips), default=0.0)
+    conflict_times = [
+        round(float(a.timeline_start_sec), 3)
+        for a in tl.audio_events
+        if a.role == "sfx" and not str(a.audio_id).startswith("clk_")
+    ]
+
+    # Collect prioritized candidate timestamps: (priority, timestamp, reason, preferred_key, gain_db)
+    candidates: list[tuple[int, float, str, str, float]] = []
+
+    for o_i, ov in enumerate(tl.overlays):
+        s0 = float(ov.timeline_start_sec)
+        s1 = float(ov.timeline_end_sec)
+        if not any(abs(s0 - ct) <= 0.40 for ct in conflict_times):
+            candidates.append((1, round(s0, 3), "overlay_entry", "mouse_click", -14.5))
+        if s1 - s0 >= 2.6:
+            mid_t = round(s0 + min(1.5, (s1 - s0) * 0.45), 3)
+            candidates.append((2, mid_t, "overlay_emphasis", "mouse_double_click", -15.5))
+        candidates.append((1, round(max(0.5, s1 - 0.05), 3), "overlay_dismiss", "switch_click", -15.5))
+
+    for c_i, clip in enumerate(tl.clips):
+        if c_i == 0 or clip.timeline_start_sec < 0.65:
+            continue
+        t_cut = round(float(clip.timeline_start_sec), 3)
+        if clip.zoom_scale >= 1.03:
+            candidates.append((1, t_cut, "punch_zoom_cut", "mouse_click", -15.0))
+        elif fast_edit or clip.transition_in.type == "cut":
+            pref = "mechanical_click" if c_i % 2 == 1 else "mouse_click"
+            candidates.append((2, t_cut, "jump_cut", pref, -16.0))
+
+    for cap_i, cue in enumerate(tl.captions):
+        t_cap = round(float(cue.start_sec), 3)
+        if t_cap < 0.75:
+            continue
+        txt = cue.text.strip()
+        is_emph = bool(re.search(r"[?!%#]|\d+", txt)) or (fast_edit and len(txt.split()) <= 2 and cap_i % 3 == 0)
+        if is_emph:
+            candidates.append((3, t_cap, "caption_emphasis", "mechanical_click", -16.5))
+
+    # Greedily select highest-priority non-overlapping clicks separated cleanly from existing SFX
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    chosen_times: list[float] = []
+    chosen_entries: list[tuple[float, str, str, float]] = []
+
+    for _prio, ts, reason, pref_key, gain_db in candidates:
+        if ts < 0.40 or (tl_end > 1.2 and ts > tl_end - 0.18):
+            continue
+        if any(abs(ts - ct) < 0.48 for ct in conflict_times):
+            continue
+        if any(abs(ts - ch) < spacing for ch in chosen_times):
+            continue
+        key = pref_key if pref_key in available else ordered_keys[len(chosen_entries) % len(ordered_keys)]
+        chosen_times.append(ts)
+        chosen_entries.append((ts, reason, key, gain_db))
+
+    chosen_entries.sort(key=lambda x: x[0])
+    placements: list[dict[str, Any]] = []
+    for idx, (ts, reason, key, gain_db) in enumerate(chosen_entries):
+        src_path = available[key]
+        au = AudioNode(
+            audio_id=f"clk_{idx:02d}_{uuid.uuid4().hex[:5]}",
+            source_path=src_path,
+            role="sfx",
+            timeline_start_sec=round(ts, 3),
+            duration_sec=0.22,
+            gain_db=gain_db,
+            duck_under_speech=False,
+        )
+        tl.audio_events.append(au)
+        placements.append(
+            {
+                "audio_id": au.audio_id,
+                "preset": key,
+                "reason": reason,
+                "timeline_start_sec": au.timeline_start_sec,
+                "gain_db": gain_db,
+                "source_path": src_path,
+            }
+        )
+
+    tl.audio_events.sort(key=lambda a: a.timeline_start_sec)
+    if placements:
+        tl.edit_notes.append(
+            f"Added {len(placements)} click SFX cues across punch cuts, overlays, and emphasis beats."
+        )
+    return tl, placements
 
 
 def build_vertical_short_timelines(
@@ -268,6 +587,8 @@ def build_vertical_short_timelines(
     platform_format: TargetPlatformFormat = TargetPlatformFormat.YOUTUBE_SHORTS,
     max_variants: int = 3,
     sfx_paths: dict[str, str] | None = None,
+    style_name: str = "short_form_viral",
+    extra_overlays: list[AnimationRenderResult] | None = None,
 ) -> list[RenderTimeline]:
     """Create genuinely distinct vertical 9:16 edit plans (Hook / Mechanism / Payoff) across the video."""
     ranked = sorted(
@@ -316,16 +637,28 @@ def build_vertical_short_timelines(
             existing_starts.append(round(st, 1))
 
     role_labels = ["Hook Cut", "Mechanism Breakdown", "Payoff & Takeaway"]
+    anim_pool: list[AnimationRenderResult] = []
+    seen_out: set[str] = set()
+    for a in ([animation_result] if animation_result else []) + list(extra_overlays or []):
+        if a is not None and a.output_path not in seen_out:
+            seen_out.add(a.output_path)
+            anim_pool.append(a)
+
     out: list[RenderTimeline] = []
     for v_idx, hl in enumerate(chosen[:max_variants]):
         from symposium_studio.models.symposium import StoryboardBeat
 
         tag = role_labels[v_idx] if v_idx < len(role_labels) else f"Variant {v_idx + 1}"
-        # Composite animation on either explicit visual highlight or Variant #1 (#0 is hook, #1 is mechanism)
-        attach_anim = animation_result is not None and (
-            (v_idx == 0 and hl.visual_opportunity_type is not None)
-            or (v_idx == 1 and animation_result is not None)
-        )
+        # Composite distinct meme/visual per variant in zoomer mode, or standard placement otherwise
+        if style_name == "zoomer_vlog" and anim_pool:
+            chosen_anim = anim_pool[v_idx % len(anim_pool)]
+            attach_anim = True
+        else:
+            chosen_anim = animation_result
+            attach_anim = chosen_anim is not None and (
+                (v_idx == 0 and hl.visual_opportunity_type is not None)
+                or (v_idx == 1 and chosen_anim is not None)
+            )
         sb = Storyboard(
             storyboard_id=f"sb_short_{v_idx}_{uuid.uuid4().hex[:5]}",
             project_id=project_id,
@@ -352,8 +685,8 @@ def build_vertical_short_timelines(
             title=f"{base_title} [{platform_format.value} #{v_idx + 1}: {tag}]",
             analysis=analysis,
             storyboard=sb,
-            style_name="short_form_viral",
-            animation_result=animation_result if attach_anim else None,
+            style_name=style_name,
+            animation_result=chosen_anim if attach_anim else None,
             platform_format=platform_format,
             sfx_paths=sfx_paths,
         )

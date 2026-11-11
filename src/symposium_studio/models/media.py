@@ -146,6 +146,7 @@ class EditingStyleName(str, Enum):
     PODCAST_HIGHLIGHTS = "podcast_highlights"
     COMEDY = "comedy"
     PERSONAL_VLOG = "personal_vlog"
+    ZOOMER_VLOG = "zoomer_vlog"
     SHORT_FORM_VIRAL = "short_form_viral"
     MINIMAL_PROFESSIONAL = "minimal_professional"
 

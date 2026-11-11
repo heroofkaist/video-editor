@@ -17,9 +17,10 @@ from symposium_studio.engines.distribution import (
     execute_publish,
     generate_threads_posts,
 )
-from symposium_studio.engines.effects import search_effects
+from symposium_studio.engines.effects import download_click_sounds, search_effects
 from symposium_studio.engines.growth import GrowthIntelligenceEngine
 from symposium_studio.engines.production import (
+    add_click_sounds_to_timeline,
     apply_iterative_edit,
     build_timeline_from_storyboard,
     build_vertical_short_timelines,
@@ -30,7 +31,9 @@ from symposium_studio.engines.production import (
     run_quality_assurance,
 )
 from symposium_studio.engines.research import (
+    MemeTrendConnector,
     ResearchIntelligenceEngine,
+    download_trending_meme_assets,
     import_explicit_item,
     import_items_from_json,
     infer_platform_from_url,
@@ -328,6 +331,133 @@ class SymposiumStudio:
                 )
         return session, anim_res
 
+    def _meme_batch_animations(self, ws_dir: Path, max_count: int = 3) -> list[AnimationRenderResult]:
+        anim_dir = ws_dir / "animations"
+        if not anim_dir.exists():
+            return []
+        found: list[AnimationRenderResult] = []
+        for sp in sorted(anim_dir.glob("anim_*.spec.json")):
+            try:
+                spec = SceneSpec.model_validate_json(sp.read_text(encoding="utf-8"))
+                if spec.template_id != "meme_reaction_card":
+                    continue
+                mov = anim_dir / f"{spec.scene_id}.mov"
+                mp4 = anim_dir / f"{spec.scene_id}.mp4"
+                out_file = mov if mov.exists() else mp4
+                if out_file.exists():
+                    found.append(
+                        AnimationRenderResult(
+                            scene_id=spec.scene_id,
+                            adapter_used=spec.preferred_adapter or "chromium_canvas",
+                            output_path=str(out_file),
+                            has_alpha=mov.exists(),
+                            width=spec.width,
+                            height=spec.height,
+                            fps=float(spec.fps),
+                            duration_sec=spec.duration_sec,
+                            scene_spec_path=str(sp),
+                            render_time_sec=0.0,
+                            factuality_mode=spec.factuality_mode,
+                        )
+                    )
+            except Exception:
+                continue
+        return found[-max_count:]
+
+    def _build_meme_card_text(
+        self,
+        slot_idx: int,
+        beat_excerpt: str,
+        meme_topic: str,
+    ) -> tuple[str, str, str]:
+        low = (beat_excerpt or "").lower()
+        accents = ["#FACC15", "#38BDF8", "#F43F5E"]
+        accent = accents[slot_idx % len(accents)]
+        if slot_idx == 0:
+            if any(k in low for k in ("ожида", "реальн", "капсул", "два года", "2 года", "жыл", "expect")):
+                return "ОЖИДАНИЕ vs РЕАЛЬНОСТЬ 👀", "Капсула времени на 2 года: не сдуйся!", accent
+            words = beat_excerpt.strip().split()
+            short = " ".join(words[:7]) if words else meme_topic
+            return "POV: HOOK 👀", short, accent
+        if slot_idx == 1:
+            if any(k in low for k in ("семестр", "тяжел", "слож", "major", "резюм", "интерн", "qi", "quiz", "data struct")):
+                return "STUDENT REALITY CHECK 💀", "1 семестр + резюме + стажировки 💀", accent
+            words = beat_excerpt.strip().split()
+            short = " ".join(words[:7]) if words else meme_topic
+            return "WAIT A SECOND ⚡", short, accent
+        if any(k in low for k in ("деньг", "зараб", "стипенд", "gpa", "dean", "ақша", "бизнес", "quiz")):
+            return "LOCK IN MODE 🎯", "GPA 3.8 + свой доход + Quiz завтра 🔥", accent
+        words = beat_excerpt.strip().split()
+        short = " ".join(words[:7]) if words else meme_topic
+        return "NO CAP 🔥", short, accent
+
+    def _generate_zoomer_meme_cards(
+        self,
+        manifest: ProjectManifest,
+        analysis: MediaAnalysisBundle,
+        session: SymposiumSession,
+        max_cards: int = 3,
+    ) -> tuple[list[AnimationRenderResult], list[dict[str, Any]]]:
+        ws_dir = Path(manifest.project.workspace_dir)
+        pid = manifest.project.project_id
+        full_text = " ".join(s.text for s in analysis.transcript.segments)
+        query_seed = f"{manifest.project.name} {' '.join(k for t in analysis.topics for k in t.keywords[:4])} {full_text[:300]}"
+        live_memes = MemeTrendConnector().fetch_public_items(query=query_seed, limit=15)
+        for it in live_memes:
+            self.db.upsert_viral_item(it)
+        downloaded = download_trending_meme_assets(live_memes, ws_dir / "memes", max_count=max(max_cards + 1, 4))
+
+        beats = session.storyboard.beats
+        hl_map = {h.highlight_id: h.transcript_excerpt for h in analysis.highlights}
+        if not beats:
+            beat_indices = [0]
+        elif len(beats) == 1:
+            beat_indices = [0]
+        elif len(beats) == 2:
+            beat_indices = [0, 1]
+        else:
+            beat_indices = [0, len(beats) // 2, len(beats) - 1]
+
+        rendered_anims: list[AnimationRenderResult] = []
+        for slot_i, b_idx in enumerate(beat_indices[:max_cards]):
+            beat = beats[b_idx]
+            excerpt = ""
+            for eid in beat.evidence_ids:
+                if eid in hl_map and hl_map[eid]:
+                    excerpt = hl_map[eid]
+                    break
+            if not excerpt and analysis.transcript.segments:
+                excerpt = next(
+                    (
+                        s.text
+                        for s in analysis.transcript.segments
+                        if s.end_sec >= beat.source_start_sec and s.start_sec <= beat.source_end_sec
+                    ),
+                    analysis.transcript.segments[0].text,
+                )
+            meme_meta = downloaded[slot_i % len(downloaded)] if downloaded else {}
+            meme_topic = str(meme_meta.get("topic") or meme_meta.get("title") or "Trending Reaction")
+            top_label, reaction_text, accent = self._build_meme_card_text(slot_i, excerpt, meme_topic)
+            anim = self.generate_animation(
+                pid,
+                template_id="meme_reaction_card",
+                title=f"Meme Card #{slot_i + 1}: {meme_topic[:36]}",
+                duration_sec=3.4,
+                width=960,
+                height=720,
+                transparent_background=True,
+                parameters={
+                    "top_label": top_label,
+                    "meme_name": meme_topic[:32],
+                    "reaction_text": reaction_text,
+                    "image_path": str(meme_meta.get("image_path") or ""),
+                    "image_url": str(meme_meta.get("original_url") or ""),
+                    "accent_color": accent,
+                },
+            )
+            rendered_anims.append(anim)
+        return rendered_anims, downloaded
+
     def build_and_render_deliverables(
         self,
         project_id: str,
@@ -335,14 +465,23 @@ class SymposiumStudio:
         include_tiktok: bool = True,
         include_reels: bool = True,
         short_variants_per_platform: int = 1,
+        extra_animations: list[AnimationRenderResult] | None = None,
+        download_click_sounds: bool = False,
     ) -> dict[str, Any]:
         analysis = self.load_analysis(project_id)
         manifest = self.workspaces.get_manifest(project_id)
         session, anim_res = self._latest_symposium_and_anim(manifest)
         ws_dir = Path(manifest.project.workspace_dir)
 
+        resolved_extra = list(extra_animations or [])
+        if extra_animations is None and manifest.project.editing_style == "zoomer_vlog":
+            meme_batch = self._meme_batch_animations(ws_dir, max_count=3)
+            if meme_batch:
+                anim_res = meme_batch[0]
+                resolved_extra = meme_batch[1:]
+
         with self.workspaces.track_run(project_id, "build_and_render_deliverables") as (manifest, run):
-            sfx_map = ensure_project_sfx(ws_dir / "effects")
+            sfx_map = ensure_project_sfx(ws_dir / "effects", download_clicks=download_click_sounds)
             # 1. Main YouTube 16:9 timeline & render
             yt_tl = build_timeline_from_storyboard(
                 project_id=project_id,
@@ -353,6 +492,7 @@ class SymposiumStudio:
                 animation_result=anim_res,
                 platform_format=TargetPlatformFormat.YOUTUBE_LONG,
                 sfx_paths=sfx_map,
+                extra_overlays=resolved_extra,
             )
             yt_tl_json = ws_dir / "timelines" / f"{yt_tl.timeline_id}_youtube.json"
             yt_tl_json.write_text(yt_tl.model_dump_json(indent=2), encoding="utf-8")
@@ -394,6 +534,7 @@ class SymposiumStudio:
                 (include_tiktok, TargetPlatformFormat.TIKTOK, AssetRole.RENDER_TIKTOK),
                 (include_reels, TargetPlatformFormat.INSTAGRAM_REELS, AssetRole.RENDER_REEL),
             ]
+            short_style = "zoomer_vlog" if manifest.project.editing_style == "zoomer_vlog" else "short_form_viral"
             for enabled, fmt, role in platform_specs:
                 if not enabled:
                     continue
@@ -405,6 +546,8 @@ class SymposiumStudio:
                     platform_format=fmt,
                     max_variants=short_variants_per_platform,
                     sfx_paths=sfx_map,
+                    style_name=short_style,
+                    extra_overlays=resolved_extra,
                 )
                 short_outputs[fmt.value] = []
                 for idx, vtl in enumerate(v_tls):
@@ -440,18 +583,131 @@ class SymposiumStudio:
             "vertical_variants": short_outputs,
         }
 
+    def add_click_sounds(
+        self,
+        project_id: str,
+        custom_urls: dict[str, str] | None = None,
+        search_query: str | None = None,
+        allow_network: bool = True,
+        render_video: bool = True,
+        include_shorts: bool = True,
+        min_spacing_sec: float | None = None,
+    ) -> dict[str, Any]:
+        """Download real internet click SFX and insert them at punch cuts, overlays, and emphasis beats."""
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        dl = download_click_sounds(
+            ws_dir / "effects",
+            custom_urls=custom_urls,
+            search_query=search_query,
+            allow_network=allow_network,
+        )
+        click_paths = dl["click_paths"]
+
+        tl_files = sorted((ws_dir / "timelines").glob("*_youtube.json"))
+        if not tl_files:
+            raise FileNotFoundError("No YouTube timeline found yet to add click sounds.")
+        yt_json_path = tl_files[-1]
+        yt_tl = RenderTimeline.model_validate_json(yt_json_path.read_text(encoding="utf-8"))
+        updated_yt, yt_placements = add_click_sounds_to_timeline(
+            yt_tl,
+            click_paths,
+            style_name=manifest.project.editing_style,
+            min_spacing_sec=min_spacing_sec,
+            replace_existing=True,
+        )
+        yt_json_path.write_text(updated_yt.model_dump_json(indent=2), encoding="utf-8")
+        yt_otio_path = ws_dir / "timelines" / f"{updated_yt.timeline_id}_youtube.otio"
+        export_otio(updated_yt, yt_otio_path)
+
+        yt_mp4 = ws_dir / "renders" / f"{manifest.project.slug}_youtube_1080p.mp4"
+        yt_qa_payload: dict[str, Any] | None = None
+        if render_video:
+            render_timeline(updated_yt, yt_mp4, ws_dir)
+            yt_qa = run_quality_assurance(project_id, yt_mp4, updated_yt, ws_dir / "reports" / "qa_frames")
+            (ws_dir / "reports" / f"qa_{updated_yt.timeline_id}.json").write_text(
+                yt_qa.model_dump_json(indent=2), encoding="utf-8"
+            )
+            yt_qa_payload = yt_qa.model_dump(mode="json")
+
+        short_updates: list[dict[str, Any]] = []
+        if include_shorts:
+            otio_assets = [a for a in manifest.assets if a.role == AssetRole.TIMELINE_OTIO]
+            for fmt in ("youtube_shorts", "tiktok", "instagram_reels"):
+                matched_jsons: list[Path] = []
+                seen_stems: set[str] = set()
+                for asset in otio_assets:
+                    ap = Path(asset.absolute_path or asset.relative_path)
+                    if ap.name.endswith(f"_{fmt}.otio"):
+                        jp = ws_dir / "timelines" / f"{ap.stem}.json"
+                        if jp.is_file() and jp.stem not in seen_stems:
+                            matched_jsons.append(jp)
+                            seen_stems.add(jp.stem)
+                if not matched_jsons:
+                    matched_jsons = sorted((ws_dir / "timelines").glob(f"*_{fmt}.json"), key=lambda p: p.stat().st_mtime)
+                short_style = "zoomer_vlog" if manifest.project.editing_style == "zoomer_vlog" else "short_form_viral"
+                for idx, s_json in enumerate(matched_jsons):
+                    stl = RenderTimeline.model_validate_json(s_json.read_text(encoding="utf-8"))
+                    ustl, s_placements = add_click_sounds_to_timeline(
+                        stl,
+                        click_paths,
+                        style_name=short_style,
+                        min_spacing_sec=min_spacing_sec,
+                        replace_existing=True,
+                    )
+                    s_json.write_text(ustl.model_dump_json(indent=2), encoding="utf-8")
+                    export_otio(ustl, ws_dir / "timelines" / f"{ustl.timeline_id}_{fmt}.otio")
+                    s_mp4 = ws_dir / "shorts" / f"{manifest.project.slug}_{fmt}_{idx + 1}.mp4"
+                    if render_video:
+                        render_timeline(ustl, s_mp4, ws_dir)
+                    short_updates.append(
+                        {
+                            "platform": fmt,
+                            "variant": idx + 1,
+                            "timeline_id": ustl.timeline_id,
+                            "click_count": len(s_placements),
+                            "video_path": str(s_mp4),
+                        }
+                    )
+
+        with self.workspaces.track_run(project_id, "add_click_sounds") as (m2, run):
+            src_manifest = Path(dl["manifest_path"])
+            if src_manifest.is_file():
+                a_src = self.workspaces.register_asset(m2, run.run_id, AssetRole.SFX_ASSET, src_manifest)
+                run.output_asset_ids.append(a_src.asset_id)
+
+        return {
+            "command": "add_click_sounds",
+            "downloaded_count": dl["downloaded_count"],
+            "cached_count": dl["cached_count"],
+            "fallback_count": dl["fallback_count"],
+            "sources": dl["sources"],
+            "sfx_manifest_path": dl["manifest_path"],
+            "youtube_click_count": len(yt_placements),
+            "placements": yt_placements,
+            "revision": updated_yt.revision,
+            "video_path": str(yt_mp4) if render_video else None,
+            "qa": yt_qa_payload,
+            "shorts_updated": short_updates,
+        }
+
     # ------------------------------------------------------------------
     # Iterative Agent Instructions
     # ------------------------------------------------------------------
     def apply_agent_instruction(self, project_id: str, instruction: str) -> dict[str, Any]:
-        """Support natural-language iterative commands (edit timeline, generate animation, generate shorts, Threads/Telegram)."""
+        """Support natural-language iterative commands (edit timeline, click SFX, animation, shorts, Threads/Telegram)."""
         low = instruction.lower()
         manifest = self.workspaces.get_manifest(project_id)
         ws_dir = Path(manifest.project.workspace_dir)
 
+        if "click" in low or "sfx" in low or ("sound" in low and ("add" in low or "download" in low)):
+            return self.add_click_sounds(project_id, allow_network=True, render_video=True)
+
         if "animation" in low and ("create" in low or "generate" in low or "show" in low):
             tmpl = "em_induction_faraday"
-            if "circuit" in low or "voltage" in low or "signal" in low:
+            if "meme" in low or "zoomer" in low:
+                tmpl = "meme_reaction_card"
+            elif "circuit" in low or "voltage" in low or "signal" in low:
                 tmpl = "rlc_signal_flow"
             elif "tree" in low or "algorithm" in low or "data structure" in low:
                 tmpl = "binary_tree_trace"
@@ -468,14 +724,21 @@ class SymposiumStudio:
             analysis = self.load_analysis(project_id)
             _, anim_res = self._latest_symposium_and_anim(manifest)
             sfx_map = ensure_project_sfx(ws_dir / "effects")
+            extra_memes = (
+                self._meme_batch_animations(ws_dir, max_count=3)
+                if manifest.project.editing_style == "zoomer_vlog"
+                else []
+            )
             v_tls = build_vertical_short_timelines(
                 project_id=project_id,
                 base_title=manifest.project.name,
                 analysis=analysis,
-                animation_result=anim_res,
+                animation_result=extra_memes[0] if extra_memes else anim_res,
                 platform_format=TargetPlatformFormat.YOUTUBE_SHORTS,
                 max_variants=3,
                 sfx_paths=sfx_map,
+                style_name="zoomer_vlog" if manifest.project.editing_style == "zoomer_vlog" else "short_form_viral",
+                extra_overlays=extra_memes[1:] if len(extra_memes) > 1 else None,
             )
             rendered = []
             for idx, vtl in enumerate(v_tls):
@@ -676,6 +939,7 @@ class SymposiumStudio:
         telegram_channel: str = "@symposium_lab",
         discover_live_research: bool = False,
         short_variants_per_platform: int = 1,
+        download_click_sounds: bool | None = None,
     ) -> dict[str, Any]:
         """Execute complete end-to-end pipeline from raw footage to multi-platform campaign."""
         manifest = self.create_project(name=name, creator_niche=creator_niche, editing_style=editing_style)
@@ -687,15 +951,38 @@ class SymposiumStudio:
         if discover_live_research:
             discovery_summary = self.discover_live_research(target_count=100, query=" ".join(keywords[:3]) or None)
         research_rep = self.run_research_report(pid, "content_proposal", keywords)
-        session = self.run_symposium_conference(pid, mode=symposium_mode, style_name=editing_style)
+        is_long_zoomer = editing_style == "zoomer_vlog" and analysis.probe.duration_sec > 120.0
+        target_min = 90.0 if is_long_zoomer else 60.0
+        target_max = min(145.0, max(95.0, analysis.probe.duration_sec * 0.78)) if is_long_zoomer else 90.0
+        session = self.run_symposium_conference(
+            pid,
+            mode=symposium_mode,
+            style_name=editing_style,
+            target_min_sec=target_min,
+            target_max_sec=target_max,
+        )
 
         # Pick template decided by Symposium storyboard if not explicitly specified
         chosen_tmpl = animation_template or next(
             (b.animation_template for b in session.storyboard.beats if b.animation_template),
-            "em_induction_faraday",
+            "meme_reaction_card" if editing_style == "zoomer_vlog" else "em_induction_faraday",
         )
-        anim = self.generate_animation(pid, template_id=chosen_tmpl, duration_sec=6.5)
-        renders = self.build_and_render_deliverables(pid, short_variants_per_platform=short_variants_per_platform)
+        downloaded_memes: list[dict[str, Any]] = []
+        extra_anims: list[AnimationRenderResult] = []
+        if chosen_tmpl == "meme_reaction_card" or editing_style == "zoomer_vlog":
+            meme_anims, downloaded_memes = self._generate_zoomer_meme_cards(manifest, analysis, session, max_cards=3)
+            anim = meme_anims[0]
+            extra_anims = meme_anims[1:]
+        else:
+            anim = self.generate_animation(pid, template_id=chosen_tmpl, duration_sec=6.5)
+
+        resolved_download_clicks = bool(discover_live_research) if download_click_sounds is None else bool(download_click_sounds)
+        renders = self.build_and_render_deliverables(
+            pid,
+            short_variants_per_platform=short_variants_per_platform,
+            extra_animations=extra_anims,
+            download_click_sounds=resolved_download_clicks,
+        )
         social = self.generate_social_and_telegram(pid, telegram_channel=telegram_channel)
         report = self.write_production_report(pid)
 
@@ -705,6 +992,7 @@ class SymposiumStudio:
             "detected_language": analysis.transcript.detected_language,
             "highlights_count": len(analysis.highlights),
             "discovery": discovery_summary,
+            "trending_memes": downloaded_memes,
             "research_report_id": research_rep.report_id,
             "symposium_session_id": session.session_id,
             "animation": anim.model_dump(mode="json"),

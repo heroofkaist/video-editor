@@ -6,12 +6,17 @@ and encodes alpha-preserving ProRes4444 MOV or H.264 MP4 deliverables via FFmpeg
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
+
+from PIL import Image
 
 from symposium_studio.engines.animation.base import AnimationAdapter
 from symposium_studio.models.animation import (
@@ -35,9 +40,39 @@ def _safe_script_json(payload: dict) -> str:
     )
 
 
+def _embed_local_meme_image(spec: SceneSpec) -> SceneSpec:
+    """Validate local meme image via Pillow and inline a safe data URI for headless Canvas rendering."""
+    if spec.template_id != "meme_reaction_card":
+        return spec
+    raw_path = str(spec.parameters.get("image_path") or "").strip()
+    if not raw_path:
+        return spec
+    p = Path(raw_path)
+    if not p.is_file() or p.stat().st_size > 6_000_000:
+        return spec
+    try:
+        with Image.open(p) as im:
+            im_conv = im.convert("RGBA") if "A" in im.getbands() else im.convert("RGB")
+            im_conv.thumbnail((880, 620), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            im_conv.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return spec.model_copy(
+                update={"parameters": {**spec.parameters, "image_data_uri": f"data:image/png;base64,{b64}"}}
+            )
+    except Exception:
+        return spec
+
+
 def _build_canvas_html(spec: SceneSpec) -> str:
     spec_json = _safe_script_json(spec.model_dump(mode="json"))
     bg_css = "transparent" if spec.transparent_background else spec.theme_palette.get("bg", "#0B1020")
+    raw_uri = str(spec.parameters.get("image_data_uri") or "")
+    preload_tag = (
+        f'<img id="memePreload" src="{raw_uri}" style="display:none" />'
+        if re.fullmatch(r"data:image/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+", raw_uri)
+        else ""
+    )
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -47,12 +82,13 @@ def _build_canvas_html(spec: SceneSpec) -> str:
     margin: 0; padding: 0; overflow: hidden;
     background: {bg_css};
     width: {spec.width}px; height: {spec.height}px;
-    font-family: 'Helvetica Neue', 'SF Pro Display', system-ui, sans-serif;
+    font-family: 'Verdana', 'Helvetica Neue', 'SF Pro Display', system-ui, sans-serif;
   }}
   canvas {{ display: block; width: {spec.width}px; height: {spec.height}px; }}
 </style>
 </head>
 <body>
+{preload_tag}
 <canvas id="stage" width="{spec.width}" height="{spec.height}"></canvas>
 <script>
 const SPEC = {spec_json};
@@ -549,8 +585,119 @@ function renderKineticCallout(t, dur, box) {{
   ctx.restore();
 }}
 
+function wrapLines(text, maxW, fontSpec, maxLines) {{
+  ctx.font = fontSpec;
+  const words = String(text || '').trim().split(/\\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {{
+    const cand = cur ? cur + ' ' + w : w;
+    if (ctx.measureText(cand).width <= maxW || !cur) {{
+      cur = cand;
+    }} else {{
+      lines.push(cur);
+      cur = w;
+      if (lines.length >= maxLines) break;
+    }}
+  }}
+  if (cur && lines.length < maxLines) lines.push(cur);
+  return lines;
+}}
+
+function renderMemeReactionCard(t, dur) {{
+  const params = SPEC.parameters || {{}};
+  const topLabel = String(params.top_label || 'TRENDING MEME').toUpperCase();
+  const memeName = String(params.meme_name || 'Reaction');
+  const reactionText = String(params.reaction_text || SPEC.title || '');
+  const accent = String(params.accent_color || '#FACC15');
+
+  const inT = clamp01(t / 0.24);
+  const outT = clamp01((dur - t) / 0.18);
+  const bounce = t < 0.24 ? (0.72 + 0.28 * easeInOut(inT) + 0.08 * Math.sin(inT * Math.PI)) : 1.0;
+  const alpha = Math.min(inT * 1.15, outT, 1.0);
+  const wobble = Math.sin(t * 3.0) * 0.008;
+
+  const cardW = W * 0.84;
+  const cardH = H * 0.84;
+  const cx = W * 0.5;
+  const cy = H * 0.5;
+
+  ctx.save();
+  ctx.globalAlpha = Math.max(0.0, alpha);
+  ctx.translate(cx, cy);
+  ctx.rotate(-0.022 + wobble);
+  ctx.scale(bounce, bounce);
+
+  const x0 = -cardW * 0.5;
+  const y0 = -cardH * 0.5;
+
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.72)';
+  ctx.shadowBlur = 30;
+  drawRoundedRect(x0, y0, cardW, cardH, 28, 'rgba(15, 23, 42, 0.96)', accent, 5.0);
+  ctx.shadowBlur = 0;
+
+  // Top trend badge pill
+  const pillFont = '800 ' + Math.round(H * 0.030) + 'px Verdana, Helvetica Neue, sans-serif';
+  ctx.font = pillFont;
+  const pillW = Math.min(cardW * 0.62, Math.max(180, ctx.measureText(topLabel).width + 38));
+  const pillH = Math.round(H * 0.056);
+  drawRoundedRect(x0 + 22, y0 + 18, pillW, pillH, pillH * 0.5, accent, accent, 1);
+  ctx.fillStyle = '#0F172A';
+  ctx.fillText(topLabel, x0 + 40, y0 + 18 + pillH * 0.68);
+
+  // Subtle format name right-aligned
+  ctx.fillStyle = '#94A3B8';
+  ctx.font = '700 ' + Math.round(H * 0.024) + 'px Verdana, Helvetica Neue, sans-serif';
+  const tagTxt = memeName.slice(0, 26);
+  const tagW = ctx.measureText(tagTxt).width;
+  ctx.fillText(tagTxt, x0 + cardW - 24 - tagW, y0 + 18 + pillH * 0.68);
+
+  // Meme image viewport (preserve natural aspect ratios, clean rounded frame)
+  const imgX = x0 + 24;
+  const imgY = y0 + 28 + pillH + 10;
+  const imgBoxW = cardW - 48;
+  const imgBoxH = cardH * 0.61;
+  drawRoundedRect(imgX, imgY, imgBoxW, imgBoxH, 18, '#020617', 'rgba(255,255,255,0.16)', 2);
+
+  const imgEl = document.getElementById('memePreload');
+  if (imgEl && imgEl.complete && imgEl.naturalWidth > 0) {{
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(imgX + 2, imgY + 2, imgBoxW - 4, imgBoxH - 4, 16);
+    ctx.clip();
+    const scale = Math.min((imgBoxW - 8) / imgEl.naturalWidth, (imgBoxH - 8) / imgEl.naturalHeight);
+    const dw = imgEl.naturalWidth * scale;
+    const dh = imgEl.naturalHeight * scale;
+    ctx.drawImage(imgEl, imgX + (imgBoxW - dw) * 0.5, imgY + (imgBoxH - dh) * 0.5, dw, dh);
+    ctx.restore();
+  }}
+
+  // Bottom bold reaction text banner
+  const textY0 = imgY + imgBoxH + Math.round(H * 0.052);
+  const reactFontPx = Math.max(24, Math.round(H * 0.046));
+  const reactFont = '900 ' + reactFontPx + 'px Verdana, Helvetica Neue, sans-serif';
+  const lines = wrapLines(reactionText, cardW - 56, reactFont, 2);
+  ctx.font = reactFont;
+  ctx.textAlign = 'center';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(5, Math.round(reactFontPx * 0.16));
+  ctx.strokeStyle = '#020617';
+  ctx.fillStyle = '#FFFFFF';
+  lines.forEach((ln, idx) => {{
+    const ly = textY0 + idx * (reactFontPx * 1.18);
+    ctx.strokeText(ln, 0, ly);
+    ctx.fillText(ln, 0, ly);
+  }});
+  ctx.textAlign = 'left';
+  ctx.restore();
+}}
+
 window.renderAtTime = function(t, dur) {{
   ctx.clearRect(0, 0, W, H);
+  if (SPEC.template_id === 'meme_reaction_card') {{
+    renderMemeReactionCard(t, dur);
+    return;
+  }}
   const fade = Math.min(1, t / 0.35, Math.max(0.0, (dur - t) / 0.35));
   const box = drawBackdropCard(
     0.96 * Math.max(0.15, fade),
@@ -689,8 +836,9 @@ class ChromiumCanvasAdapter(AnimationAdapter):
         spec_path = output_dir / f"{scene_spec.scene_id}.spec.json"
         spec_path.write_text(scene_spec.model_dump_json(indent=2), encoding="utf-8")
 
+        render_spec = _embed_local_meme_image(scene_spec)
         html_path = output_dir / f"{scene_spec.scene_id}.html"
-        html_path.write_text(_build_canvas_html(scene_spec), encoding="utf-8")
+        html_path.write_text(_build_canvas_html(render_spec), encoding="utf-8")
 
         frames_dir = output_dir / f"{scene_spec.scene_id}_frames"
         frames_dir.mkdir(parents=True, exist_ok=True)

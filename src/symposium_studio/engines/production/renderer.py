@@ -10,14 +10,15 @@ from PIL import Image, ImageDraw, ImageFont
 
 from symposium_studio.engines.effects.library import EFFECTS_CATALOG
 from symposium_studio.engines.effects.sfx_synth import synthesize_ambient_bed, synthesize_sfx
+from symposium_studio.engines.effects.sound_downloader import DEFAULT_CLICK_SOUNDS, download_click_sounds
 from symposium_studio.engines.production.captions import write_ass, write_srt
 from symposium_studio.models.timeline import RenderTimeline, TargetPlatformFormat
 
 
-def ensure_project_sfx(effects_dir: Path) -> dict[str, str]:
+def ensure_project_sfx(effects_dir: Path, download_clicks: bool = False) -> dict[str, str]:
     effects_dir.mkdir(parents=True, exist_ok=True)
     sfx_map: dict[str, str] = {}
-    for preset in ("whoosh_transition", "sub_impact", "riser_tension", "ui_pop"):
+    for preset in ("whoosh_transition", "sub_impact", "riser_tension", "ui_pop", "vine_boom"):
         p = effects_dir / f"{preset}.wav"
         if not p.exists():
             synthesize_sfx(preset, p)
@@ -26,6 +27,14 @@ def ensure_project_sfx(effects_dir: Path) -> dict[str, str]:
     if not bed_path.exists():
         synthesize_ambient_bed(bed_path, duration_sec=24.0, mood="tech_focus")
     sfx_map["ambient_bed"] = str(bed_path.resolve())
+    if download_clicks:
+        dl = download_click_sounds(effects_dir, allow_network=True)
+        sfx_map.update(dl["click_paths"])
+    else:
+        for click_preset in DEFAULT_CLICK_SOUNDS:
+            cp = effects_dir / f"{click_preset}.wav"
+            if cp.is_file():
+                sfx_map[click_preset] = str(cp.resolve())
     return sfx_map
 
 
@@ -47,10 +56,10 @@ def _build_atempo_chain(speed: float) -> str:
 
 
 def _color_filter_for_style(style_profile: str) -> str:
+    if "zoomer" in style_profile or "high_energy" in style_profile or "short_form" in style_profile or "comedy" in style_profile:
+        return "eq=contrast=1.09:saturation=1.14:brightness=0.015,unsharp=3:3:0.35"
     if "cinematic" in style_profile or "vlog" in style_profile:
         return "eq=contrast=1.06:saturation=1.05,vignette=PI/7"
-    if "high_energy" in style_profile or "short_form" in style_profile or "comedy" in style_profile:
-        return "eq=contrast=1.09:saturation=1.14:brightness=0.015,unsharp=3:3:0.35"
     return "eq=contrast=1.05:saturation=1.06,unsharp=3:3:0.25"
 
 
@@ -282,18 +291,42 @@ def render_thumbnail(
     """Extract a sharp frame from rendered/source video and design a high-contrast 1280x720 thumbnail."""
     out_png.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="symposium_thumb_") as tmpdir:
-        raw_frame = Path(tmpdir) / "frame.png"
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", f"{max(0.0, capture_sec):.3f}",
-                "-i", str(source_video),
-                "-vframes", "1",
-                str(raw_frame),
-            ],
-            check=True,
-        )
-        base = Image.open(raw_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
+        best_frame: Path | None = None
+        best_score = -1.0
+        try:
+            import cv2  # noqa: PLC0415
+        except Exception:
+            cv2 = None
+
+        candidates = [max(0.0, capture_sec + off) for off in (0.0, -0.9, 1.3, 2.5)]
+        for idx, ts in enumerate(candidates):
+            cand = Path(tmpdir) / f"frame_{idx}.png"
+            proc = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{ts:.3f}",
+                    "-i", str(source_video),
+                    "-vframes", "1",
+                    str(cand),
+                ],
+                check=(idx == 0),
+                capture_output=True,
+            )
+            if proc.returncode != 0 or not cand.is_file() or cand.stat().st_size == 0:
+                continue
+            score = float(cand.stat().st_size)
+            if cv2 is not None:
+                img_cv = cv2.imread(str(cand), cv2.IMREAD_GRAYSCALE)
+                if img_cv is not None:
+                    score = float(cv2.Laplacian(img_cv, cv2.CV_64F).var())
+            if best_frame is None or score > best_score:
+                best_frame = cand
+                best_score = score
+            if cv2 is None:
+                break
+        if best_frame is None:
+            raise RuntimeError(f"Failed to extract thumbnail frame from {source_video}")
+        base = Image.open(best_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
 
     # Dark left gradient scrim kept compact so subject & right-hand board stay crisp
     overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
@@ -305,11 +338,21 @@ def render_thumbnail(
     combined = Image.alpha_composite(base, overlay)
     d = ImageDraw.Draw(combined)
 
-    font_path = "/System/Library/Fonts/HelveticaNeue.ttc"
-    try:
-        title_font = ImageFont.truetype(font_path, 48)
-        badge_font = ImageFont.truetype(font_path, 22)
-    except Exception:
+    title_font = None
+    badge_font = None
+    for font_candidate in (
+        "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+    ):
+        if Path(font_candidate).is_file():
+            try:
+                title_font = ImageFont.truetype(font_candidate, 46)
+                badge_font = ImageFont.truetype(font_candidate, 21)
+                break
+            except Exception:
+                continue
+    if title_font is None or badge_font is None:
         title_font = ImageFont.load_default()
         badge_font = ImageFont.load_default()
 

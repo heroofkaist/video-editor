@@ -8,17 +8,20 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import io
 import json
 import os
 import re
 import statistics
 import uuid
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
 import httpx
+from PIL import Image
 
 from symposium_studio.models.research import (
     ContentCategory,
@@ -655,9 +658,247 @@ def infer_platform_from_url(url: str) -> ResearchPlatform:
     return ResearchPlatform.YOUTUBE
 
 
+_MEME_TOPIC_HINTS: dict[str, tuple[str, ...]] = {
+    "drake": ("vs", "instead", "rather", "choice", "focus", "discipline", "ожидани", "реальн", "таңда", "лучше", "көрсе"),
+    "buttons": ("decision", "choice", "hard", "major", "quiz", "internship", "экзамен", "семестр", "выбор", "мамандық"),
+    "distracted": ("distract", "focus", "habit", "scroll", "hobby", "отвлек", "привычк", "хобби", "фокус"),
+    "change my mind": ("opinion", "expect", "goal", "mind", "дум", "цел", "мақсат", "ой"),
+    "harold": ("pain", "stress", "struggle", "fail", "problem", "hard", "тяжел", "сложн", "қиын", "стресс", "quiz"),
+    "panik": ("quiz", "exam", "deadline", "semester", "money", "экзамен", "семестр", "деньги", "ақша", "стипенд"),
+    "stonks": ("money", "earn", "career", "gpa", "dean", "salary", "зараб", "деньг", "ақша", "стипенд", "бизнес"),
+    "disaster": ("burnout", "crash", "bug", "mistake", "problem", "ошибк", "проблем", "қате"),
+    "skeleton": ("wait", "year", "long", "later", "time capsule", "жд", "год", "жыл", "капсул"),
+    "brain": ("learn", "level", "skill", "code", "algorithm", "data structure", "уч", "код", "программ", "біл"),
+    "pigeon": ("confused", "why", "what", "expect", "почему", "непонят", "сұрақ"),
+    "batman": ("reality", "truth", "slap", "реальн", "правда", "шындық"),
+    "always has been": ("realize", "secret", "truth", "понял", "оказывается"),
+    "escobar": ("alone", "wait", "miss", "скуч", "один", "жд"),
+}
+
+
+class MemeTrendConnector(PlatformConnector):
+    """Fetch live trending meme templates & viral internet formats from public endpoints."""
+
+    platform = ResearchPlatform.INSTAGRAM_POST
+    connector_id = "imgflip_reddit_memes"
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "platform": self.platform.value,
+            "connector_id": self.connector_id,
+            "official_api_configured": True,
+            "notes": (
+                "Queries Imgflip public trending memes endpoint (api.imgflip.com/get_memes) with live "
+                "template usage counts and optional public Reddit /r/memes JSON without bypassing auth walls."
+            ),
+        }
+
+    def fetch_public_items(self, query: str = "", limit: int = 12) -> list[ViralContentItem]:
+        items: list[ViralContentItem] = []
+        raw_memes: list[dict[str, Any]] = []
+        try:
+            resp = httpx.get("https://api.imgflip.com/get_memes", timeout=8.0)
+            if resp.status_code == 200:
+                payload = resp.json()
+                raw_memes = list((payload.get("data") or {}).get("memes") or [])
+        except Exception:
+            raw_memes = []
+
+        if raw_memes:
+            caption_counts = [int(m.get("captions") or 0) for m in raw_memes if int(m.get("captions") or 0) > 0]
+            median_caps = float(statistics.median(caption_counts)) if caption_counts else 100000.0
+            q_low = (query or "").lower()
+            q_tokens = [tok for tok in re.split(r"[\s,.;:!?]+", q_low) if len(tok) >= 2]
+
+            scored_memes: list[tuple[float, dict[str, Any]]] = []
+            for idx, m in enumerate(raw_memes):
+                name = str(m.get("name") or "").strip()
+                url = str(m.get("url") or "").strip()
+                caps = int(m.get("captions") or 0)
+                if not name or not url:
+                    continue
+                low_name = name.lower()
+                rel_bonus = 0.0
+                for tok in q_tokens:
+                    if tok in low_name:
+                        rel_bonus += 0.45
+                for stem, hint_words in _MEME_TOPIC_HINTS.items():
+                    if stem in low_name and any(hw in q_low for hw in hint_words):
+                        rel_bonus += 0.55
+                pop_score = (caps / max(1.0, median_caps)) * 0.4 + max(0.0, (40 - idx) / 80.0)
+                scored_memes.append((rel_bonus + pop_score, m))
+
+            scored_memes.sort(key=lambda x: x[0], reverse=True)
+            for _sc, m in scored_memes[: max(1, limit)]:
+                meme_id = str(m.get("id") or uuid.uuid4().hex[:6])
+                name = str(m.get("name") or "Trending Meme").strip()
+                url = str(m.get("url") or "").strip()
+                caps = int(m.get("captions") or 0)
+                ratio = round(caps / max(1.0, median_caps), 2) if caps > 0 else 1.0
+                tech = ReusableTechnique(
+                    technique_id=f"tech_meme_{meme_id}",
+                    name=f"Meme Cutaway Pop-up: {name}",
+                    mechanism=(
+                        f"Uses live trending meme template '{name}' ({caps:,} documented Imgflip caption instances, "
+                        f"{ratio:.2f}x cohort median) as a 2.5–3.5s visual reaction punch."
+                    ),
+                    applicable_niches=["personal_storytelling", "comedy", "internet_trends", "youtube", "shorts"],
+                    editing_translation=(
+                        f"Pop in '{name}' as an animated PIP card with a 3-word reaction punchline + ui_pop/vine_boom SFX."
+                    ),
+                )
+                items.append(
+                    ViralContentItem(
+                        item_id=f"meme_imgflip_{meme_id}",
+                        platform=ResearchPlatform.INSTAGRAM_POST,
+                        creator="Imgflip Live Trends",
+                        original_url=url,
+                        title=f"{name} (Trending Meme Format)",
+                        published_at=utc_now_iso()[:10],
+                        metrics=PublicEngagementMetrics(
+                            platform=ResearchPlatform.INSTAGRAM_POST,
+                            metric_source="imgflip_live_api",
+                            views=caps if caps > 0 else None,
+                            channel_baseline_views=int(median_caps) if median_caps > 0 else None,
+                            audience_normalized_ratio=ratio,
+                            captured_at=utc_now_iso(),
+                        ),
+                        category=ContentCategory.INTERNET_TRENDS,
+                        topic=name,
+                        opening_hook_structure=f"Visual punchline card anchored by trending format '{name}'.",
+                        editing_style="zoomer_vlog reaction cutaway (animated PIP card + SFX punch)",
+                        narrative_structure="Relatable setup -> instant meme reaction punchline -> spoken beat continuation.",
+                        visual_effects=["spring_pop_in", "meme_reaction_card", "sfx_punch"],
+                        reusable_techniques=[tech],
+                        evidence=(
+                            f"Live response from api.imgflip.com/get_memes: captions_count={caps:,} "
+                            f"(template {m.get('width')}x{m.get('height')}, median_cohort={int(median_caps):,})."
+                        ),
+                        confidence=0.92,
+                        platform_relative_score=0.0,
+                        score_basis="audience_normalized_breakout",
+                        provenance_type="live_public_api",
+                    )
+                )
+
+        if len(items) < limit:
+            try:
+                rr = httpx.get(
+                    "https://www.reddit.com/r/memes/hot.json?limit=8",
+                    headers={"User-Agent": "SymposiumStudio/0.2 (open-source video research)"},
+                    timeout=5.0,
+                )
+                if rr.status_code == 200:
+                    children = (rr.json().get("data") or {}).get("children") or []
+                    for c in children:
+                        if len(items) >= limit:
+                            break
+                        p = c.get("data") or {}
+                        p_url = str(p.get("url") or "")
+                        ups = int(p.get("ups") or p.get("score") or 0)
+                        if not re.search(r"\.(png|jpe?g|webp)(\?.*)?$", p_url, re.I) or ups <= 0:
+                            continue
+                        pid = str(p.get("id") or uuid.uuid4().hex[:6])
+                        title = str(p.get("title") or "Reddit Trending Meme")[:120]
+                        items.append(
+                            ViralContentItem(
+                                item_id=f"meme_reddit_{pid}",
+                                platform=ResearchPlatform.INSTAGRAM_POST,
+                                creator=f"r/memes ({p.get('author', 'community')})",
+                                original_url=p_url,
+                                title=title,
+                                published_at=utc_now_iso()[:10],
+                                metrics=PublicEngagementMetrics(
+                                    platform=ResearchPlatform.INSTAGRAM_POST,
+                                    metric_source="reddit_public_json",
+                                    views=ups,
+                                    likes=ups,
+                                    comments=int(p.get("num_comments") or 0),
+                                    captured_at=utc_now_iso(),
+                                ),
+                                category=ContentCategory.INTERNET_TRENDS,
+                                topic=title,
+                                opening_hook_structure="Current viral post reaction meme from r/memes hot feed.",
+                                editing_style="zoomer_vlog reaction cutaway",
+                                narrative_structure="Setup -> relatable visual reaction.",
+                                reusable_techniques=[
+                                    ReusableTechnique(
+                                        technique_id=f"tech_rd_{pid}",
+                                        name="Current Community Meme Reference",
+                                        mechanism=f"Top trending Reddit /r/memes post ({ups:,} upvotes) ready for visual callback.",
+                                        applicable_niches=["internet_trends", "comedy", "personal_storytelling"],
+                                        editing_translation="Overlay cleanly in upper-right PIP during relatable story beat.",
+                                    )
+                                ],
+                                evidence=f"Public Reddit /r/memes JSON score={ups:,}, comments={int(p.get('num_comments') or 0):,}.",
+                                confidence=0.88,
+                                platform_relative_score=0.0,
+                                score_basis="within_platform_normalized",
+                                provenance_type="live_public_api",
+                            )
+                        )
+            except Exception:
+                pass
+        return items[:limit]
+
+
+def download_trending_meme_assets(
+    items: list[ViralContentItem],
+    dest_dir: Path,
+    max_count: int = 4,
+) -> list[dict[str, Any]]:
+    """Download and validate trending meme images locally into workspace so overlays render deterministically."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for it in items:
+        if len(downloaded) >= max_count:
+            break
+        url = (it.original_url or "").strip()
+        if not url or url in seen_urls:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if not (
+            re.search(r"\.(png|jpe?g|webp)(\?.*)?$", url, re.I)
+            or "imgflip.com" in parsed.netloc.lower()
+            or "redd.it" in parsed.netloc.lower()
+        ):
+            continue
+        seen_urls.add(url)
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", it.item_id)[:48]
+        out_png = dest_dir / f"{safe_id}.png"
+        try:
+            if not out_png.exists():
+                resp = httpx.get(url, timeout=8.0, follow_redirects=True)
+                if resp.status_code != 200 or len(resp.content) < 512 or len(resp.content) > 8_000_000:
+                    continue
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                img.thumbnail((960, 720), Image.Resampling.LANCZOS)
+                img.save(out_png, format="PNG")
+            if out_png.is_file() and out_png.stat().st_size > 512:
+                downloaded.append(
+                    {
+                        "item_id": it.item_id,
+                        "title": it.title,
+                        "topic": it.topic,
+                        "original_url": url,
+                        "image_path": str(out_png.resolve()),
+                        "usage_count": it.metrics.views,
+                        "metric_source": it.metrics.metric_source,
+                    }
+                )
+        except Exception:
+            continue
+    return downloaded
+
+
 def build_default_connectors() -> list[PlatformConnector]:
     return [
         YouTubeOfficialConnector(),
+        MemeTrendConnector(),
         GatedOfficialConnector(
             ResearchPlatform.TIKTOK,
             "tiktok_official",

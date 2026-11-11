@@ -17,16 +17,32 @@ from symposium_studio.models.media import SilenceInterval, SpeakerTurn, Transcri
 def detect_silences(
     media_path: Path,
     duration_sec: float,
-    noise_db: float = -34.0,
+    noise_db: float | None = None,
     min_silence_sec: float = 0.55,
 ) -> list[SilenceInterval]:
+    if noise_db is None:
+        # Adapt threshold for quiet laptop microphones (mean volume < -28 dB)
+        vol_proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", str(media_path), "-af", "highpass=f=80,volumedetect", "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+        )
+        m_mean = re.search(r"mean_volume:\s*([-0-9.]+)\s*dB", vol_proc.stderr or "")
+        if m_mean:
+            mean_db = float(m_mean.group(1))
+            eff_noise_db = max(-52.0, min(-30.0, round(mean_db - 2.5, 1))) if mean_db < -28.0 else -34.0
+        else:
+            eff_noise_db = -34.0
+    else:
+        eff_noise_db = noise_db
+
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-i",
         str(media_path),
         "-af",
-        f"silencedetect=noise={noise_db}dB:d={min_silence_sec}",
+        f"highpass=f=80,silencedetect=noise={eff_noise_db}dB:d={min_silence_sec}",
         "-f",
         "null",
         "-",

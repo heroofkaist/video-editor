@@ -66,6 +66,35 @@ def synthesize_sfx(preset_id: str, out_path: Path, duration_sec: float = 0.65, s
         sig = np.sin(phase) * np.exp(-24.0 * t) * 0.5
         return _write_wav(out_path, sig, sample_rate)
 
+    if preset_id in {"mouse_click", "mechanical_click", "switch_click"}:
+        click_cfg = {
+            "mouse_click": (0.11, 1850.0, 62.0),
+            "mechanical_click": (0.13, 1320.0, 52.0),
+            "switch_click": (0.12, 2350.0, 68.0),
+        }
+        dur, body_hz, decay = click_cfg[preset_id]
+        dur = max(0.08, min(dur, duration_sec))
+        n = int(round(dur * sample_rate))
+        t = np.linspace(0.0, dur, n, endpoint=False)
+        snap = sosfilt(
+            butter(3, [1200.0, 6800.0], btype="bandpass", fs=sample_rate, output="sos"),
+            rng.normal(0.0, 1.0, n),
+        ) * np.exp(-95.0 * t)
+        body = np.sin(2.0 * np.pi * body_hz * t) * np.exp(-decay * t)
+        return _write_wav(out_path, (snap * 0.65 + body * 0.35) * 0.72, sample_rate)
+
+    if preset_id == "vine_boom":
+        dur = min(0.85, max(0.55, duration_sec))
+        n = int(round(dur * sample_rate))
+        t = np.linspace(0.0, dur, n, endpoint=False)
+        # Punchy Gen-Z bass thump: rapid pitch drop 135Hz -> 36Hz + transient snap
+        freq = 36.0 + 99.0 * np.exp(-16.0 * t)
+        phase = 2.0 * np.pi * np.cumsum(freq) / sample_rate
+        sub = np.tanh(1.65 * np.sin(phase)) * np.exp(-4.6 * t)
+        transient = (rng.normal(0.0, 0.25, n) + 0.45 * np.sin(2.0 * np.pi * 220.0 * t)) * np.exp(-65.0 * t)
+        sig = (sub * 0.85 + transient * 0.35)
+        return _write_wav(out_path, sig, sample_rate)
+
     # Subtle ambient harmonic pad bed
     return synthesize_ambient_bed(out_path, duration_sec=max(3.0, duration_sec), mood="tech_focus", sample_rate=sample_rate)
 

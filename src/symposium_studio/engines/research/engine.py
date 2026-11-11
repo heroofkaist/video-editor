@@ -7,6 +7,7 @@ from collections import defaultdict
 from typing import Any
 
 from symposium_studio.engines.research.connectors import (
+    MemeTrendConnector,
     YouTubeOfficialConnector,
     build_default_connectors,
 )
@@ -121,6 +122,7 @@ class ResearchIntelligenceEngine:
         target_count: int = 100,
         categories: list[str] | None = None,
         query: str | None = None,
+        include_memes: bool = True,
     ) -> dict[str, Any]:
         """Fetch real public items across multiple niches/creators and score relative to channel baseline."""
         yt = YouTubeOfficialConnector()
@@ -130,6 +132,23 @@ class ResearchIntelligenceEngine:
             categories=cat_enums,
             query=query,
         )
+        want_memes = include_memes and (
+            target_count >= 50
+            or bool(query)
+            or (
+                bool(cat_enums)
+                and any(
+                    c in {ContentCategory.INTERNET_TRENDS, ContentCategory.COMEDY, ContentCategory.PERSONAL_STORYTELLING}
+                    for c in cat_enums
+                )
+            )
+        )
+        if want_memes:
+            meme_items = MemeTrendConnector().fetch_public_items(
+                query=query or "",
+                limit=min(20, max(6, target_count // 6)),
+            )
+            discovered.extend(meme_items)
         for it in discovered:
             self.db.upsert_viral_item(it)
 

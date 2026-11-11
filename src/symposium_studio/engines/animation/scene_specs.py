@@ -212,6 +212,33 @@ def build_scene_spec(
             ],
         )
 
+    if template_id == "meme_reaction_card":
+        return SceneSpec(
+            scene_id=scene_id,
+            title=title or "Trending Meme Reaction",
+            domain=AnimationDomain.STORYTELLING,
+            template_id=template_id,
+            factuality_mode=FactualityMode.ARTISTIC_ILLUSTRATION,
+            duration_sec=duration_sec,
+            width=width,
+            height=height,
+            fps=fps,
+            transparent_background=transparent_background,
+            preferred_adapter=preferred_adapter,
+            parameters={
+                "top_label": params.get("top_label", "TRENDING MEME"),
+                "meme_name": params.get("meme_name", "Live Trend"),
+                "reaction_text": params.get("reaction_text", title or "Wait for it"),
+                "image_path": params.get("image_path", ""),
+                "image_url": params.get("image_url", ""),
+                "accent_color": params.get("accent_color", "#FACC15"),
+                **params,
+            },
+            elements=[
+                SceneElementSpec(element_id="meme_card", kind="meme_popup", label="Live Trending Meme Pop-up"),
+            ],
+        )
+
     return SceneSpec(
         scene_id=scene_id,
         title=title or "Key Insight Callout",

@@ -72,6 +72,7 @@ def write_ass(timeline: RenderTimeline, out_path: Path) -> Path:
     margin_lr = 70 if is_vertical else 110
 
     # PrimaryColour = Yellow/Amber highlight for karaoke, SecondaryColour = crisp White before sweep
+    outline_px = 4.2 if cs.max_words_per_line <= 4 else 3.5
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {timeline.width}
@@ -81,7 +82,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{cs.font_name},{font_size},&H001AF0FF,&H00FFFFFF,&H00120C06,&H80000000,-1,0,0,0,100,100,0,0,1,3.5,1.5,2,{margin_lr},{margin_lr},{margin_v},1
+Style: Default,{cs.font_name},{font_size},&H001AF0FF,&H00FFFFFF,&H00080808,&H90000000,-1,0,0,0,100,100,0,0,1,{outline_px},1.8,2,{margin_lr},{margin_lr},{margin_v},1
 Style: Uncertain,{cs.font_name},{max(22, font_size - 6)},&H0088D8FF,&H00E2E8F0,&H00120C06,&H80000000,0,1,0,0,100,100,0,0,1,2.5,1,2,{margin_lr},{margin_lr},{margin_v},1
 
 [Events]

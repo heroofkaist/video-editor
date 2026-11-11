@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from symposium_studio.config import StudioConfig
 from symposium_studio.engines.distribution import execute_publish
-from symposium_studio.engines.effects import search_effects
+from symposium_studio.engines.effects import search_effects, search_internet_clicks
 from symposium_studio.engines.research import import_explicit_item, infer_platform_from_url
 from symposium_studio.engines.symposium import AGENT_ROSTER
 from symposium_studio.models.research import ContentCategory, ResearchPlatform
@@ -61,6 +61,15 @@ class AnimateRequest(BaseModel):
 
 class IterativeInstructionRequest(BaseModel):
     instruction: str
+
+
+class ClickSoundsRequest(BaseModel):
+    search_query: str | None = None
+    custom_urls: dict[str, str] = Field(default_factory=dict)
+    allow_network: bool = True
+    render_video: bool = True
+    include_shorts: bool = True
+    min_spacing_sec: float | None = None
 
 
 class SocialRequest(BaseModel):
@@ -325,6 +334,22 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             }
             for e in search_effects(q, category)
         ]
+
+    @app.get("/api/effects/clicks/search")
+    def search_click_sfx(q: str = "mouse click", limit: int = 8) -> list[dict[str, Any]]:
+        return search_internet_clicks(query=q, limit=limit)
+
+    @app.post("/api/projects/{project_id}/sfx/clicks")
+    def add_project_click_sfx(project_id: str, req: ClickSoundsRequest = ClickSoundsRequest()) -> dict[str, Any]:
+        return studio.add_click_sounds(
+            project_id=project_id,
+            custom_urls=req.custom_urls or None,
+            search_query=req.search_query,
+            allow_network=req.allow_network,
+            render_video=req.render_video,
+            include_shorts=req.include_shorts,
+            min_spacing_sec=req.min_spacing_sec,
+        )
 
     # --- Render, Iterative Edit, Social, Telegram, Growth, Search ---
     @app.post("/api/projects/{project_id}/render")

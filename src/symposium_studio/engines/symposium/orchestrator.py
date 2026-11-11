@@ -192,7 +192,9 @@ def active_agents_for_mode(mode: ResearchMode) -> list[AgentDefinition]:
     return [a for a in AGENT_ROSTER if MODE_RANK[a.min_mode] <= rank]
 
 
-def _pick_animation_template(analysis: MediaAnalysisBundle) -> str:
+def _pick_animation_template(analysis: MediaAnalysisBundle, style_name: str = "") -> str:
+    if style_name == "zoomer_vlog":
+        return "meme_reaction_card"
     best_visual = (
         max(analysis.highlights, key=lambda h: h.scores.visual_opportunity + h.scores.educational_value)
         if analysis.highlights
@@ -209,6 +211,8 @@ def _pick_animation_template(analysis: MediaAnalysisBundle) -> str:
         return "rlc_signal_flow"
     if any(k in full_txt for k in ("tree", "binary", "algorithm", "search", "complexity", "recursion")):
         return "binary_tree_trace"
+    if style_name in {"personal_vlog", "comedy", "short_form_viral"}:
+        return "kinetic_callout"
     return "em_induction_faraday"
 
 
@@ -752,7 +756,7 @@ class SymposiumOrchestrator:
         agents = active_agents_for_mode(mode)
         backend = self.llm.detect_backend()
         brief = _compute_signal_brief(analysis, research_report)
-        anim_template = _pick_animation_template(analysis)
+        anim_template = _pick_animation_template(analysis, style_name=style_name)
         relevance = assess_topic_relevance(analysis, research_report, research_items)
 
         proposals: list[AgentProposal] = []
