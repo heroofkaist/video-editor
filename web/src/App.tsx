@@ -13,12 +13,13 @@ import {
   TrendingUp,
   Users,
 } from 'lucide-react';
-import { apiGet, apiPost, apiUpload, workspaceFileUrl } from './api';
+import { apiGet, apiPost, apiUpload, apiUploadMultiple, referenceContactSheetUrl, workspaceFileUrl } from './api';
 
 type WorkspaceTab =
   | 'home'
   | 'research'
   | 'symposium'
+  | 'references'
   | 'media'
   | 'editor'
   | 'animation'
@@ -58,6 +59,7 @@ const NAV_ITEMS: { id: WorkspaceTab; label: string; icon: React.ReactNode }[] = 
   { id: 'home', label: 'Home Dashboard', icon: <Home size={16} /> },
   { id: 'research', label: 'Viral Research Lab', icon: <TrendingUp size={16} /> },
   { id: 'symposium', label: 'AI Symposium', icon: <Users size={16} /> },
+  { id: 'references', label: 'Reference Studio', icon: <Layers size={16} /> },
   { id: 'media', label: 'Media Library', icon: <FolderSearch size={16} /> },
   { id: 'editor', label: 'Video Editor', icon: <Clapperboard size={16} /> },
   { id: 'animation', label: 'Animation Studio', icon: <Sparkles size={16} /> },
@@ -102,19 +104,30 @@ export default function App() {
   const [expQuery, setExpQuery] = useState('');
   const [expPlatformFilter, setExpPlatformFilter] = useState('');
   const [expSearchResults, setExpSearchResults] = useState<any[] | null>(null);
+  const [refState, setRefState] = useState<any>(null);
+  const [refLibrary, setRefLibrary] = useState<any[]>([]);
+  const [publishReadiness, setPublishReadiness] = useState<any>(null);
+  const [refWorkspacePath, setRefWorkspacePath] = useState('');
+  const [refUrlInput, setRefUrlInput] = useState('');
+  const [refPlatform, setRefPlatform] = useState('youtube_long');
+  const [refSelectionMode, setRefSelectionMode] = useState<'best_single' | 'intelligent_hybrid' | 'manual_override'>('best_single');
+  const [refManualId, setRefManualId] = useState('');
+  const [refLastRender, setRefLastRender] = useState<any>(null);
 
   async function refreshBase() {
     try {
-      const [h, projs, vitems, fx] = await Promise.all([
+      const [h, projs, vitems, fx, libRefs] = await Promise.all([
         apiGet<any>('/api/health'),
         apiGet<ProjectRecord[]>('/api/projects'),
         apiGet<any[]>('/api/research/items'),
         apiGet<any[]>('/api/effects'),
+        apiGet<any[]>('/api/references').catch(() => []),
       ]);
       setHealth(h);
       setProjects(projs);
       setViralItems(vitems);
       setEffects(fx);
+      setRefLibrary(libRefs);
       if (!activePid && projs.length > 0) {
         setActivePid(projs[0].project_id);
       }
@@ -152,6 +165,16 @@ export default function App() {
         setSocialBundle(null);
       }
       setGrowthData(await apiGet(`/api/growth?project_id=${encodeURIComponent(pid)}`));
+      try {
+        setRefState(await apiGet(`/api/projects/${pid}/references`));
+      } catch {
+        setRefState(null);
+      }
+      try {
+        setPublishReadiness(await apiGet(`/api/projects/${pid}/publish-readiness`));
+      } catch {
+        setPublishReadiness(null);
+      }
     } catch (e: any) {
       setStatusMsg(e.message);
     }
@@ -163,6 +186,7 @@ export default function App() {
 
   useEffect(() => {
     setExpSearchResults(null);
+    setRefLastRender(null);
     if (activePid) loadProjectDetails(activePid);
   }, [activePid]);
 
@@ -1099,6 +1123,447 @@ export default function App() {
                   </table>
                 </>
               ) : <p className="muted">Select a project to inspect funnel links and authorized analytics.</p>}
+            </div>
+          )}
+
+          {tab === 'references' && (
+            <div style={{ display: 'grid', gap: 16 }}>
+              <div className="card">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                  <div>
+                    <h2 style={{ margin: 0 }}>Multi-Reference Video Intelligence & Style Transfer</h2>
+                    <div className="muted">
+                      Upload multiple references, extract StyleDNA &amp; contact sheets, run the 10-specialist Symposium Conference, refine transfer parameters, and render.
+                    </div>
+                  </div>
+                  {publishReadiness && (
+                    <span className={`pill ${publishReadiness.ready_for_publish ? 'pill-green' : 'pill-rose'}`}>
+                      Publish Gate: {publishReadiness.recommended_status}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Step 1: Multi-Reference Ingest & Personal Library */}
+              <div className="card">
+                <h3>1. Multi-Reference Ingest &amp; Personal Library</h3>
+                <div className="grid-2">
+                  <div style={{ display: 'grid', gap: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 12.5, marginBottom: 4 }}><strong>Upload Multiple Reference Videos (MP4 / MOV / WebM)</strong></div>
+                      <input
+                        type="file"
+                        multiple
+                        accept="video/*,.mp4,.mov,.webm,.mkv"
+                        disabled={busy || !activePid}
+                        onChange={async (e) => {
+                          const fl = e.target.files ? Array.from(e.target.files) : [];
+                          if (fl.length === 0 || !activePid) return;
+                          setBusy(true);
+                          setStatusMsg(`Uploading ${fl.length} reference video(s)...`);
+                          try {
+                            await apiUploadMultiple(`/api/projects/${activePid}/references/upload`, fl);
+                            await refreshBase();
+                            await loadProjectDetails(activePid);
+                            setStatusMsg(`Uploaded ${fl.length} reference video(s).`);
+                          } catch (err: any) {
+                            setStatusMsg(`Reference upload error: ${err.message}`);
+                          } finally {
+                            setBusy(false);
+                            e.target.value = '';
+                          }
+                        }}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <input
+                        placeholder="Workspace relative path (e.g. source/clip.mp4)"
+                        value={refWorkspacePath}
+                        onChange={(e) => setRefWorkspacePath(e.target.value)}
+                      />
+                      <button
+                        className="btn"
+                        disabled={busy || !activePid || !refWorkspacePath.trim()}
+                        onClick={() => runAction('Add Workspace Reference', async () => {
+                          await apiPost(`/api/projects/${activePid}/references/add`, { workspace_paths: [refWorkspacePath.trim()] });
+                          setRefWorkspacePath('');
+                        })}
+                      >
+                        Add Workspace File
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <input
+                        placeholder="Import URL (YouTube, Shorts, TikTok, Reels)"
+                        value={refUrlInput}
+                        onChange={(e) => setRefUrlInput(e.target.value)}
+                      />
+                      <button
+                        className="btn"
+                        disabled={busy || !activePid || !refUrlInput.trim()}
+                        onClick={() => runAction('Import Reference URL', async () => {
+                          await apiPost(`/api/projects/${activePid}/references/add`, { urls: [refUrlInput.trim()], allow_network: true });
+                          setRefUrlInput('');
+                        })}
+                      >
+                        Import URL
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 12.5, marginBottom: 6 }}>
+                      <strong>Personal Reference Library ({refLibrary.length})</strong>{' '}
+                      <span className="muted">(SHA-256 deduplicated &amp; cached)</span>
+                    </div>
+                    <div style={{ maxHeight: 165, overflowY: 'auto', display: 'grid', gap: 6 }}>
+                      {refLibrary.map((lr: any) => (
+                        <div key={lr.reference_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 8px', background: '#0a101d', borderRadius: 6, border: '1px solid var(--border)' }}>
+                          <div style={{ fontSize: 12 }}>
+                            <strong>{lr.title}</strong>{' '}
+                            <span className="muted">({lr.platform} · {Number(lr.duration_sec || 0).toFixed(1)}s)</span>
+                          </div>
+                          <button
+                            className="btn"
+                            disabled={busy || !activePid}
+                            onClick={() => runAction(`Reuse Library Reference ${lr.title}`, () =>
+                              apiPost(`/api/projects/${activePid}/references/add`, { library_reference_ids: [lr.reference_id] })
+                            )}
+                          >
+                            Import
+                          </button>
+                        </div>
+                      ))}
+                      {refLibrary.length === 0 && <div className="muted">No saved library references yet. Upload local files to build your library.</div>}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Step 2: Deep Analysis Cards & Contact Sheets */}
+              <div className="card">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+                  <h3 style={{ margin: 0 }}>2. Analyzed Reference StyleDNA &amp; Visual Evidence ({(refState?.references || []).length})</h3>
+                  <button
+                    className="btn btn-primary"
+                    disabled={busy || !activePid || (refState?.references || []).length === 0}
+                    onClick={() => runAction('Analyze Project References', () =>
+                      apiPost(`/api/projects/${activePid}/references/analyze`, { run_asr: true })
+                    )}
+                  >
+                    Analyze References
+                  </button>
+                </div>
+                <div className="grid-3">
+                  {(refState?.references || []).map((r: any) => {
+                    const dna = r.style_dna;
+                    const isMetaOnly = r.analysis_status === 'metadata_only';
+                    return (
+                      <div className="card" key={r.reference_id} style={{ padding: 12 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6 }}>
+                          <strong>{r.title}</strong>
+                          <span className={`pill ${isMetaOnly ? 'pill-rose' : r.analysis_status === 'full_video_and_audio' ? 'pill-green' : 'pill-amber'}`}>
+                            {isMetaOnly ? 'Metadata-only (frames unavailable)' : r.analysis_status}
+                          </span>
+                        </div>
+                        <div className="muted" style={{ fontSize: 11.5, margin: '4px 0 8px' }}>
+                          {r.platform} · {r.source_type} · {Number(r.duration_sec || 0).toFixed(1)}s {r.sha256 ? `· ${String(r.sha256).slice(0, 10)}` : ''}
+                        </div>
+                        {r.contact_sheet_path && !isMetaOnly && (
+                          <img
+                            src={referenceContactSheetUrl(r.reference_id)}
+                            alt={`${r.title} contact sheet`}
+                            style={{ width: '100%', borderRadius: 6, marginBottom: 8, border: '1px solid var(--border)' }}
+                          />
+                        )}
+                        {dna ? (
+                          <div style={{ fontSize: 12, display: 'grid', gap: 4 }}>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                              <span className="pill">{dna.mapped_base_style}</span>
+                              <span className="pill">{dna.pacing?.cuts_per_minute} cuts/min</span>
+                              <span className="pill">{dna.pacing?.median_shot_duration_sec}s med shot</span>
+                              <span className="pill">{dna.pacing?.punch_ins_per_minute} zoom/min</span>
+                              <span className="pill">{dna.audio?.transient_sfx_per_min} SFX/min</span>
+                              <span className="pill">{dna.subtitles?.estimated_words_per_cue}w/cue</span>
+                            </div>
+                            <ul style={{ margin: '4px 0 0', paddingLeft: 16 }}>
+                              {(dna.editorial_notes || []).slice(0, 3).map((n: string, i: number) => (
+                                <li className="muted" key={i}>{n}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : (
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            {isMetaOnly
+                              ? 'Honest limitation: stream frames unavailable offline; penalized in visual comparison and StyleDNA cannot be inferred.'
+                              : 'Pending CV/Audio/ASR analysis. Click Analyze References.'}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Step 3 & 4: Comparison Matrix + 10-Specialist Symposium Conference */}
+              {(() => {
+                const rankingsMap = refState?.rankings_by_platform || {};
+                const activeRanking = rankingsMap[refPlatform] || Object.values(rankingsMap)[0] || [];
+                const conf = refState?.conference;
+                const plan = refState?.style_transfer_plan;
+                const params = plan?.parameters;
+                const sim = refState?.style_similarity;
+                const refRenderAsset = manifest?.assets.find((a) => a.role === 'render_youtube' && a.relative_path.includes('_ref_youtube_'));
+                return (
+                  <>
+                    <div className="card">
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 10 }}>
+                        <div>
+                          <h3 style={{ margin: 0 }}>3. 13-Criteria Source &amp; Platform Comparison</h3>
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            Heuristic editorial compatibility scores computed from analyzed source footage and reference signals; not a forecast of views or algorithmic reach.
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                          <select value={refPlatform} onChange={(e) => setRefPlatform(e.target.value)} style={{ width: 'auto' }}>
+                            <option value="youtube_long">YouTube Long (16:9)</option>
+                            <option value="youtube_shorts">YouTube Shorts (9:16)</option>
+                            <option value="tiktok">TikTok (9:16)</option>
+                            <option value="instagram_reels">Instagram Reels (9:16)</option>
+                          </select>
+                          <select value={refSelectionMode} onChange={(e) => setRefSelectionMode(e.target.value as any)} style={{ width: 'auto' }}>
+                            <option value="best_single">Mode A: Best Single Reference</option>
+                            <option value="intelligent_hybrid">Mode B: Intelligent Hybrid Blend</option>
+                            <option value="manual_override">Manual Override</option>
+                          </select>
+                          {refSelectionMode === 'manual_override' && (
+                            <select value={refManualId} onChange={(e) => setRefManualId(e.target.value)} style={{ width: 'auto' }}>
+                              <option value="">Choose reference...</option>
+                              {(refState?.references || []).map((r: any) => (
+                                <option key={r.reference_id} value={r.reference_id}>{r.title}</option>
+                              ))}
+                            </select>
+                          )}
+                          <button
+                            className="btn btn-primary"
+                            disabled={busy || !activePid || (refState?.references || []).length === 0}
+                            onClick={() => runAction('Compare & Run Reference Symposium', () =>
+                              apiPost(`/api/projects/${activePid}/references/compare`, {
+                                target_platform: refPlatform,
+                                selection_mode: refSelectionMode,
+                                manual_reference_id: refSelectionMode === 'manual_override' ? (refManualId || null) : null,
+                              })
+                            )}
+                          >
+                            Compare &amp; Run Reference Conference
+                          </button>
+                        </div>
+                      </div>
+                      {Array.isArray(activeRanking) && activeRanking.length > 0 ? (
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Rank &amp; Reference</th>
+                              <th>Compatibility</th>
+                              <th>Criteria Breakdown</th>
+                              <th>Strengths &amp; Risks</th>
+                              <th>Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {activeRanking.map((ev: any, idx: number) => (
+                              <tr key={ev.reference_id}>
+                                <td>
+                                  <strong>#{idx + 1} {ev.title}</strong>
+                                  <div>
+                                    <span className={`pill ${ev.is_feasible ? 'pill-green' : 'pill-rose'}`}>
+                                      {ev.is_feasible ? ev.analysis_status : 'Disqualified / Low Signal'}
+                                    </span>
+                                    {refState?.selected_reference?.reference_id === ev.reference_id && (
+                                      <span className="pill pill-amber" style={{ marginLeft: 4 }}>Selected</span>
+                                    )}
+                                  </div>
+                                  {ev.disqualification_reason && <div className="muted" style={{ fontSize: 11 }}>{ev.disqualification_reason}</div>}
+                                </td>
+                                <td><strong>{Number(ev.heuristic_compatibility_score).toFixed(3)}</strong></td>
+                                <td>
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                    {(ev.criteria_breakdown || []).slice(0, 6).map((c: any) => (
+                                      <span className="pill" key={c.criterion} title={c.rationale}>
+                                        {c.criterion.replace(/_/g, ' ')}: {Number(c.score).toFixed(2)}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </td>
+                                <td>
+                                  {(ev.transferable_strengths || []).slice(0, 2).map((s: string, i: number) => (
+                                    <div key={`s-${i}`} style={{ fontSize: 11.5, color: '#6ee7b7' }}>+ {s}</div>
+                                  ))}
+                                  {(ev.identified_risks || []).slice(0, 2).map((rk: string, i: number) => (
+                                    <div key={`r-${i}`} style={{ fontSize: 11.5, color: '#fda4af' }}>! {rk}</div>
+                                  ))}
+                                </td>
+                                <td>
+                                  <button
+                                    className="btn"
+                                    disabled={busy}
+                                    onClick={() => runAction(`Select ${ev.title}`, () => {
+                                      setRefSelectionMode('manual_override');
+                                      setRefManualId(ev.reference_id);
+                                      return apiPost(`/api/projects/${activePid}/references/compare`, {
+                                        target_platform: refPlatform,
+                                        selection_mode: 'manual_override',
+                                        manual_reference_id: ev.reference_id,
+                                      });
+                                    })}
+                                  >
+                                    Re-select This
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      ) : <div className="muted">Run Compare &amp; Reference Conference to evaluate all references against your footage.</div>}
+                    </div>
+
+                    {conf && (
+                      <div className="card">
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                          <h3 style={{ margin: 0 }}>4. AI Symposium Reference Conference ({conf.selection_mode})</h3>
+                          <span className="pill">{conf.backend_used}</span>
+                        </div>
+                        <p style={{ margin: '0 0 8px' }}><strong>Final Decision Rationale:</strong> <span className="muted">{conf.final_rationale}</span></p>
+                        {conf.hybrid_guide && (
+                          <div style={{ marginBottom: 10, padding: 10, background: '#0a101d', borderRadius: 8, border: '1px solid var(--border)' }}>
+                            <strong>Intelligent Hybrid Dimension Mapping:</strong>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                              {Object.entries(conf.hybrid_guide.dimension_sources || {}).map(([dim, rid]: [string, any]) => (
+                                <span className="pill pill-amber" key={dim}>{dim}: {rid}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {(conf.moderator_warnings || []).length > 0 && (
+                          <div style={{ marginBottom: 10 }}>
+                            <strong>Devil&apos;s Advocate Moderator Warnings:</strong>
+                            <ul style={{ margin: '4px 0 0', paddingLeft: 18, fontSize: 12.5 }}>
+                              {conf.moderator_warnings.map((w: string, i: number) => <li className="muted" key={i}>{w}</li>)}
+                            </ul>
+                          </div>
+                        )}
+                        <div className="grid-2">
+                          {(conf.agent_statements || []).map((st: any) => (
+                            <div key={st.agent_id} style={{ padding: 10, borderRadius: 8, background: '#0a101d', border: '1px solid var(--border)', fontSize: 12 }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <strong>{st.agent_title}</strong>
+                                {st.stance_reference_id && <span className="pill">{st.stance_reference_id}</span>}
+                              </div>
+                              {(st.recommendations || []).slice(0, 2).map((rec: string, i: number) => <div className="muted" key={i}>• {rec}</div>)}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {plan && params && (
+                      <div className="card">
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 10 }}>
+                          <h3 style={{ margin: 0 }}>5. Executable StyleTransferPlan &amp; Interactive Creator Controls</h3>
+                          <button
+                            className="btn btn-primary"
+                            disabled={busy}
+                            onClick={() => runAction('Render With Reference Style', async () => {
+                              const res = await apiPost(`/api/projects/${activePid}/references/render`, {
+                                target_platform: refPlatform,
+                                include_shorts: true,
+                              });
+                              setRefLastRender(res);
+                            })}
+                          >
+                            Render With Style
+                          </button>
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                          <span className="pill">Base: {params.base_style_profile}</span>
+                          <span className="pill">Target Shot: {params.target_shot_duration_sec}s</span>
+                          <span className="pill">Pacing: {params.pacing_multiplier}x</span>
+                          <span className="pill">Zoom Punch: +{params.zoom_punch_step}</span>
+                          <span className="pill">Subtitles: &lt;= {params.subtitle_max_words}w · {params.subtitle_font_size}px</span>
+                          <span className="pill">SFX Spacing: {params.sfx_click_min_spacing_sec}s</span>
+                          <span className={`pill ${params.enable_memes ? 'pill-amber' : 'pill-green'}`}>Memes: {params.enable_memes ? 'ON' : 'OFF'}</span>
+                          <span className="pill">Keep Structure: {params.keep_structure_apply_rhythm_only ? 'YES' : 'NO'}</span>
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+                          <button className="btn" disabled={busy} onClick={() => runAction('Increase Pacing', () => apiPost(`/api/projects/${activePid}/references/adjust`, { adjustments: { increase_pacing: true } }))}>
+                            Increase Pacing (+0.25x)
+                          </button>
+                          <button className="btn" disabled={busy} onClick={() => runAction('Decrease Pacing', () => apiPost(`/api/projects/${activePid}/references/adjust`, { adjustments: { decrease_pacing: true } }))}>
+                            Decrease Pacing (-0.20x)
+                          </button>
+                          <button className="btn" disabled={busy} onClick={() => runAction('More Minimal Subtitles', () => apiPost(`/api/projects/${activePid}/references/adjust`, { adjustments: { subtitle_minimal: true } }))}>
+                            More Minimal Subtitles
+                          </button>
+                          <button className="btn" disabled={busy} onClick={() => runAction('Toggle Memes', () => apiPost(`/api/projects/${activePid}/references/adjust`, { adjustments: { disable_memes: params.enable_memes, enable_memes: !params.enable_memes } }))}>
+                            {params.enable_memes ? 'Disable Memes' : 'Enable Memes'}
+                          </button>
+                          <button className="btn" disabled={busy} onClick={() => runAction('Boost Educational Graphics', () => apiPost(`/api/projects/${activePid}/references/adjust`, { adjustments: { boost_educational_graphics: true, enable_educational_graphics: true } }))}>
+                            Boost Educational Graphics
+                          </button>
+                          <button className="btn" disabled={busy} onClick={() => runAction('Toggle Keep Structure', () => apiPost(`/api/projects/${activePid}/references/adjust`, { adjustments: { keep_structure_apply_rhythm_only: !params.keep_structure_apply_rhythm_only } }))}>
+                            {params.keep_structure_apply_rhythm_only ? 'Allow Full Re-Structure' : 'Keep Structure, Apply Rhythm Only'}
+                          </button>
+                        </div>
+                        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5 }}>
+                          {(plan.timeline_directives || []).map((d: string, i: number) => <li className="muted" key={i}>{d}</li>)}
+                        </ul>
+                      </div>
+                    )}
+
+                    {(sim || refRenderAsset || refLastRender) && (
+                      <div className="card">
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                          <h3 style={{ margin: 0 }}>6. Post-Render Output, StyleSimilarityReport &amp; QA Gate</h3>
+                          {publishReadiness && (
+                            <span className={`pill ${publishReadiness.ready_for_publish ? 'pill-green' : 'pill-rose'}`}>
+                              {publishReadiness.ready_for_publish ? 'ready_for_publish (QA Passed)' : 'requires_review (Blocked)'}
+                            </span>
+                          )}
+                        </div>
+                        {refRenderAsset && (
+                          <div className="video-stage" style={{ marginBottom: 12 }}>
+                            <video key={refRenderAsset.sha256} controls src={workspaceFileUrl(activePid, refRenderAsset.relative_path)} />
+                          </div>
+                        )}
+                        {sim && (
+                          <>
+                            <p style={{ margin: '0 0 8px' }}>
+                              <strong>Measured Style Adherence Score:</strong>{' '}
+                              <span className="pill pill-green">{Number(sim.overall_style_adherence_score).toFixed(3)}</span>{' '}
+                              <span className="muted">({sim.qa_passed ? 'QA Passed' : 'QA Review Required'})</span>
+                            </p>
+                            <table>
+                              <thead>
+                                <tr><th>Metric</th><th>Reference Target</th><th>Rendered Output</th><th>Delta</th><th>Status</th></tr>
+                              </thead>
+                              <tbody>
+                                {(sim.metrics || []).map((m: any) => (
+                                  <tr key={m.metric}>
+                                    <td><strong>{m.metric}</strong></td>
+                                    <td>{String(m.reference_value ?? '-')}</td>
+                                    <td>{String(m.rendered_value ?? '-')}</td>
+                                    <td>{m.delta != null ? String(m.delta) : '-'}</td>
+                                    <td><span className={`pill ${m.alignment_status === 'aligned' ? 'pill-green' : 'pill-amber'}`}>{m.alignment_status}</span></td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           )}
 

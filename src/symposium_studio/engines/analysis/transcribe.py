@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -121,6 +121,41 @@ def _logprob_to_conf(avg_logprob: float | None, no_speech_prob: float | None) ->
     return conf, bool(reasons), "; ".join(reasons) if reasons else None
 
 
+def _collapse_consecutive_word_repeats(words: list[WordTimestamp]) -> tuple[list[WordTimestamp], bool]:
+    """Collapse degenerate 3+ consecutive identical words inside word-level timestamps."""
+    if len(words) < 4:
+        return words, False
+    filtered_words: list[WordTimestamp] = []
+    prev_norm = ""
+    rep_run = 0
+    trimmed_repeat = False
+    for w in words:
+        norm_w = re.sub(r"[^\w]+", "", w.word.casefold())
+        if norm_w and norm_w == prev_norm:
+            rep_run += 1
+            if rep_run >= 2:
+                trimmed_repeat = True
+                continue
+        else:
+            prev_norm = norm_w
+            rep_run = 1
+        filtered_words.append(w)
+    return filtered_words, trimmed_repeat
+
+
+def _shift_segments_offset(segments: list[TranscriptSegment], offset_sec: float) -> list[TranscriptSegment]:
+    """Shift segment and word timestamps cleanly by chunk offset_sec."""
+    if abs(offset_sec) < 1e-6:
+        return segments
+    for seg in segments:
+        seg.start_sec = round(float(seg.start_sec) + offset_sec, 3)
+        seg.end_sec = round(max(seg.start_sec + 0.05, float(seg.end_sec) + offset_sec), 3)
+        for w in seg.words:
+            w.start_sec = round(float(w.start_sec) + offset_sec, 3)
+            w.end_sec = round(max(w.start_sec + 0.02, float(w.end_sec) + offset_sec), 3)
+    return segments
+
+
 def _convert_whisper_segments(
     raw_segments: list[dict[str, Any]],
     detected_language: str,
@@ -128,13 +163,18 @@ def _convert_whisper_segments(
     segments: list[TranscriptSegment] = []
     uncertain_ids: list[str] = []
 
-    for idx, seg in enumerate(raw_segments):
-        seg_id = f"seg_{idx:04d}"
-        text = str(seg.get("text", "")).strip()
+    for seg in raw_segments:
+        raw_text = str(seg.get("text", "")).strip()
+        if not raw_text:
+            continue
+        text, trimmed_repeat = _clean_hallucinated_repeats(raw_text)
         if not text:
             continue
         start_sec = round(float(seg.get("start", 0.0)), 3)
         end_sec = round(max(start_sec + 0.05, float(seg.get("end", start_sec + 0.5))), 3)
+        if segments and text.casefold() == segments[-1].text.casefold():
+            segments[-1].end_sec = max(segments[-1].end_sec, end_sec)
+            continue
 
         conf, low_conf, reason = _logprob_to_conf(
             seg.get("avg_logprob"),
@@ -173,6 +213,14 @@ def _convert_whisper_segments(
                         )
                     )
 
+        words, word_trimmed = _collapse_consecutive_word_repeats(words)
+        trimmed_repeat = trimmed_repeat or word_trimmed
+        if trimmed_repeat:
+            conf = min(conf, 0.42)
+            low_conf = True
+            reason = "collapsed_repetitive_hallucination"
+
+        seg_id = f"seg_{len(segments):04d}"
         if low_conf:
             uncertain_ids.append(seg_id)
 
@@ -187,6 +235,7 @@ def _convert_whisper_segments(
                 low_confidence=low_conf,
                 low_confidence_reason=reason,
                 words=words,
+                verification_status="uncertain_needs_review" if low_conf else "asr_raw",
             )
         )
     return segments, uncertain_ids
@@ -464,23 +513,8 @@ def _run_whisper_cpp_chunk(
         for w in words:
             w.start_sec = round(w.start_sec + offset_sec, 3)
             w.end_sec = round(w.end_sec + offset_sec, 3)
-        # Collapse degenerate consecutive repeated words inside word-level timestamps too
-        if len(words) >= 4:
-            filtered_words: list[WordTimestamp] = []
-            prev_norm = ""
-            rep_run = 0
-            for w in words:
-                norm_w = re.sub(r"[^\w]+", "", w.word.casefold())
-                if norm_w and norm_w == prev_norm:
-                    rep_run += 1
-                    if rep_run >= 2:
-                        trimmed_repeat = True
-                        continue
-                else:
-                    prev_norm = norm_w
-                    rep_run = 1
-                filtered_words.append(w)
-            words = filtered_words
+        words, word_trimmed = _collapse_consecutive_word_repeats(words)
+        trimmed_repeat = trimmed_repeat or word_trimmed
         if trimmed_repeat:
             seg_conf = min(seg_conf, 0.42)
         low_conf = seg_conf < 0.48 or trimmed_repeat
@@ -1191,27 +1225,125 @@ def align_transcript_to_audio(
     return audit_and_verify_transcript(transcript)
 
 
-def _transcribe_with_whisper_cpp(
+ChunkRunnerFn = Callable[
+    [Path, str | None, float, str],
+    tuple[str, float, list[TranscriptSegment], list[str]],
+]
+
+_ANOMALY_RECHECK_FLAGS = {
+    "single_token_repeat_loop",
+    "sparse_words_over_long_window",
+    "possible_code_switch_phonetic_garble",
+    "mixed_cyrillic_latin_token",
+    "hallucination_repeat_or_phantom_cleaned",
+}
+
+
+def _chunk_has_signal(wav_path: Path) -> bool:
+    try:
+        _sr_c, _pcm_c = _load_wav_mono_float(wav_path)
+        return len(_pcm_c) > 0 and float(np.max(np.abs(_pcm_c))) >= 1e-4
+    except Exception:
+        return True
+
+
+def _verify_and_select_chunk_hypothesis(
+    chunk_wav: Path,
+    c0: float,
+    lang: str,
+    prob: float,
+    segs: list[TranscriptSegment],
+    probe_langs: list[str],
+    core_langs: set[str],
+    multi_chunk: bool,
+    tag_prefix: str,
+    run_chunk: ChunkRunnerFn,
+) -> tuple[str, float, list[TranscriptSegment]]:
+    """Evaluate a decoded chunk and re-decode across candidate languages if anomalous or low-confidence."""
+    base_score = _chunk_quality_score(lang, segs)
+    chunk_anomalous = any(bool(set(_detect_segment_anomalies(s)) & _ANOMALY_RECHECK_FLAGS) for s in segs)
+    chunk_low_conf = any(s.low_confidence or s.confidence < 0.56 for s in segs) or chunk_anomalous or not segs
+    outlier_lang = (
+        (lang in _OUTLIER_LANG_CODES and (not multi_chunk or lang not in core_langs))
+    )
+    chosen_lang, chosen_prob, chosen_segs = lang, prob, segs
+
+    if (outlier_lang or chunk_low_conf) and probe_langs:
+        alts: list[tuple[float, str, float, list[TranscriptSegment]]] = []
+        for alt_lang in probe_langs:
+            if alt_lang == lang and segs:
+                continue
+            try:
+                a_lang, a_prob, a_segs, _ = run_chunk(chunk_wav, alt_lang, c0, f"{tag_prefix}_{alt_lang}")
+                alts.append((_chunk_quality_score(a_lang, a_segs), a_lang, a_prob, a_segs))
+            except Exception:
+                continue
+        if alts:
+            best_alt_score, best_alt_lang, best_alt_prob, best_alt_segs = max(alts, key=lambda x: x[0])
+            alt_summary = [
+                {
+                    "language": al,
+                    "text": " ".join(s.text for s in asegs),
+                    "quality_score": round(asc, 3),
+                }
+                for asc, al, _, asegs in alts
+                if asegs
+            ]
+            if best_alt_score > base_score + 0.06:
+                if segs:
+                    alt_summary.append(
+                        {
+                            "language": lang,
+                            "text": " ".join(s.text for s in segs),
+                            "quality_score": round(base_score, 3),
+                        }
+                    )
+                chosen_lang = best_alt_lang
+                chosen_prob = best_alt_prob
+                chosen_segs = best_alt_segs
+                for s in chosen_segs:
+                    s.verification_status = "alternate_hypothesis_selected"
+                    s.candidate_alternatives = alt_summary[:3]
+            else:
+                for s in chosen_segs:
+                    s.candidate_alternatives = alt_summary[:3]
+
+    return chosen_lang, chosen_prob, chosen_segs
+
+
+def _run_multilingual_chunked_verification(
     wav_path: Path,
     duration_sec: float,
-    whisper_cli: str,
-    model_path: Path,
-    language: str | None = None,
+    engine_name: str,
+    model_label: str,
+    language: str | None,
+    run_chunk: ChunkRunnerFn,
 ) -> TranscriptResult:
+    """Execute pause-aware chunking + multilingual kk/ru/en verification identically across ASR backends."""
     chunks = _plan_wav_chunks(wav_path) if (language is None and duration_sec > 24.0) else []
     if len(chunks) <= 1:
-        lang, lang_prob, segments, uncertain_ids = _run_whisper_cpp_chunk(
-            chunk_wav=wav_path,
-            out_prefix=wav_path.parent / "wcpp_out",
-            whisper_cli=whisper_cli,
-            model_path=model_path,
-            language=language,
-            offset_sec=0.0,
-            start_seg_idx=0,
-        )
+        lang, lang_prob, segments, uncertain_ids = run_chunk(wav_path, language, 0.0, "main")
+        if language is None and _chunk_has_signal(wav_path):
+            lang, lang_prob, segments = _verify_and_select_chunk_hypothesis(
+                chunk_wav=wav_path,
+                c0=0.0,
+                lang=lang,
+                prob=lang_prob,
+                segs=segments,
+                probe_langs=["kk", "ru", "en"],
+                core_langs={lang} if lang not in _OUTLIER_LANG_CODES and lang != "unknown" else set(),
+                multi_chunk=False,
+                tag_prefix="main",
+                run_chunk=run_chunk,
+            )
+            uncertain_ids = []
+            for idx_s, s in enumerate(segments):
+                s.segment_id = f"seg_{idx_s:04d}"
+                if s.low_confidence:
+                    uncertain_ids.append(s.segment_id)
         res = TranscriptResult(
-            engine="whisper.cpp",
-            model=model_path.name,
+            engine=engine_name,
+            model=model_label,
             detected_language=lang,
             language_probability=lang_prob,
             languages_observed=[lang] if lang != "unknown" else [],
@@ -1225,20 +1357,11 @@ def _transcribe_with_whisper_cpp(
     raw_chunks: list[tuple[int, float, float, Path, str, float, list[TranscriptSegment], list[str]]] = []
     lang_counts: dict[str, int] = {}
     for idx, (c0, c1) in enumerate(chunks):
-        chunk_wav = wav_path.parent / f"wcpp_chunk_{idx:03d}.wav"
+        chunk_wav = wav_path.parent / f"asr_chunk_{idx:03d}.wav"
         _write_wav_slice(wav_path, chunk_wav, c0, c1)
-        _sr_c, _pcm_c = _load_wav_mono_float(chunk_wav)
-        if len(_pcm_c) == 0 or float(np.max(np.abs(_pcm_c))) < 1e-4:
+        if not _chunk_has_signal(chunk_wav):
             continue
-        lang, prob, segs, unc = _run_whisper_cpp_chunk(
-            chunk_wav=chunk_wav,
-            out_prefix=wav_path.parent / f"wcpp_out_{idx:03d}",
-            whisper_cli=whisper_cli,
-            model_path=model_path,
-            language=None,
-            offset_sec=c0,
-            start_seg_idx=0,
-        )
+        lang, prob, segs, unc = run_chunk(chunk_wav, None, c0, f"{idx:03d}")
         if lang != "unknown" and segs:
             lang_counts[lang] = lang_counts.get(lang, 0) + 1
         raw_chunks.append((idx, c0, c1, chunk_wav, lang, prob, segs, unc))
@@ -1247,83 +1370,33 @@ def _transcribe_with_whisper_cpp(
     if not core_langs and lang_counts:
         core_langs = {max(lang_counts, key=lambda k: lang_counts[k])}
 
-    # Second-stage multilingual verification on low-conf, anomalous, or outlier-language chunks
+    if core_langs & {"kk", "ru"} or any(l in _OUTLIER_LANG_CODES for _, _, _, _, l, _, _, _ in raw_chunks):
+        probe_langs = ["kk", "ru", "en"]
+    else:
+        probe_langs = [lg for lg in ("kk", "ru", "en") if lg in core_langs or len(core_langs) > 0]
+
     all_segments: list[TranscriptSegment] = []
     all_uncertain: list[str] = []
     lang_weights: dict[str, int] = {}
     weighted_probs: list[tuple[float, int]] = []
-    probe_langs = [lg for lg in ("kk", "ru", "en") if lg in core_langs or len(core_langs) > 0]
-    if core_langs & {"kk", "ru"}:
-        probe_langs = ["kk", "ru", "en"] if "en" in core_langs else ["kk", "ru"]
 
-    for idx, c0, c1, chunk_wav, lang, prob, segs, unc in raw_chunks:
-        base_score = _chunk_quality_score(lang, segs)
-        chunk_anomalous = any(
-            set(_detect_segment_anomalies(s))
-            & {
-                "single_token_repeat_loop",
-                "sparse_words_over_long_window",
-                "possible_code_switch_phonetic_garble",
-                "mixed_cyrillic_latin_token",
-                "hallucination_repeat_or_phantom_cleaned",
-            }
-            for s in segs
+    for idx, c0, c1, chunk_wav, lang, prob, segs, _unc in raw_chunks:
+        chosen_lang, chosen_prob, chosen_segs = _verify_and_select_chunk_hypothesis(
+            chunk_wav=chunk_wav,
+            c0=c0,
+            lang=lang,
+            prob=prob,
+            segs=segs,
+            probe_langs=probe_langs,
+            core_langs=core_langs,
+            multi_chunk=len(chunks) >= 3,
+            tag_prefix=f"{idx:03d}",
+            run_chunk=run_chunk,
         )
-        chunk_low_conf = any(s.low_confidence or s.confidence < 0.56 for s in segs) or chunk_anomalous or not segs
-        outlier_lang = (len(chunks) >= 3 and lang in _OUTLIER_LANG_CODES and lang not in core_langs)
-        chosen_lang, chosen_prob, chosen_segs = lang, prob, segs
-
-        if (outlier_lang or chunk_low_conf) and probe_langs:
-            alts: list[tuple[float, str, float, list[TranscriptSegment]]] = []
-            for alt_lang in probe_langs:
-                if alt_lang == lang and segs:
-                    continue
-                try:
-                    a_lang, a_prob, a_segs, _ = _run_whisper_cpp_chunk(
-                        chunk_wav=chunk_wav,
-                        out_prefix=wav_path.parent / f"wcpp_out_{idx:03d}_{alt_lang}",
-                        whisper_cli=whisper_cli,
-                        model_path=model_path,
-                        language=alt_lang,
-                        offset_sec=c0,
-                        start_seg_idx=0,
-                    )
-                    alts.append((_chunk_quality_score(a_lang, a_segs), a_lang, a_prob, a_segs))
-                except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
-                    continue
-            if alts:
-                best_alt_score, best_alt_lang, best_alt_prob, best_alt_segs = max(alts, key=lambda x: x[0])
-                alt_summary = [
-                    {
-                        "language": al,
-                        "text": " ".join(s.text for s in asegs),
-                        "quality_score": round(asc, 3),
-                    }
-                    for asc, al, _, asegs in alts
-                    if asegs
-                ]
-                if best_alt_score > base_score + 0.06:
-                    if segs:
-                        alt_summary.append(
-                            {
-                                "language": lang,
-                                "text": " ".join(s.text for s in segs),
-                                "quality_score": round(base_score, 3),
-                            }
-                        )
-                    chosen_lang = best_alt_lang
-                    chosen_prob = best_alt_prob
-                    chosen_segs = best_alt_segs
-                    for s in chosen_segs:
-                        s.verification_status = "alternate_hypothesis_selected"
-                        s.candidate_alternatives = alt_summary[:3]
-                else:
-                    for s in chosen_segs:
-                        s.candidate_alternatives = alt_summary[:3]
-
-        # Re-number sequential global segment_id across chunks cleanly
         for s in chosen_segs:
             s.segment_id = f"seg_{len(all_segments):04d}"
+            if chosen_lang != "unknown":
+                s.language = chosen_lang
             if s.low_confidence:
                 all_uncertain.append(s.segment_id)
             all_segments.append(s)
@@ -1339,8 +1412,8 @@ def _transcribe_with_whisper_cpp(
     avg_prob = round(sum(p * w for p, w in weighted_probs) / total_chars, 3)
 
     res = TranscriptResult(
-        engine="whisper.cpp",
-        model=model_path.name,
+        engine=engine_name,
+        model=model_label,
         detected_language=dominant_lang,
         language_probability=avg_prob,
         languages_observed=ordered_langs,
@@ -1350,6 +1423,124 @@ def _transcribe_with_whisper_cpp(
         verbatim_preserved=True,
     )
     return audit_and_verify_transcript(res)
+
+
+def _transcribe_with_whisper_cpp(
+    wav_path: Path,
+    duration_sec: float,
+    whisper_cli: str,
+    model_path: Path,
+    language: str | None = None,
+) -> TranscriptResult:
+    def _run_chunk(chunk_wav: Path, lang: str | None, offset_sec: float, tag: str) -> tuple[str, float, list[TranscriptSegment], list[str]]:
+        return _run_whisper_cpp_chunk(
+            chunk_wav=chunk_wav,
+            out_prefix=wav_path.parent / f"wcpp_out_{tag}",
+            whisper_cli=whisper_cli,
+            model_path=model_path,
+            language=lang,
+            offset_sec=offset_sec,
+            start_seg_idx=0,
+        )
+
+    return _run_multilingual_chunked_verification(
+        wav_path=wav_path,
+        duration_sec=duration_sec,
+        engine_name="whisper.cpp",
+        model_label=model_path.name,
+        language=language,
+        run_chunk=_run_chunk,
+    )
+
+
+def _transcribe_with_mlx_whisper(
+    wav_path: Path,
+    duration_sec: float,
+    model_name: str,
+    language: str | None = None,
+    mlx_module: Any | None = None,
+) -> TranscriptResult:
+    if mlx_module is None:
+        import mlx_whisper as mlx_module  # type: ignore
+
+    effective_mlx_model = model_name
+    hf_large_v3_dir = Path.home() / ".cache" / "huggingface" / "hub" / "models--mlx-community--whisper-large-v3-mlx"
+    if model_name == "mlx-community/whisper-small-mlx" and hf_large_v3_dir.exists():
+        effective_mlx_model = "mlx-community/whisper-large-v3-mlx"
+
+    def _run_chunk(chunk_wav: Path, lang: str | None, offset_sec: float, _tag: str) -> tuple[str, float, list[TranscriptSegment], list[str]]:
+        kwargs: dict[str, Any] = {
+            "path_or_hf_repo": effective_mlx_model,
+            "word_timestamps": True,
+            "condition_on_previous_text": False,
+            "compression_ratio_threshold": 2.2,
+            "no_speech_threshold": 0.55,
+        }
+        if lang:
+            kwargs["language"] = lang
+        result = mlx_module.transcribe(str(chunk_wav), **kwargs)
+        detected_lang = str(result.get("language") or lang or "unknown")
+        lang_prob = float(result.get("language_probability", 0.95 if detected_lang != "unknown" else 0.0))
+        raw_segs = result.get("segments") or []
+        segments, uncertain_ids = _convert_whisper_segments(raw_segs, detected_lang)
+        _shift_segments_offset(segments, offset_sec)
+        return detected_lang, round(lang_prob, 3), segments, uncertain_ids
+
+    return _run_multilingual_chunked_verification(
+        wav_path=wav_path,
+        duration_sec=duration_sec,
+        engine_name="mlx-whisper",
+        model_label=effective_mlx_model,
+        language=language,
+        run_chunk=_run_chunk,
+    )
+
+
+def _transcribe_with_faster_whisper(
+    wav_path: Path,
+    duration_sec: float,
+    model_name: str,
+    language: str | None = None,
+    whisper_model: Any | None = None,
+    fw_size: str | None = None,
+) -> TranscriptResult:
+    resolved_size = fw_size or ("small" if "small" in model_name else "base")
+    if whisper_model is None:
+        from faster_whisper import WhisperModel  # type: ignore
+
+        whisper_model = WhisperModel(resolved_size, device="cpu", compute_type="int8")
+
+    def _run_chunk(chunk_wav: Path, lang: str | None, offset_sec: float, _tag: str) -> tuple[str, float, list[TranscriptSegment], list[str]]:
+        seg_iter, info = whisper_model.transcribe(str(chunk_wav), language=lang, word_timestamps=True)
+        raw_segs: list[dict[str, Any]] = []
+        for s in seg_iter:
+            raw_segs.append(
+                {
+                    "start": s.start,
+                    "end": s.end,
+                    "text": s.text,
+                    "avg_logprob": s.avg_logprob,
+                    "no_speech_prob": s.no_speech_prob,
+                    "words": [
+                        {"word": w.word, "start": w.start, "end": w.end, "probability": w.probability}
+                        for w in (s.words or [])
+                    ],
+                }
+            )
+        detected_lang = str(getattr(info, "language", None) or lang or "unknown")
+        lang_prob = float(getattr(info, "language_probability", 0.9 if lang else 0.0))
+        segments, uncertain_ids = _convert_whisper_segments(raw_segs, detected_lang)
+        _shift_segments_offset(segments, offset_sec)
+        return detected_lang, round(lang_prob, 3), segments, uncertain_ids
+
+    return _run_multilingual_chunked_verification(
+        wav_path=wav_path,
+        duration_sec=duration_sec,
+        engine_name="faster-whisper",
+        model_label=resolved_size,
+        language=language,
+        run_chunk=_run_chunk,
+    )
 
 
 def transcribe_media(
@@ -1368,39 +1559,11 @@ def transcribe_media(
 
         # 1. Try mlx-whisper (Apple Silicon Python MLX acceleration)
         try:
-            import mlx_whisper  # type: ignore
-
-            effective_mlx_model = model_name
-            hf_large_v3_dir = Path.home() / ".cache" / "huggingface" / "hub" / "models--mlx-community--whisper-large-v3-mlx"
-            if model_name == "mlx-community/whisper-small-mlx" and hf_large_v3_dir.exists():
-                effective_mlx_model = "mlx-community/whisper-large-v3-mlx"
-
-            kwargs: dict[str, Any] = {
-                "path_or_hf_repo": effective_mlx_model,
-                "word_timestamps": True,
-                "condition_on_previous_text": False,
-                "compression_ratio_threshold": 2.2,
-                "no_speech_threshold": 0.55,
-            }
-            if language:
-                kwargs["language"] = language
-            result = mlx_whisper.transcribe(str(wav_path), **kwargs)
-            detected_lang = str(result.get("language") or language or "unknown")
-            raw_segs = result.get("segments") or []
-            segments, uncertain_ids = _convert_whisper_segments(raw_segs, detected_lang)
-            langs = sorted({s.language for s in segments} | ({detected_lang} if detected_lang != "unknown" else set()))
-            tr = audit_and_verify_transcript(
-                TranscriptResult(
-                    engine="mlx-whisper",
-                    model=effective_mlx_model,
-                    detected_language=detected_lang,
-                    language_probability=0.95 if detected_lang != "unknown" else 0.0,
-                    languages_observed=langs,
-                    duration_sec=duration_sec,
-                    segments=segments,
-                    uncertain_segment_ids=uncertain_ids,
-                    verbatim_preserved=True,
-                )
+            tr = _transcribe_with_mlx_whisper(
+                wav_path=wav_path,
+                duration_sec=duration_sec,
+                model_name=model_name,
+                language=language,
             )
             return align_transcript_to_audio(tr, raw_wav_path, force_all=False)
         except ImportError:
@@ -1421,44 +1584,77 @@ def transcribe_media(
 
         # 3. Try faster-whisper (cross-platform CTranslate2 fallback)
         try:
-            from faster_whisper import WhisperModel  # type: ignore
-
-            fw_size = "small" if "small" in model_name else "base"
-            model = WhisperModel(fw_size, device="cpu", compute_type="int8")
-            seg_iter, info = model.transcribe(str(wav_path), language=language, word_timestamps=True)
-            raw_segs = []
-            for s in seg_iter:
-                raw_segs.append(
-                    {
-                        "start": s.start,
-                        "end": s.end,
-                        "text": s.text,
-                        "avg_logprob": s.avg_logprob,
-                        "no_speech_prob": s.no_speech_prob,
-                        "words": [
-                            {"word": w.word, "start": w.start, "end": w.end, "probability": w.probability}
-                            for w in (s.words or [])
-                        ],
-                    }
-                )
-            detected_lang = str(getattr(info, "language", None) or language or "unknown")
-            lang_prob = float(getattr(info, "language_probability", 0.0))
-            segments, uncertain_ids = _convert_whisper_segments(raw_segs, detected_lang)
-            tr = audit_and_verify_transcript(
-                TranscriptResult(
-                    engine="faster-whisper",
-                    model=fw_size,
-                    detected_language=detected_lang,
-                    language_probability=round(lang_prob, 3),
-                    languages_observed=[detected_lang] if detected_lang != "unknown" else [],
-                    duration_sec=duration_sec,
-                    segments=segments,
-                    uncertain_segment_ids=uncertain_ids,
-                    verbatim_preserved=True,
-                )
+            tr = _transcribe_with_faster_whisper(
+                wav_path=wav_path,
+                duration_sec=duration_sec,
+                model_name=model_name,
+                language=language,
             )
             return align_transcript_to_audio(tr, raw_wav_path, force_all=False)
         except ImportError as exc:
             raise RuntimeError(
                 "No local Whisper backend available (install mlx-whisper, whisper-cpp + GGML model, or faster-whisper)."
             ) from exc
+
+
+def extract_final_audio_word_timestamps(
+    final_audio_wav: Path,
+    languages: list[str] | None = None,
+    model_hint: str = "mlx-community/whisper-small-mlx",
+) -> list[dict[str, Any]]:
+    """Decode actual spoken word occurrences & timestamps from final edited audio via available local ASR."""
+    wav = Path(final_audio_wav)
+    if not wav.exists():
+        return []
+    env = compute_audio_envelope(wav)
+    if env is None or float(env["max_rms"]) < 5e-4:
+        return []
+    sr, samples = _load_wav_mono_float(wav)
+    if sr <= 0 or len(samples) < int(0.1 * sr):
+        return []
+    duration_sec = float(len(samples)) / float(sr)
+
+    clean_langs = [lg for lg in (languages or []) if lg and lg != "unknown"]
+    single_lang = clean_langs[0] if len(set(clean_langs)) == 1 else None
+
+    tr: TranscriptResult | None = None
+    with tempfile.TemporaryDirectory(prefix="symposium_final_align_") as tmpdir:
+        work_wav = Path(tmpdir) / "final_16k.wav"
+        shutil.copy2(wav, work_wav)
+        try:
+            tr = _transcribe_with_mlx_whisper(work_wav, duration_sec, model_hint, language=single_lang)
+        except Exception:
+            tr = None
+        if tr is None:
+            whisper_cli = shutil.which("whisper-cli")
+            ggml_model = find_whisper_cpp_model(model_hint)
+            if whisper_cli and ggml_model:
+                try:
+                    tr = _transcribe_with_whisper_cpp(work_wav, duration_sec, whisper_cli, ggml_model, language=single_lang)
+                except Exception:
+                    tr = None
+        if tr is None:
+            try:
+                tr = _transcribe_with_faster_whisper(work_wav, duration_sec, model_hint, language=single_lang)
+            except Exception:
+                tr = None
+
+    if tr is None:
+        return []
+    words_out: list[dict[str, Any]] = []
+    for seg in tr.segments:
+        for w in seg.words:
+            txt = w.word.strip()
+            if not txt:
+                continue
+            words_out.append(
+                {
+                    "word": txt,
+                    "start_sec": round(float(w.start_sec), 3),
+                    "end_sec": round(max(float(w.start_sec) + 0.04, float(w.end_sec)), 3),
+                    "probability": round(float(w.probability), 3),
+                    "language": seg.language,
+                }
+            )
+    words_out.sort(key=lambda item: (float(item["start_sec"]), float(item["end_sec"])))
+    return words_out

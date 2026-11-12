@@ -9,14 +9,27 @@ from typing import Any
 
 import httpx
 
-from symposium_studio.models.social import PublishingMode, PublishRequest
+from symposium_studio.engines.production.qa import evaluate_publish_readiness
+from symposium_studio.models.social import PublishingMode, PublishRequest, QualityAssuranceReport
+
+
+def _check_workspace_qa_readiness(workspace_dir: Path, artifact_path: str) -> dict[str, Any]:
+    qa_files = sorted((workspace_dir / "reports").glob("qa_*.json"))
+    qa_reports = [QualityAssuranceReport.model_validate_json(p.read_text(encoding="utf-8")) for p in qa_files]
+    readiness = evaluate_publish_readiness(qa_reports)
+    renders_exist = any((workspace_dir / "renders").glob("*.mp4")) or any((workspace_dir / "shorts").glob("*.mp4"))
+    art_is_video = Path(artifact_path).suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"} if artifact_path else False
+    qa_required = bool(qa_reports) or renders_exist or art_is_video
+    readiness["qa_required"] = qa_required
+    return readiness
 
 
 def execute_publish(req: PublishRequest, workspace_dir: Path) -> dict[str, Any]:
-    """Execute export_only, draft_prep, or approved_publish strictly honoring explicit user approval."""
+    """Execute export_only, draft_prep, or approved_publish strictly honoring explicit user approval and QA readiness."""
     out_dir = workspace_dir / ("telegram" if req.platform == "telegram" else "social")
     out_dir.mkdir(parents=True, exist_ok=True)
     draft_path = out_dir / f"publish_payload_{req.platform}.json"
+    readiness = _check_workspace_qa_readiness(workspace_dir, req.artifact_path)
 
     payload = {
         "platform": req.platform,
@@ -24,14 +37,22 @@ def execute_publish(req: PublishRequest, workspace_dir: Path) -> dict[str, Any]:
         "artifact_path": req.artifact_path,
         "metadata": req.metadata,
         "approval_confirmed": req.approval_confirmed,
+        "publish_readiness": readiness,
     }
 
     if req.mode == PublishingMode.EXPORT_ONLY:
         draft_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        return {"status": "exported_only", "payload_path": str(draft_path), "external_posted": False}
+        return {
+            "status": "exported_only",
+            "payload_path": str(draft_path),
+            "external_posted": False,
+            "publish_readiness": readiness,
+        }
 
     # Platform preflight validation for draft_prep / approved_publish
     warnings: list[str] = []
+    if readiness.get("qa_required") and not readiness["ready_for_publish"]:
+        warnings.append("Critical QA checks have not passed; publishing is blocked until resolved.")
     if req.platform == "threads":
         text = str(req.metadata.get("text", ""))
         if len(text) > 500:
@@ -48,12 +69,18 @@ def execute_publish(req: PublishRequest, workspace_dir: Path) -> dict[str, Any]:
             "payload_path": str(draft_path),
             "warnings": warnings,
             "external_posted": False,
+            "publish_readiness": readiness,
         }
 
-    # APPROVED_PUBLISH gate
+    # APPROVED_PUBLISH gate: requires explicit human approval AND clean QA readiness
     if not req.approval_confirmed or not req.approval_reason.strip():
         raise PermissionError(
             "External publishing refused: requires explicit `approval_confirmed=True` and non-empty `approval_reason`."
+        )
+    if readiness.get("qa_required") and not readiness["ready_for_publish"]:
+        reasons = "; ".join(readiness.get("blocking_reasons") or ["QA failed"])
+        raise PermissionError(
+            f"External publishing refused by QA gate (status=requires_review): {reasons}"
         )
 
     if req.platform == "telegram":

@@ -9,11 +9,14 @@ from typing import Any
 import typer
 import uvicorn
 
+from symposium_studio.models.reference import SelectionMode
 from symposium_studio.models.research import ContentCategory
 from symposium_studio.models.symposium import ResearchMode
 from symposium_studio.studio import SymposiumStudio
 
 cli = typer.Typer(help="Symposium Studio — Open-source AI content production & growth CLI.")
+ref_cli = typer.Typer(help="Multi-reference video intelligence & style transfer.")
+cli.add_typer(ref_cli, name="reference")
 
 
 def _emit(data: Any) -> None:
@@ -260,6 +263,164 @@ def cmd_search(query: str, project_id: str | None = typer.Option(None)) -> None:
 def cmd_serve(host: str = "127.0.0.1", port: int = 8420) -> None:
     """Launch the Symposium Studio FastAPI backend & Web UI server."""
     uvicorn.run("symposium_studio.api.app:app", host=host, port=port, reload=False)
+
+
+@ref_cli.command("library")
+def cmd_ref_library(limit: int = typer.Option(100, help="Max references to list")) -> None:
+    """List reusable references across the personal library."""
+    studio = SymposiumStudio()
+    _emit([r.model_dump(mode="json") for r in studio.list_library_references(limit=limit)])
+
+
+@ref_cli.command("add")
+def cmd_ref_add(
+    project_id: str,
+    files: list[Path] = typer.Option([], "--file", "-f", help="Local reference video path(s)"),
+    workspace_paths: list[str] = typer.Option([], "--workspace-path", help="Relative file path(s) inside workspace"),
+    urls: list[str] = typer.Option([], "--url", "-u", help="Reference URL(s) (YouTube/Shorts/TikTok/Reels)"),
+    library_ids: list[str] = typer.Option([], "--library-id", "-l", help="Existing reference_id(s) from personal library"),
+    platform: str = typer.Option("local", help="Reference platform tag"),
+    creator: str = typer.Option("", help="Creator attribution"),
+    allow_network: bool = typer.Option(False, help="Allow metadata/media fetch for URLs"),
+) -> None:
+    """Ingest local files, workspace videos, URLs, or personal library references into a project."""
+    studio = SymposiumStudio()
+    results: list[dict[str, Any]] = []
+    cache_hits = 0
+    if files:
+        res_f = studio.ingest_reference_files(project_id, files, platform=platform, creator=creator)
+        results.extend(res_f["references"])
+        cache_hits += int(res_f["cache_hits"])
+    for rel in workspace_paths:
+        res_w = studio.ingest_reference_workspace_file(project_id, rel)
+        cache_hits += int(bool(res_w["cache_hit"]))
+        results.append({**res_w["reference"], "cache_hit": res_w["cache_hit"]})
+    for u in urls:
+        res_u = studio.ingest_reference_url(project_id, u, creator=creator, allow_network=allow_network)
+        cache_hits += int(bool(res_u["cache_hit"]))
+        results.append({**res_u["reference"], "cache_hit": res_u["cache_hit"]})
+    for rid in library_ids:
+        res_l = studio.import_library_reference(project_id, rid)
+        cache_hits += 1
+        results.append({**res_l["reference"], "cache_hit": True})
+    _emit({"project_id": project_id, "ingested_count": len(results), "cache_hits": cache_hits, "references": results})
+
+
+@ref_cli.command("analyze")
+def cmd_ref_analyze(
+    project_id: str,
+    reference_ids: list[str] = typer.Option([], "--ref-id", help="Optional specific reference_id(s)"),
+    run_asr: bool = typer.Option(True, "--asr/--no-asr", help="Run local Whisper ASR cadence check on references"),
+    force: bool = typer.Option(False, "--force", help="Re-analyze even if StyleDNA is cached"),
+) -> None:
+    """Run deep CV, SceneDetect, audio SFX, and ASR analysis across project references."""
+    studio = SymposiumStudio()
+    _emit(
+        studio.analyze_project_references(
+            project_id,
+            reference_ids=reference_ids or None,
+            run_asr=run_asr,
+            force=force,
+        )
+    )
+
+
+@ref_cli.command("compare")
+def cmd_ref_compare(
+    project_id: str,
+    platform: str = typer.Option("youtube_long", "--platform", help="youtube_long | youtube_shorts | tiktok | instagram_reels"),
+    mode: SelectionMode = typer.Option(SelectionMode.BEST_SINGLE, "--mode", help="best_single | intelligent_hybrid | manual_override"),
+    manual_id: str | None = typer.Option(None, "--manual-id", help="Manual reference_id override"),
+) -> None:
+    """Rank analyzed references via 13 compatibility criteria and run the AI Symposium Reference Conference."""
+    studio = SymposiumStudio()
+    _emit(
+        studio.compare_and_select_references(
+            project_id,
+            target_platform=platform,
+            selection_mode=mode,
+            manual_reference_id=manual_id,
+        )
+    )
+
+
+@ref_cli.command("select")
+def cmd_ref_select(
+    project_id: str,
+    reference_id: str,
+    platform: str = typer.Option("youtube_long", "--platform", help="Target deliverable platform"),
+) -> None:
+    """Manually select a reference and regenerate Symposium decision + StyleTransferPlan."""
+    studio = SymposiumStudio()
+    _emit(
+        studio.compare_and_select_references(
+            project_id,
+            target_platform=platform,
+            selection_mode=SelectionMode.MANUAL_OVERRIDE,
+            manual_reference_id=reference_id,
+        )
+    )
+
+
+@ref_cli.command("adjust")
+def cmd_ref_adjust(
+    project_id: str,
+    pacing_multiplier: float | None = typer.Option(None, help="Explicit pacing multiplier (0.5..1.8)"),
+    increase_pacing: bool = typer.Option(False, "--increase-pacing", help="Boost pacing +0.25x"),
+    decrease_pacing: bool = typer.Option(False, "--decrease-pacing", help="Relax pacing -0.20x"),
+    subtitle_minimal: bool = typer.Option(False, "--subtitle-minimal", help="Use minimal captions"),
+    subtitle_bold: bool = typer.Option(False, "--subtitle-bold", help="Use bold/heavy captions"),
+    disable_memes: bool = typer.Option(False, "--disable-memes", help="Disable meme cards"),
+    enable_memes: bool = typer.Option(False, "--enable-memes", help="Enable meme cards"),
+    boost_edu: bool = typer.Option(False, "--boost-edu", help="Boost educational graphics"),
+    keep_structure: bool = typer.Option(False, "--keep-structure", help="Keep storyboard order, apply rhythm only"),
+    platform: str | None = typer.Option(None, "--platform"),
+) -> None:
+    """Interactively refine StyleTransferParameters without re-analyzing references."""
+    adj: dict[str, Any] = {}
+    if pacing_multiplier is not None:
+        adj["pacing_multiplier"] = pacing_multiplier
+    if increase_pacing:
+        adj["increase_pacing"] = True
+    if decrease_pacing:
+        adj["decrease_pacing"] = True
+    if subtitle_minimal:
+        adj["subtitle_minimal"] = True
+    if subtitle_bold:
+        adj["subtitle_bold"] = True
+    if disable_memes:
+        adj["disable_memes"] = True
+    if enable_memes:
+        adj["enable_memes"] = True
+    if boost_edu:
+        adj["boost_educational_graphics"] = True
+    if keep_structure:
+        adj["keep_structure_apply_rhythm_only"] = True
+    studio = SymposiumStudio()
+    _emit(studio.adjust_style_transfer_plan(project_id, adjustments=adj, target_platform=platform))
+
+
+@ref_cli.command("render")
+def cmd_ref_render(
+    project_id: str,
+    platform: str = typer.Option("youtube_long", "--platform"),
+    include_shorts: bool = typer.Option(True, "--shorts/--no-shorts"),
+    include_tiktok: bool = typer.Option(False, "--tiktok"),
+    include_reels: bool = typer.Option(False, "--reels"),
+    variants: int = typer.Option(1, "--variants"),
+) -> None:
+    """Render deliverables using the locked StyleTransferPlan and generate style_similarity.json."""
+    studio = SymposiumStudio()
+    _emit(
+        studio.render_with_reference_style(
+            project_id,
+            target_platform=platform,
+            include_shorts=include_shorts,
+            include_tiktok=include_tiktok,
+            include_reels=include_reels,
+            short_variants_per_platform=variants,
+        )
+    )
 
 
 def main() -> None:

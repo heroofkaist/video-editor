@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from symposium_studio.engines.analysis.probe import probe_media
-from symposium_studio.engines.analysis.transcribe import extract_raw_mono_wav
+from symposium_studio.engines.analysis.transcribe import extract_final_audio_word_timestamps, extract_raw_mono_wav
 from symposium_studio.engines.effects.library import EFFECTS_CATALOG
 from symposium_studio.engines.effects.sfx_synth import synthesize_ambient_bed, synthesize_sfx
 from symposium_studio.engines.effects.sound_downloader import (
@@ -235,6 +235,8 @@ def render_timeline(
             out_frames = target_frames
 
             push_fx = next((fx for fx in clip.effects if fx.preset_id == "smooth_push_in"), None)
+            color_fx = next((fx for fx in clip.effects if fx.preset_id == "reference_color_grade"), None)
+            clip_grade_vf = (color_fx.parameters or {}).get("ffmpeg_filter", grade_vf) if color_fx is not None else grade_vf
             sw, sh = src_dims.get(clip.source_path, (0, 0))
             src_portrait = sw > 0 and sh > 0 and sh > sw * 1.15
 
@@ -264,7 +266,7 @@ def render_timeline(
                     f"gblur=sigma=28,eq=brightness=-0.10:saturation=0.85,setsar=1,setpts=PTS-STARTPTS[bg];"
                     f"{fg_chain};"
                     f"[bg][fg]overlay=(W-w)/2:(H-h)/2:eof_action=pass,"
-                    f"{grade_vf}{trans_vf},"
+                    f"{clip_grade_vf}{trans_vf},"
                     f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
                 )
             else:
@@ -284,14 +286,14 @@ def render_timeline(
                         f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.32,"
                         f"zoompan=z='{z:.3f}+{z_delta:.3f}*min(1\\,on/{out_frames})':"
                         f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*0.34':d=1:s={w}x{h}:fps={fps_int},"
-                        f"setsar=1,{grade_vf}{trans_vf},"
+                        f"setsar=1,{clip_grade_vf}{trans_vf},"
                         f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
                     )
                 else:
                     vf = (
                         f"{speed_vf}{base_crop}"
                         f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
-                        f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.34,setsar=1,{grade_vf}{trans_vf},"
+                        f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.34,setsar=1,{clip_grade_vf}{trans_vf},"
                         f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
                     )
 
@@ -347,8 +349,23 @@ def render_timeline(
         final_speech_wav = tmp / "final_speech_16k.wav"
         try:
             extract_raw_mono_wav(concat_mkv, final_speech_wav, sample_rate=16000)
-            render_tl = align_captions_to_final_audio(render_tl, final_speech_wav)
-            integrity = validate_subtitle_integrity(render_tl, final_audio_wav=final_speech_wav)
+            lang_hints = list(dict.fromkeys(
+                m.language for m in render_tl.segment_mappings if m.language and m.language != "unknown"
+            ))
+            final_asr_words = extract_final_audio_word_timestamps(
+                final_speech_wav, languages=lang_hints or None
+            )
+            render_tl = align_captions_to_final_audio(
+                render_tl,
+                final_speech_wav,
+                final_asr_words=final_asr_words,
+                use_asr_alignment=False,
+            )
+            integrity = validate_subtitle_integrity(
+                render_tl,
+                final_audio_wav=final_speech_wav,
+                final_asr_words=final_asr_words,
+            )
         except Exception:
             integrity = validate_subtitle_integrity(render_tl)
         render_tl.subtitle_integrity = integrity

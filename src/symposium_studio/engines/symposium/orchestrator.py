@@ -32,6 +32,15 @@ from symposium_studio.engines.symposium.llm_provider import SymposiumLLMRouter
 from symposium_studio.models.growth import ContentExperimentRecord
 from symposium_studio.models.media import MediaAnalysisBundle
 from symposium_studio.models.project import utc_now_iso
+from symposium_studio.models.reference import (
+    ConferenceAgentStatement,
+    HybridStyleGuide,
+    ReferenceAnalysisStatus,
+    ReferenceCandidateEvaluation,
+    ReferenceConferenceRecord,
+    ReferenceItem,
+    SelectionMode,
+)
 from symposium_studio.models.research import ResearchReport, ViralContentItem
 from symposium_studio.models.symposium import (
     AgentProposal,
@@ -1064,4 +1073,206 @@ class SymposiumOrchestrator:
             prior_learnings_applied=prior_learnings,
             storyboard=storyboard,
             created_at=utc_now_iso(),
+        )
+
+    def run_reference_conference(
+        self,
+        project_id: str,
+        analysis: MediaAnalysisBundle,
+        references: list[ReferenceItem],
+        ranked_evaluations: list[ReferenceCandidateEvaluation],
+        target_platform: str = "youtube_long",
+        selection_mode: SelectionMode = SelectionMode.BEST_SINGLE,
+        manual_reference_id: str | None = None,
+    ) -> ReferenceConferenceRecord:
+        """Multi-agent Symposium Reference Conference evaluating compatibility across 10 specialist roles."""
+        from symposium_studio.engines.analysis.reference_selector import build_hybrid_style_guide
+
+        if not ranked_evaluations:
+            raise ValueError("Cannot run Symposium Reference Conference with zero evaluated references.")
+
+        refs_by_id = {r.reference_id: r for r in references}
+        evals_by_id = {e.reference_id: e for e in ranked_evaluations}
+
+        if selection_mode == SelectionMode.MANUAL_OVERRIDE or manual_reference_id:
+            if not manual_reference_id or manual_reference_id not in refs_by_id:
+                raise FileNotFoundError(f"Manual override reference_id not found: {manual_reference_id}")
+            selected_id = manual_reference_id
+            effective_mode = SelectionMode.MANUAL_OVERRIDE if manual_reference_id else selection_mode
+        else:
+            feasible = [e for e in ranked_evaluations if e.is_feasible]
+            selected_id = (feasible[0] if feasible else ranked_evaluations[0]).reference_id
+            effective_mode = selection_mode
+
+        winner_ref = refs_by_id[selected_id]
+        winner_eval = evals_by_id[selected_id]
+        dna = winner_ref.style_dna
+
+        hybrid_guide: HybridStyleGuide | None = None
+        if effective_mode == SelectionMode.INTELLIGENT_HYBRID and len(references) >= 2:
+            hybrid_guide = build_hybrid_style_guide(ranked_evaluations, refs_by_id, target_platform)
+
+        rejected_ids = [e.reference_id for e in ranked_evaluations if e.reference_id != selected_id]
+        cuts_pm = dna.pacing.cuts_per_minute if dna else 0.0
+        med_shot = dna.pacing.median_shot_duration_sec if dna else 0.0
+        sub_words = dna.subtitles.estimated_words_per_cue if dna else 3
+        sub_region = dna.subtitles.vertical_region if dna else "bottom_safe"
+        langs = analysis.transcript.languages_observed or [analysis.transcript.detected_language]
+        has_tech = any(t.is_technical for t in analysis.topics)
+
+        meta_only_refs = [r.title for r in references if r.analysis_status == ReferenceAnalysisStatus.METADATA_ONLY]
+        mod_warnings: list[str] = list(winner_eval.identified_risks)
+        if meta_only_refs:
+            mod_warnings.append(
+                f"Metadata-only references ({', '.join(meta_only_refs[:3])}) could not be visually inspected and were penalized."
+            )
+        if winner_ref.analysis_status == ReferenceAnalysisStatus.METADATA_ONLY:
+            mod_warnings.append(
+                "Selected reference lacks accessible video frames; style transfer falls back safely to metadata defaults."
+            )
+
+        statements: list[ConferenceAgentStatement] = [
+            ConferenceAgentStatement(
+                agent_id="creative_director",
+                agent_title="Creative Director",
+                stance_reference_id=selected_id,
+                recommendations=[
+                    f"Adopt structural rhythm of '{winner_ref.title}' (heuristic fit {winner_eval.heuristic_compatibility_score:.2f} for {target_platform}) while preserving creator voice.",
+                    "Avoid copying copyrighted audio or channel branding; synthesize original callouts & diagrams instead.",
+                ],
+                evidence_refs=[selected_id, analysis.project_id],
+            ),
+            ConferenceAgentStatement(
+                agent_id="research_analyst",
+                agent_title="Research & Reference Analyst",
+                stance_reference_id=ranked_evaluations[0].reference_id,
+                concerns=meta_only_refs and [f"Metadata-only limits on {', '.join(meta_only_refs[:2])}"] or [],
+                recommendations=[
+                    f"Ranked {len(ranked_evaluations)} candidate references across 13 heuristic criteria; top fit='{ranked_evaluations[0].title}' ({ranked_evaluations[0].heuristic_compatibility_score:.3f}).",
+                    "Compatible scores reflect structural footage match, not guaranteed audience view counts.",
+                ],
+                evidence_refs=[e.reference_id for e in ranked_evaluations[:3]],
+            ),
+            ConferenceAgentStatement(
+                agent_id="technical_science_editor",
+                agent_title="Technical Physics & Science Editor",
+                stance_reference_id=selected_id,
+                concerns=(
+                    ["Ref cuts exceed 24/min; hold 1.0x clarity speed on technical explanations."]
+                    if has_tech and cuts_pm >= 24.0
+                    else []
+                ),
+                recommendations=[
+                    f"Use `{dna.recommended_animation_engine if dna else 'manim_factual_diagram'}` during explanation beats with factual clarity lock.",
+                ],
+                evidence_refs=[t.topic_id for t in analysis.topics[:2]],
+            ),
+            ConferenceAgentStatement(
+                agent_id="pacing_shortform_editor",
+                agent_title="Pacing & Short-Form Editor",
+                stance_reference_id=selected_id,
+                recommendations=[
+                    f"Target ~{med_shot:.2f}s median shot ({cuts_pm:.1f} cuts/min) with tight silence removal and opening 5s hook punch.",
+                ],
+                evidence_refs=[selected_id],
+            ),
+            ConferenceAgentStatement(
+                agent_id="cinematography_framing_specialist",
+                agent_title="Cinematography & Framing Specialist",
+                stance_reference_id=selected_id,
+                recommendations=[
+                    f"Match `{dna.visual.framing_style if dna else 'medium_talking_head'}` with bounded color contrast/saturation and crop_center_x={analysis.recommended_crop_center_x:.2f}.",
+                ],
+                evidence_refs=[selected_id],
+            ),
+            ConferenceAgentStatement(
+                agent_id="motion_designer",
+                agent_title="Motion Designer",
+                stance_reference_id=hybrid_guide.dimension_sources.get("motion_graphics", selected_id) if hybrid_guide else selected_id,
+                recommendations=[
+                    f"Translate detected graphics cadence ({dna.visual.motion_graphics_ratio if dna else 0.0:.2f} ratio) into native procedural overlays (`{dna.recommended_animation_engine if dna else 'kinetic_callout'}`).",
+                ],
+                evidence_refs=[selected_id],
+            ),
+            ConferenceAgentStatement(
+                agent_id="multilingual_subtitle_specialist",
+                agent_title="Multilingual Subtitle & Localization Specialist",
+                stance_reference_id=hybrid_guide.dimension_sources.get("subtitle_typography", selected_id) if hybrid_guide else selected_id,
+                concerns=(
+                    ["Dense multi-script dialogue requires hard cap <=3 words/cue inside safe zone."]
+                    if len([l for l in langs if l and l != "unknown"]) >= 2
+                    else []
+                ),
+                recommendations=[
+                    f"Format captions at <= {min(3, max(1, sub_words))} words/cue in `{sub_region}` anchored to final edited audio ASR timestamps across {', '.join(langs)}.",
+                ],
+                evidence_refs=["subtitle_integrity_gate"],
+            ),
+            ConferenceAgentStatement(
+                agent_id="comedy_meme_strategist",
+                agent_title="Comedy & Meme Strategist",
+                stance_reference_id=selected_id,
+                recommendations=[
+                    f"Keep cutaway/meme density calibrated ({dna.recommended_meme_density if dna else 0.15:.2f}) strictly to conversational punchlines without masking explanatory speech.",
+                ],
+                evidence_refs=[selected_id],
+            ),
+            ConferenceAgentStatement(
+                agent_id="audio_sfx_producer",
+                agent_title="Audio & SFX Producer",
+                stance_reference_id=hybrid_guide.dimension_sources.get("audio_sfx", selected_id) if hybrid_guide else selected_id,
+                recommendations=[
+                    f"Align licensed click/whoosh accents near transitions (~{dna.audio.transient_sfx_per_min if dna else 5.0:.1f}/min) while ducking music bed >=20dB below speech.",
+                ],
+                evidence_refs=[selected_id],
+            ),
+            ConferenceAgentStatement(
+                agent_id="moderator",
+                agent_title="Devil's Advocate Moderator",
+                stance_reference_id=selected_id,
+                concerns=mod_warnings,
+                recommendations=[
+                    "Enforce P0 QA gate (`requires_review` on critical caption/render failures) and document any intentional clarity divergences in Style Similarity Report.",
+                ],
+                evidence_refs=[selected_id, *rejected_ids[:2]],
+            ),
+        ]
+
+        backend_used = "deterministic_analytical"
+        final_rationale = (
+            f"Selected '{winner_ref.title}' via {effective_mode.value} for `{target_platform}` "
+            f"(heuristic fit={winner_eval.heuristic_compatibility_score:.3f}, cuts/min={cuts_pm:.1f}, "
+            f"median_shot={med_shot:.2f}s, engine=`{dna.recommended_animation_engine if dna else 'kinetic_callout'}`). "
+            + (" ".join(hybrid_guide.blended_notes[:3]) if hybrid_guide else "")
+        ).strip()
+
+        # Optional live LLM synthesis polish when explicitly opted in / local Ollama available
+        if self.config.safety.allow_cloud_ai_reasoning or self.config.ollama_model or self.config.local_llm_url:
+            prompt_payload = {
+                "project_id": project_id,
+                "target_platform": target_platform,
+                "selection_mode": effective_mode.value,
+                "winner": {"title": winner_ref.title, "score": winner_eval.heuristic_compatibility_score, "cuts_per_min": cuts_pm},
+                "alternatives": [{"title": e.title, "score": e.heuristic_compatibility_score} for e in ranked_evaluations[:4]],
+            }
+            llm_out, llm_backend = self.llm.try_json(
+                "You are the Symposium Creative Director synthesizing a multi-reference editing conference rationale. Return JSON {\"final_rationale\": str}.",
+                json.dumps(prompt_payload),
+            )
+            if llm_out and isinstance(llm_out.get("final_rationale"), str) and llm_out["final_rationale"].strip():
+                final_rationale = llm_out["final_rationale"].strip()
+                backend_used = llm_backend
+
+        return ReferenceConferenceRecord(
+            conference_id=f"refconf_{uuid.uuid4().hex[:8]}",
+            project_id=project_id,
+            target_platform=target_platform,
+            selection_mode=effective_mode,
+            backend_used=backend_used,
+            selected_reference_id=selected_id,
+            rejected_reference_ids=rejected_ids,
+            hybrid_guide=hybrid_guide,
+            agent_statements=statements,
+            moderator_warnings=mod_warnings,
+            final_rationale=final_rationale,
         )

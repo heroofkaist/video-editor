@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import re
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from symposium_studio.engines.analysis.transcribe import (
     align_words_to_envelope,
     compute_audio_envelope,
     detect_speech_islands_in_window,
+    extract_final_audio_word_timestamps,
 )
 from symposium_studio.models.timeline import CaptionCue, RenderTimeline, TargetPlatformFormat, VideoClipNode
 
@@ -142,12 +144,351 @@ def _match_cue_clip(cue: CaptionCue, clips: list[VideoClipNode]) -> VideoClipNod
     return best_clip
 
 
+_CYR_TO_LAT_TABLE = str.maketrans({
+    "а": "a", "ә": "a", "б": "b", "в": "v", "г": "g", "ғ": "g", "д": "d",
+    "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i", "і": "i", "й": "y",
+    "к": "k", "қ": "k", "л": "l", "м": "m", "н": "n", "ң": "n", "о": "o",
+    "ө": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ұ": "u",
+    "ү": "u", "ф": "f", "х": "h", "һ": "h", "ц": "ts", "ч": "ch", "ш": "sh",
+    "щ": "sh", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+
+
+def _norm_word_token(tok: str) -> str:
+    return re.sub(r"[^\w]+", "", tok.casefold()).strip()
+
+
+def _word_match_similarity(expected_tok: str, asr_tok: str) -> float:
+    e_norm = _norm_word_token(expected_tok)
+    a_norm = _norm_word_token(asr_tok)
+    if not e_norm or not a_norm:
+        return 0.0
+    if e_norm == a_norm:
+        return 1.0
+    sim_direct = difflib.SequenceMatcher(None, e_norm, a_norm).ratio()
+    e_lat = e_norm.translate(_CYR_TO_LAT_TABLE)
+    a_lat = a_norm.translate(_CYR_TO_LAT_TABLE)
+    sim_lat = difflib.SequenceMatcher(None, e_lat, a_lat).ratio()
+    # Cross-script phonetic check (e.g. Latin "test" vs Cyrillic "тест")
+    best = max(sim_direct, sim_lat * 0.96)
+    if (e_norm.startswith(a_norm) or a_norm.startswith(e_norm)) and min(len(e_norm), len(a_norm)) >= 3:
+        best = max(best, 0.80)
+    return best
+
+
+def _normalize_monotonic_cues_and_words(captions: list[CaptionCue]) -> None:
+    """Enforce strictly non-overlapping cues and strictly monotonic internal word timings in place."""
+    captions.sort(key=lambda c: (c.start_sec, c.end_sec))
+    prev_cue_end = 0.0
+    for cue in captions:
+        cue_s = max(prev_cue_end, float(cue.start_sec))
+        if cue.words:
+            w_cursor = cue_s
+            for w in cue.words:
+                orig_ws = float(w.get("start_sec", w_cursor))
+                orig_we = float(w.get("end_sec", orig_ws + 0.08))
+                orig_dur = max(0.04, min(1.5, orig_we - orig_ws))
+                ws = max(w_cursor, orig_ws)
+                we = max(ws + 0.04, orig_we if orig_ws >= w_cursor else ws + min(0.18, orig_dur))
+                w["start_sec"] = round(ws, 3)
+                w["end_sec"] = round(we, 3)
+                w_cursor = float(w["end_sec"])
+            cue.start_sec = round(float(cue.words[0]["start_sec"]), 3)
+            cue.end_sec = round(max(cue.start_sec + 0.14, float(cue.words[-1]["end_sec"])), 3)
+        else:
+            cue.start_sec = round(cue_s, 3)
+            cue.end_sec = round(max(cue.start_sec + 0.14, float(cue.end_sec)), 3)
+        prev_cue_end = float(cue.end_sec)
+
+
+def _speech_silence_threshold(env: dict[str, Any]) -> float:
+    floor = float(env["floor"])
+    max_rms = float(env["max_rms"])
+    has_silent_baseline = floor <= 0.025 and floor < max_rms * 0.20
+    return max(floor * 1.85, max_rms * 0.03) if has_silent_baseline else min(max_rms * 0.03, floor * 0.35)
+
+
+def _tighten_asr_word_span(
+    w: dict[str, Any],
+    env: dict[str, Any] | None,
+    clip_start: float | None = None,
+    clip_end: float | None = None,
+    min_pause_sec: float = 0.10,
+) -> tuple[float, float, bool]:
+    """Tighten pause-smeared ASR word spans onto actual speech islands before clip clamping."""
+    ws_raw = float(w.get("start_sec", 0.0))
+    we_raw = max(ws_raw + 0.04, float(w.get("end_sec", ws_raw + 0.04)))
+    has_real_speech = env is not None and float(env["max_rms"]) >= 5e-4
+    if has_real_speech and env is not None:
+        silence_thresh = _speech_silence_threshold(env)
+        if we_raw - ws_raw > 1.20:
+            det_tok = detect_speech_islands_in_window(env, ws_raw, we_raw, min_pause_sec=min_pause_sec)
+            if det_tok["islands_sec"] and float(det_tok["peak_rms"]) >= silence_thresh:
+                ws_raw, we_raw = max(det_tok["islands_sec"], key=lambda iv: iv[1] - iv[0])
+            else:
+                return ws_raw, we_raw, False
+        else:
+            det_tok = detect_speech_islands_in_window(env, ws_raw, we_raw, min_pause_sec=min_pause_sec)
+            if float(det_tok["peak_rms"]) < silence_thresh:
+                return ws_raw, we_raw, False
+
+    if clip_start is not None:
+        ws_raw = max(clip_start, ws_raw)
+    if clip_end is not None:
+        we_raw = min(clip_end, max(ws_raw + 0.04, we_raw))
+    return round(ws_raw, 3), round(max(ws_raw + 0.04, we_raw), 3), True
+
+
+def _align_tokens_to_asr_words(
+    expected_items: list[dict[str, Any]],
+    asr_words: list[dict[str, Any]],
+    clip_start: float,
+    clip_end: float,
+    env: dict[str, Any] | None,
+    min_pause_sec: float = 0.10,
+) -> tuple[list[dict[str, Any]] | None, int]:
+    """Align expected timeline tokens monotonically against ASR-transcribed words from final audio."""
+    if not expected_items or not asr_words:
+        return None, 0
+
+    clip_dur = max(0.2, clip_end - clip_start)
+    cand_asr: list[dict[str, Any]] = []
+    for w in asr_words:
+        if float(w.get("end_sec", 0.0)) < clip_start - 0.35 or float(w.get("start_sec", 0.0)) > clip_end + 0.35:
+            continue
+        if not _norm_word_token(str(w.get("word", ""))):
+            continue
+        ws_t, we_t, ok_tok = _tighten_asr_word_span(w, env, clip_start=clip_start, clip_end=clip_end, min_pause_sec=min_pause_sec)
+        if not ok_tok:
+            continue
+        cleaned = dict(w)
+        cleaned["start_sec"] = ws_t
+        cleaned["end_sec"] = we_t
+        cand_asr.append(cleaned)
+
+    n = len(expected_items)
+    m = len(cand_asr)
+    if n == 0 or m == 0:
+        return None, 0
+
+    max_time_slack = min(2.4, max(1.35, 0.25 * clip_dur))
+    dp: list[list[float]] = [[0.0] * (m + 1) for _ in range(n + 1)]
+    choice: list[list[int]] = [[0] * (m + 1) for _ in range(n + 1)]  # 1=skip_i, 2=skip_j, 3=match
+
+    for i in range(1, n + 1):
+        ei = expected_items[i - 1]
+        e_txt = str(ei["word"])
+        e_norm = _norm_word_token(e_txt)
+        e_mid = 0.5 * (float(ei.get("orig_start", clip_start)) + float(ei.get("orig_end", clip_end)))
+        for j in range(1, m + 1):
+            aj = cand_asr[j - 1]
+            a_mid = 0.5 * (float(aj["start_sec"]) + float(aj["end_sec"]))
+            best_sc = dp[i - 1][j]
+            act = 1
+            if dp[i][j - 1] > best_sc:
+                best_sc = dp[i][j - 1]
+                act = 2
+            dt = abs(e_mid - a_mid)
+            if dt <= max_time_slack:
+                a_norm = _norm_word_token(str(aj["word"]))
+                sim = _word_match_similarity(e_txt, str(aj["word"]))
+                min_tok_len = min(len(e_norm), len(a_norm))
+                prob_a = float(aj.get("probability", 0.9))
+                # Prevent tiny 1-2 char function words or very low-prob tokens from anchoring large jumps
+                short_jump = min_tok_len <= 2 and (dt > 1.05 or sim < 0.85 or prob_a < 0.25)
+                if sim >= 0.54 and not short_jump:
+                    match_sc = dp[i - 1][j - 1] + (sim * 2.0) - min(0.75, 0.22 * dt)
+                    if match_sc > best_sc:
+                        best_sc = match_sc
+                        act = 3
+            dp[i][j] = best_sc
+            choice[i][j] = act
+
+    matches: dict[int, int] = {}
+    i, j = n, m
+    while i > 0 and j > 0:
+        act = choice[i][j]
+        if act == 3:
+            matches[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif act == 1:
+            i -= 1
+        else:
+            j -= 1
+
+    # Prune contradictory/compressing anchors that squeeze >=2 intervening words below physical speech duration
+    sorted_m = sorted(matches.items())
+    if len(sorted_m) >= 2:
+        pruned: dict[int, int] = {}
+        kept_list: list[tuple[int, int]] = []
+        for idx_e, idx_a in sorted_m:
+            aj = cand_asr[idx_a]
+            ws = max(clip_start, min(clip_end - 0.04, float(aj["start_sec"])))
+            if kept_list:
+                prev_e, prev_a = kept_list[-1]
+                prev_we = min(clip_end, max(clip_start + 0.04, float(cand_asr[prev_a]["end_sec"])))
+                k_between = idx_e - prev_e - 1
+                if k_between >= 2:
+                    avail = ws - prev_we
+                    orig_gap_span = float(expected_items[idx_e - 1]["orig_end"]) - float(expected_items[prev_e + 1]["orig_start"])
+                    if avail < 0.065 * k_between and orig_gap_span >= 0.22 * k_between:
+                        # Drop whichever of the two anchors deviates further from its expected timeline time
+                        prev_dt = abs(0.5 * (float(expected_items[prev_e]["orig_start"]) + float(expected_items[prev_e]["orig_end"])) - float(cand_asr[prev_a]["start_sec"]))
+                        curr_dt = abs(0.5 * (float(expected_items[idx_e]["orig_start"]) + float(expected_items[idx_e]["orig_end"])) - ws)
+                        if curr_dt >= prev_dt:
+                            continue
+                        kept_list.pop()
+            kept_list.append((idx_e, idx_a))
+        pruned = dict(kept_list)
+        matches = pruned
+
+    matched_cnt = len(matches)
+    if matched_cnt == 0 or (n >= 4 and matched_cnt < 2 and matched_cnt / n < 0.25):
+        return None, 0
+
+    aligned: list[dict[str, Any] | None] = [None] * n
+    for idx_e, idx_a in sorted(matches.items()):
+        aj = cand_asr[idx_a]
+        ws = max(clip_start, min(clip_end - 0.04, float(aj["start_sec"])))
+        we = min(clip_end, max(ws + 0.04, float(aj["end_sec"])))
+        orig = expected_items[idx_e]
+        aligned[idx_e] = {
+            "word": str(orig["word"]),
+            "start_sec": round(ws, 3),
+            "end_sec": round(we, 3),
+            "probability": round(float(orig.get("probability", aj.get("probability", 0.95))), 3),
+            "alignment_source": "asr_word_match",
+            "matched_asr_word": str(aj["word"]),
+        }
+
+    # Interpolate any unmatched words inside tight neighboring matched ASR anchor bounds + acoustic islands,
+    # preserving natural pause boundaries from expected orig_start/orig_end so pauses never stretch single cues.
+    idx = 0
+    while idx < n:
+        if aligned[idx] is not None:
+            idx += 1
+            continue
+        run_end = idx
+        while run_end < n and aligned[run_end] is None:
+            run_end += 1
+        left_t = float(aligned[idx - 1]["end_sec"]) if idx > 0 and aligned[idx - 1] is not None else max(
+            clip_start, float(expected_items[idx].get("orig_start", clip_start)) - 0.20
+        )
+        right_t = float(aligned[run_end]["start_sec"]) if run_end < n and aligned[run_end] is not None else min(
+            clip_end, float(expected_items[run_end - 1].get("orig_end", clip_end)) + 0.20
+        )
+        left_t = max(clip_start, left_t)
+        right_t = min(clip_end, max(left_t + 0.04 * (run_end - idx), right_t))
+
+        # Split unmatched run into natural speaking bursts across >=0.40s pauses in expected timeline timing
+        bursts: list[tuple[int, int]] = []
+        b_start = idx
+        for k in range(idx + 1, run_end):
+            pause_gap = float(expected_items[k]["orig_start"]) - float(expected_items[k - 1]["orig_end"])
+            if pause_gap >= 0.40:
+                bursts.append((b_start, k))
+                b_start = k
+        bursts.append((b_start, run_end))
+
+        cursor_t = left_t
+        for b_i, (bs, be) in enumerate(bursts):
+            k_rem_after = run_end - be
+            hard_max_t = right_t - 0.04 * k_rem_after
+            first_orig_s = float(expected_items[bs].get("orig_start", cursor_t))
+            last_orig_e = float(expected_items[be - 1].get("orig_end", hard_max_t))
+            # If this burst is just one segment among multiple bursts or bounded by a distant anchor,
+            # localize the acoustic window instead of stretching across the long silent pause.
+            if len(bursts) > 1:
+                win_s = max(cursor_t, first_orig_s - 0.55)
+                next_burst_orig_s = float(expected_items[be]["orig_start"]) if b_i + 1 < len(bursts) else hard_max_t
+                win_e = min(hard_max_t, max(win_s + 0.04 * (be - bs), min(last_orig_e + 0.55, 0.5 * (last_orig_e + next_burst_orig_s))))
+            else:
+                win_s = cursor_t
+                # Also guard a single burst before a distant anchor after a long pause
+                if run_end < n and (right_t - last_orig_e) > 1.25:
+                    win_e = min(hard_max_t, max(win_s + 0.04 * (be - bs), last_orig_e + 0.55))
+                else:
+                    win_e = hard_max_t
+            win_s = max(clip_start, min(win_s, hard_max_t - 0.04 * (be - bs)))
+            win_e = min(clip_end, max(win_s + 0.04 * (be - bs), win_e))
+
+            sub_tokens = [str(expected_items[k]["word"]) for k in range(bs, be)]
+            sub_weights = [_syllable_word_weight(t) for t in sub_tokens]
+            sub_probs = [float(expected_items[k].get("probability", 0.92)) for k in range(bs, be)]
+
+            used_env = False
+            if env is not None:
+                det = detect_speech_islands_in_window(env, win_s, win_e, min_pause_sec=min_pause_sec)
+                if det["islands_idx"]:
+                    env_words, _ = align_words_to_envelope(
+                        tokens=sub_tokens,
+                        word_weights=sub_weights,
+                        env=env,
+                        start_sec=win_s,
+                        end_sec=win_e,
+                        min_pause_sec=min_pause_sec,
+                        probs=sub_probs,
+                    )
+                    if len(env_words) == len(sub_tokens):
+                        for k_off, ew in enumerate(env_words):
+                            aligned[bs + k_off] = {
+                                "word": sub_tokens[k_off],
+                                "start_sec": round(float(ew["start_sec"]), 3),
+                                "end_sec": round(float(ew["end_sec"]), 3),
+                                "probability": round(float(ew["probability"]), 3),
+                                "alignment_source": "asr_anchor_interpolated",
+                            }
+                        used_env = True
+            if not used_env:
+                tot_w = sum(sub_weights) or float(len(sub_tokens))
+                cur_t = win_s
+                span = max(0.04 * len(sub_tokens), win_e - win_s)
+                for k_off, (tok, ww, pr) in enumerate(zip(sub_tokens, sub_weights, sub_probs)):
+                    dur = span * (ww / tot_w)
+                    we = min(clip_end, max(cur_t + 0.04, cur_t + dur))
+                    aligned[bs + k_off] = {
+                        "word": tok,
+                        "start_sec": round(cur_t, 3),
+                        "end_sec": round(we, 3),
+                        "probability": round(pr, 3),
+                        "alignment_source": "asr_anchor_interpolated",
+                    }
+                    cur_t = we
+            cursor_t = float(aligned[be - 1]["end_sec"])  # type: ignore[index]
+        idx = run_end
+
+    # Guarantee strictly ascending word timestamps within [clip_start, clip_end]
+    out: list[dict[str, Any]] = []
+    prev_end = clip_start
+    for rem_idx, item in enumerate(aligned):
+        assert item is not None
+        max_end_here = clip_end - 0.04 * (n - rem_idx - 1)
+        ws = max(prev_end, min(max_end_here - 0.04, float(item["start_sec"])))
+        we = min(max_end_here, max(ws + 0.04, float(item["end_sec"])))
+        if we <= ws:
+            ws = max(prev_end, max_end_here - 0.04)
+            we = max_end_here
+        item["start_sec"] = round(ws, 3)
+        item["end_sec"] = round(we, 3)
+        prev_end = item["end_sec"]
+        out.append(item)
+    return out, matched_cnt
+
+
 def align_captions_to_final_audio(
     timeline: RenderTimeline,
     final_audio_wav: Path,
     min_pause_sec: float = 0.10,
+    final_asr_words: list[dict[str, Any]] | None = None,
+    use_asr_alignment: bool = True,
 ) -> RenderTimeline:
-    """Align caption cue and word timestamps directly against final edited concatenated audio."""
+    """Align caption cue and word timestamps directly against final edited concatenated audio.
+
+    Prefers genuine ASR word-timestamp DP matching against final edited audio pronunciation,
+    refining unmatched inter-anchor words via acoustic speech islands, and gracefully falling back
+    to acoustic envelope anchoring when final audio has no decodable speech tokens.
+    """
     aligned_tl = timeline.model_copy(deep=True)
     if not aligned_tl.captions:
         return aligned_tl
@@ -155,6 +496,13 @@ def align_captions_to_final_audio(
     env = compute_audio_envelope(final_audio_wav)
     if env is None or float(env["max_rms"]) < 5e-4:
         return aligned_tl
+
+    asr_words: list[dict[str, Any]] = list(final_asr_words or [])
+    if not asr_words and use_asr_alignment:
+        lang_hints = list(dict.fromkeys(
+            m.language for m in aligned_tl.segment_mappings if m.language and m.language != "unknown"
+        ))
+        asr_words = extract_final_audio_word_timestamps(final_audio_wav, languages=lang_hints or None)
 
     clips = aligned_tl.clips
     clip_order = {c.clip_id: i for i, c in enumerate(clips)}
@@ -175,6 +523,69 @@ def align_captions_to_final_audio(
     for c_idx in sorted(grouped_indices):
         clip = clips[c_idx]
         idx_list = sorted(grouped_indices[c_idx], key=lambda i: aligned_tl.captions[i].start_sec)
+
+        # Stage 1: Try genuine ASR word-level monotone alignment across this clip's cues
+        clip_cue_slices: list[tuple[int, list[dict[str, Any]]]] = []
+        clip_flat_items: list[dict[str, Any]] = []
+        for idx in idx_list:
+            cue = aligned_tl.captions[idx]
+            if cue.words:
+                w_items = [dict(w) for w in cue.words if str(w.get("word", "")).strip()]
+            else:
+                toks = [t for t in cue.text.split() if t.strip()]
+                step = max(0.04, (cue.end_sec - cue.start_sec) / max(1, len(toks)))
+                w_items = [
+                    {
+                        "word": t,
+                        "start_sec": round(cue.start_sec + wi * step, 3),
+                        "end_sec": round(min(cue.end_sec, cue.start_sec + (wi + 1) * step), 3),
+                    }
+                    for wi, t in enumerate(toks)
+                ]
+            if not w_items:
+                continue
+            clip_cue_slices.append((idx, w_items))
+            for wi in w_items:
+                clip_flat_items.append(
+                    {
+                        "word": str(wi["word"]).strip(),
+                        "orig_start": float(wi.get("start_sec", cue.start_sec)),
+                        "orig_end": float(wi.get("end_sec", cue.end_sec)),
+                        "probability": float(wi.get("probability", 0.95)),
+                    }
+                )
+
+        if asr_words and clip_flat_items:
+            asr_aligned_words, matched_cnt = _align_tokens_to_asr_words(
+                expected_items=clip_flat_items,
+                asr_words=asr_words,
+                clip_start=float(clip.timeline_start_sec),
+                clip_end=float(clip.timeline_end_sec),
+                env=env,
+                min_pause_sec=min_pause_sec,
+            )
+            if asr_aligned_words is not None and matched_cnt > 0 and len(asr_aligned_words) == len(clip_flat_items):
+                cursor = 0
+                for idx, orig_items in clip_cue_slices:
+                    cue = aligned_tl.captions[idx]
+                    n_w = len(orig_items)
+                    seg_aligned = asr_aligned_words[cursor : cursor + n_w]
+                    cursor += n_w
+                    new_words: list[dict[str, Any]] = []
+                    for orig_w, al_w in zip(orig_items, seg_aligned):
+                        merged = dict(orig_w)
+                        merged["word"] = str(orig_w.get("word", al_w["word"]))
+                        merged["start_sec"] = round(float(al_w["start_sec"]), 3)
+                        merged["end_sec"] = round(float(al_w["end_sec"]), 3)
+                        merged["alignment_source"] = al_w.get("alignment_source", "asr_word_match")
+                        new_words.append(merged)
+                    cue.words = new_words
+                    cue.start_sec = round(float(new_words[0]["start_sec"]), 3)
+                    cue.end_sec = round(max(cue.start_sec + 0.14, float(new_words[-1]["end_sec"])), 3)
+                    cue.aligned_to_final_audio = True
+                continue
+
+        # Stage 2: Acoustic speech-island fallback (for non-speech tones or zero ASR matches)
         # Partition cues into contiguous speech bursts separated by > 0.48s
         clusters: list[list[int]] = []
         for idx in idx_list:
@@ -257,6 +668,7 @@ def align_captions_to_final_audio(
                     merged["word"] = str(orig_w.get("word", al_w["word"]))
                     merged["start_sec"] = round(float(al_w["start_sec"]), 3)
                     merged["end_sec"] = round(float(al_w["end_sec"]), 3)
+                    merged["alignment_source"] = "acoustic_envelope"
                     new_words.append(merged)
                 cue.words = new_words
                 cue.start_sec = round(float(new_words[0]["start_sec"]), 3)
@@ -264,21 +676,8 @@ def align_captions_to_final_audio(
                 cue.aligned_to_final_audio = True
             prev_cluster_end = float(aligned_tl.captions[cl_indices[-1]].end_sec)
 
-    # Guarantee strictly non-overlapping ascending output timestamps after final-audio snapping
-    aligned_tl.captions.sort(key=lambda c: (c.start_sec, c.end_sec))
-    prev_end = 0.0
-    for cue in aligned_tl.captions:
-        if cue.start_sec < prev_end:
-            cue.start_sec = round(prev_end, 3)
-            if cue.end_sec < cue.start_sec + 0.14:
-                cue.end_sec = round(cue.start_sec + 0.14, 3)
-            for w in cue.words:
-                if float(w.get("start_sec", 0.0)) < cue.start_sec:
-                    w["start_sec"] = cue.start_sec
-                if float(w.get("end_sec", 0.0)) < float(w.get("start_sec", 0.0)) + 0.04:
-                    w["end_sec"] = round(float(w.get("start_sec", 0.0)) + 0.04, 3)
-        prev_end = cue.end_sec
-
+    # Guarantee strictly non-overlapping ascending cues and monotonic internal words after snapping
+    _normalize_monotonic_cues_and_words(aligned_tl.captions)
     return aligned_tl
 
 
@@ -286,6 +685,7 @@ def validate_subtitle_integrity(
     timeline: RenderTimeline,
     final_audio_wav: Path | None = None,
     expected_segment_ids: list[str] | set[str] | None = None,
+    final_asr_words: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Detect missing, duplicated, incorrectly ordered, unadjusted-source, and acoustically misaligned subtitles."""
     missing: list[dict[str, Any]] = []
@@ -399,12 +799,15 @@ def validate_subtitle_integrity(
                 expected_tl_s = host_clip.timeline_start_sec + (
                     float(cue.source_start_sec) - float(host_clip.source_start_sec)
                 ) / max(0.25, float(host_clip.playback_speed))
-                tol_unadj = (
-                    max(0.95, 0.35 * max(0.2, host_clip.timeline_end_sec - host_clip.timeline_start_sec))
-                    if cue.aligned_to_final_audio
-                    else 0.65
+                clip_dur = max(0.2, host_clip.timeline_end_sec - host_clip.timeline_start_sec)
+                tol_unadj = max(1.45, 0.45 * clip_dur) if cue.aligned_to_final_audio else 0.65
+                has_asr_match = any(w.get("alignment_source") == "asr_word_match" for w in cue.words)
+                leaked_raw_src = (
+                    abs(float(cue.start_sec) - float(cue.source_start_sec)) <= 0.12
+                    and abs(expected_tl_s - float(cue.source_start_sec)) > 0.75
+                    and (not cue.aligned_to_final_audio or not has_asr_match)
                 )
-                if abs(float(cue.start_sec) - expected_tl_s) > tol_unadj:
+                if leaked_raw_src or abs(float(cue.start_sec) - expected_tl_s) > tol_unadj:
                     misaligned.append(
                         {
                             "code": "UNADJUSTED_SOURCE_TIMESTAMP_REUSE",
@@ -487,6 +890,51 @@ def validate_subtitle_integrity(
                         }
                     )
 
+    # Summarize word-level provenance & verify drift when final ASR words are provided
+    source_counts: dict[str, int] = {}
+    total_word_count = 0
+    for c in cues:
+        for w in c.words:
+            total_word_count += 1
+            src = str(w.get("alignment_source") or "timeline_estimate")
+            source_counts[src] = source_counts.get(src, 0) + 1
+
+    word_drifts: list[float] = []
+    if final_asr_words:
+        # Compare ASR-matched cue words directly against matching final ASR word occurrences nearby,
+        # using the exact same speech-island tightening & host clip boundary clamping as alignment.
+        for c in cues:
+            hc = clip_by_id.get(c.clip_id or "") or _match_cue_clip(c, clips)
+            hc_s = float(hc.timeline_start_sec) if hc is not None else None
+            hc_e = float(hc.timeline_end_sec) if hc is not None else None
+            for w in c.words:
+                w_txt = str(w.get("word", ""))
+                ws = float(w.get("start_sec", c.start_sec))
+                near_pairs: list[tuple[dict[str, Any], float]] = []
+                for aw in final_asr_words:
+                    if _word_match_similarity(w_txt, str(aw.get("word", ""))) < 0.65:
+                        continue
+                    aw_s, _aw_e, ok_tok = _tighten_asr_word_span(aw, env, clip_start=hc_s, clip_end=hc_e)
+                    if not ok_tok:
+                        aw_s = float(aw.get("start_sec", -99.0))
+                    if abs(aw_s - ws) <= 1.25 or abs(float(aw.get("start_sec", -99.0)) - ws) <= 1.25:
+                        near_pairs.append((aw, aw_s))
+                if near_pairs:
+                    best_aw, best_aw_s = min(near_pairs, key=lambda item: abs(item[1] - ws))
+                    drift = abs(best_aw_s - ws)
+                    word_drifts.append(drift)
+                    if drift > 0.55 and w.get("alignment_source") == "asr_word_match":
+                        misaligned.append(
+                            {
+                                "code": "ASR_WORD_DRIFT_EXCEEDED",
+                                "cue_id": c.cue_id,
+                                "word": w_txt,
+                                "cue_word_start_sec": ws,
+                                "asr_word_start_sec": best_aw_s,
+                                "drift_sec": round(drift, 3),
+                            }
+                        )
+
     if over_three > 0:
         warnings.append(f"{over_three} caption cue(s) exceed 3 words (max={max(cue_word_counts, default=0)}).")
 
@@ -501,6 +949,11 @@ def validate_subtitle_integrity(
         "error_count": len(all_errors),
         "cue_count": len(cues),
         "aligned_cue_count": sum(1 for c in cues if c.aligned_to_final_audio),
+        "total_word_count": total_word_count,
+        "asr_matched_word_count": source_counts.get("asr_word_match", 0),
+        "alignment_sources": source_counts,
+        "mean_word_onset_drift_sec": round(sum(word_drifts) / len(word_drifts), 3) if word_drifts else None,
+        "max_word_onset_drift_sec": round(max(word_drifts), 3) if word_drifts else None,
         "word_count_gt_3": over_three,
         "max_words_per_cue": max(cue_word_counts, default=0),
     }

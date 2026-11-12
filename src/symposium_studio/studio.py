@@ -10,9 +10,15 @@ from typing import Any
 
 from symposium_studio.config import StudioConfig
 from symposium_studio.engines.analysis import (
+    ReferenceLibraryManager,
     align_transcript_to_audio,
+    analyze_reference_item,
+    apply_style_transfer_plan_to_timeline,
     apply_transcript_corrections,
+    build_style_transfer_plan,
+    evaluate_reference_against_source,
     extract_raw_mono_wav,
+    measure_post_render_style_similarity,
     run_full_media_analysis,
 )
 from symposium_studio.engines.analysis.semantics import detect_repetitions, score_highlights, segment_topics
@@ -32,6 +38,7 @@ from symposium_studio.engines.production import (
     build_timeline_from_storyboard,
     build_vertical_short_timelines,
     ensure_project_sfx,
+    evaluate_publish_readiness,
     export_otio,
     render_thumbnail,
     render_timeline,
@@ -50,6 +57,14 @@ from symposium_studio.engines.symposium import AGENT_ROSTER, SymposiumOrchestrat
 from symposium_studio.models.animation import AnimationDomain, AnimationRenderResult, FactualityMode, SceneSpec
 from symposium_studio.models.media import MediaAnalysisBundle
 from symposium_studio.models.project import AssetRole, ProjectManifest
+from symposium_studio.models.reference import (
+    ReferenceAnalysisStatus,
+    ReferenceCandidateEvaluation,
+    ReferenceConferenceRecord,
+    ReferenceItem,
+    SelectionMode,
+    StyleTransferPlan,
+)
 from symposium_studio.models.research import ContentCategory, ResearchPlatform, ResearchReport, ViralContentItem
 from symposium_studio.models.social import (
     PublishingMode,
@@ -74,6 +89,7 @@ class SymposiumStudio:
         self.symposium = SymposiumOrchestrator(self.config)
         self.animations = AnimationEngineRegistry(self.config)
         self.growth = GrowthIntelligenceEngine(self.db)
+        self.reference_lib = ReferenceLibraryManager(self.config.workspaces_root, self.db)
 
     # ------------------------------------------------------------------
     # Projects & Workspaces
@@ -781,6 +797,7 @@ class SymposiumStudio:
             self.workspaces.register_asset(manifest, run.run_id, AssetRole.QA_REPORT, qa_path)
 
             # 2. Platform-specific 9:16 vertical deliverables
+            all_qa_reports = [yt_qa]
             short_outputs: dict[str, list[dict[str, Any]]] = {}
             platform_specs: list[tuple[bool, TargetPlatformFormat, AssetRole]] = [
                 (include_shorts, TargetPlatformFormat.YOUTUBE_SHORTS, AssetRole.RENDER_SHORT),
@@ -820,8 +837,12 @@ class SymposiumStudio:
                         ws_dir / "reports" / "qa_frames",
                         analysis=analysis,
                     )
+                    v_qa_path = ws_dir / "reports" / f"qa_{vtl.timeline_id}.json"
+                    v_qa_path.write_text(v_qa.model_dump_json(indent=2), encoding="utf-8")
+                    all_qa_reports.append(v_qa)
                     self.workspaces.register_asset(manifest, run.run_id, role, v_mp4)
                     self.workspaces.register_asset(manifest, run.run_id, AssetRole.TIMELINE_OTIO, v_otio)
+                    self.workspaces.register_asset(manifest, run.run_id, AssetRole.QA_REPORT, v_qa_path)
                     short_outputs[fmt.value].append(
                         {
                             "timeline_id": vtl.timeline_id,
@@ -830,7 +851,8 @@ class SymposiumStudio:
                             "qa": v_qa.model_dump(mode="json"),
                         }
                     )
-            manifest.project.status = "rendered"
+            readiness = evaluate_publish_readiness(all_qa_reports)
+            manifest.project.status = readiness["recommended_status"]
 
         return {
             "youtube": {
@@ -843,6 +865,8 @@ class SymposiumStudio:
                 "qa": yt_qa.model_dump(mode="json"),
             },
             "vertical_variants": short_outputs,
+            "publish_readiness": readiness,
+            "project_status": manifest.project.status,
         }
 
     def add_click_sounds(
@@ -938,11 +962,26 @@ class SymposiumStudio:
                         }
                     )
 
+        if render_video and short_updates:
+            for item in short_updates:
+                s_mp4 = Path(item["video_path"])
+                s_json = next((ws_dir / "timelines").glob(f"{item['timeline_id']}*.json"), None)
+                if s_mp4.is_file() and s_json is not None:
+                    stl_cur = RenderTimeline.model_validate_json(s_json.read_text(encoding="utf-8"))
+                    s_qa = run_quality_assurance(project_id, s_mp4, stl_cur, ws_dir / "reports" / "qa_frames")
+                    (ws_dir / "reports" / f"qa_{stl_cur.timeline_id}.json").write_text(
+                        s_qa.model_dump_json(indent=2), encoding="utf-8"
+                    )
+
+        readiness = self.get_publish_readiness(project_id) if render_video else None
+
         with self.workspaces.track_run(project_id, "add_click_sounds") as (m2, run):
             src_manifest = Path(dl["manifest_path"])
             if src_manifest.is_file():
                 a_src = self.workspaces.register_asset(m2, run.run_id, AssetRole.SFX_ASSET, src_manifest)
                 run.output_asset_ids.append(a_src.asset_id)
+            if readiness is not None:
+                m2.project.status = readiness["recommended_status"]
 
         return {
             "command": "add_click_sounds",
@@ -956,8 +995,19 @@ class SymposiumStudio:
             "revision": updated_yt.revision,
             "video_path": str(yt_mp4) if render_video else None,
             "qa": yt_qa_payload,
+            "publish_readiness": readiness,
             "shorts_updated": short_updates,
         }
+
+    def get_publish_readiness(self, project_id: str) -> dict[str, Any]:
+        """Evaluate whether rendered deliverables have passed all critical QA & subtitle checks."""
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        qa_files = sorted((ws_dir / "reports").glob("qa_*.json"))
+        qa_reports = [QualityAssuranceReport.model_validate_json(f.read_text(encoding="utf-8")) for f in qa_files]
+        readiness = evaluate_publish_readiness(qa_reports)
+        readiness["project_status"] = manifest.project.status
+        return readiness
 
     # ------------------------------------------------------------------
     # Iterative Agent Instructions
@@ -1129,7 +1179,9 @@ class SymposiumStudio:
         session, _ = self._latest_symposium_and_anim(manifest)
 
         qa_files = sorted((ws_dir / "reports").glob("qa_*.json"))
-        qa_reports = [QualityAssuranceReport.model_validate_json(f.read_text(encoding="utf-8")).model_dump(mode="json") for f in qa_files]
+        qa_models = [QualityAssuranceReport.model_validate_json(f.read_text(encoding="utf-8")) for f in qa_files]
+        qa_reports = [q.model_dump(mode="json") for q in qa_models]
+        readiness = evaluate_publish_readiness(qa_models)
 
         rep_files = sorted((ws_dir / "research").glob("*.json"))
         research_reports = [ResearchReport.model_validate_json(f.read_text(encoding="utf-8")).model_dump(mode="json") for f in rep_files]
@@ -1160,6 +1212,7 @@ class SymposiumStudio:
             "growth_objective": session.growth_objective.model_dump(mode="json") if session.growth_objective else None,
             "creative_director_review": session.creative_director_review.model_dump(mode="json") if session.creative_director_review else None,
             "qa_reports": qa_reports,
+            "publish_readiness": readiness,
             "assets": [a.model_dump(mode="json") for a in manifest.assets],
             "limitations": [
                 "No private retention curves, CTR, or platform watch-time data were fabricated.",
@@ -1183,6 +1236,13 @@ class SymposiumStudio:
         for d in session.decisions:
             md_lines.append(f"- **{d.topic}**: {d.chosen_option} _(Evidence: {', '.join(d.evidence_refs) or 'internal analysis'})_ — {d.rationale}")
         md_lines.append("\n## Quality Verification")
+        md_lines.append(
+            f"- **Publish Gate**: `ready_for_publish={readiness['ready_for_publish']}` "
+            f"(recommended_status=`{readiness['recommended_status']}`, project_status=`{manifest.project.status}`)"
+        )
+        for reason in readiness.get("blocking_reasons") or []:
+            if not readiness["ready_for_publish"]:
+                md_lines.append(f"  - BLOCKED: {reason}")
         for q in qa_reports:
             md_lines.append(f"- `{Path(q['artifact_path']).name}`: passed=`{q['passed']}`, {q['width']}x{q['height']}, dur=`{q['duration_sec']}s`, mean_audio=`{q['audio_mean_db']} dB`, captions=`{q['caption_count']}`, overlays=`{q['overlay_count']}`")
         md_lines.append("\n## Limitations & Compliance Notes")
@@ -1198,6 +1258,715 @@ class SymposiumStudio:
             run.output_asset_ids.extend([a_json.asset_id, a_md.asset_id])
 
         return {"json_path": str(json_path), "markdown_path": str(md_path), "report": report_payload}
+
+    # ------------------------------------------------------------------
+    # Multi-Reference Video Intelligence & Professional Style Transfer
+    # ------------------------------------------------------------------
+    def ingest_reference_files(
+        self,
+        project_id: str,
+        video_paths: list[Path],
+        titles: list[str] | None = None,
+        platform: str = "local",
+        creator: str = "",
+        copy_video: bool = True,
+    ) -> dict[str, Any]:
+        """Ingest one or many local MP4/MOV/WebM reference videos with SHA256 deduplication and cache reuse."""
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        ingested: list[dict[str, Any]] = []
+        cache_hits = 0
+        with self.workspaces.track_run(project_id, "ingest_references", {"count": len(video_paths)}) as (m, run):
+            for idx, vp in enumerate(video_paths):
+                ttl = titles[idx] if titles and idx < len(titles) else None
+                item, hit = self.reference_lib.ingest_local_file(
+                    Path(vp),
+                    project_id=project_id,
+                    workspace_dir=ws_dir,
+                    title=ttl,
+                    platform=platform,
+                    creator=creator,
+                    copy_video=copy_video,
+                )
+                if hit:
+                    cache_hits += 1
+                if item.source_path and Path(item.source_path).is_file():
+                    asset = self.workspaces.register_asset(
+                        m,
+                        run.run_id,
+                        AssetRole.REFERENCE_VIDEO,
+                        Path(item.source_path),
+                        source_attribution="user_reference_video",
+                        license_info="User-provided reference (never copied verbatim into rendered deliverables)",
+                        metadata={"reference_id": item.reference_id, "cache_hit": hit},
+                    )
+                    run.output_asset_ids.append(asset.asset_id)
+                ingested.append({**item.model_dump(mode="json"), "cache_hit": hit})
+        return {"project_id": project_id, "ingested_count": len(ingested), "cache_hits": cache_hits, "references": ingested}
+
+    def ingest_reference_workspace_file(
+        self,
+        project_id: str,
+        relative_path: str,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        item, hit = self.reference_lib.ingest_workspace_file(project_id, ws_dir, relative_path, title=title)
+        return {"project_id": project_id, "cache_hit": hit, "reference": item.model_dump(mode="json")}
+
+    def ingest_reference_url(
+        self,
+        project_id: str,
+        url: str,
+        title: str | None = None,
+        creator: str = "",
+        allow_network: bool = False,
+        metadata_notes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        item, hit = self.reference_lib.ingest_url(
+            url=url,
+            project_id=project_id,
+            workspace_dir=ws_dir,
+            title=title,
+            creator=creator,
+            allow_network=allow_network,
+            metadata_notes=metadata_notes,
+        )
+        return {"project_id": project_id, "cache_hit": hit, "reference": item.model_dump(mode="json")}
+
+    def import_library_reference(self, project_id: str, source_reference_id: str) -> dict[str, Any]:
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        item = self.reference_lib.import_existing_reference(source_reference_id, project_id, ws_dir)
+        return {"project_id": project_id, "reference": item.model_dump(mode="json")}
+
+    def list_project_references(self, project_id: str) -> list[ReferenceItem]:
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        items = self.reference_lib.load_project_manifest(ws_dir)
+        return items if items else self.db.list_references(project_id=project_id)
+
+    def list_library_references(self, limit: int = 200) -> list[ReferenceItem]:
+        """List reusable analyzed/ingested references across all projects, deduplicated by content hash."""
+        items = self.db.list_references(limit=limit)
+        ordered = sorted(
+            items,
+            key=lambda r: (1 if r.style_dna is not None else 0, r.updated_at),
+            reverse=True,
+        )
+        seen: set[str] = set()
+        deduped: list[ReferenceItem] = []
+        for item in ordered:
+            key = item.sha256 or item.source_url or item.reference_id
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def analyze_project_references(
+        self,
+        project_id: str,
+        reference_ids: list[str] | None = None,
+        run_asr: bool = True,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Run genuine CV, PySceneDetect, audio transient, and ASR cadence analysis across all project references."""
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        items = self.list_project_references(project_id)
+        if not items:
+            raise ValueError(f"No references registered in project {project_id}.")
+
+        target_set = set(reference_ids) if reference_ids else None
+        analyzed: list[ReferenceItem] = []
+        skipped_cached = 0
+        metadata_only_count = 0
+
+        with self.workspaces.track_run(project_id, "analyze_references", {"run_asr": run_asr, "force": force}) as (m, run):
+            for item in items:
+                if target_set and item.reference_id not in target_set:
+                    analyzed.append(item)
+                    continue
+                if item.analysis_status == ReferenceAnalysisStatus.METADATA_ONLY:
+                    metadata_only_count += 1
+                    analyzed.append(item)
+                    continue
+                if not force and item.analysis_status == ReferenceAnalysisStatus.FULL_VIDEO_AUDIO and item.style_dna is not None:
+                    skipped_cached += 1
+                    analyzed.append(item)
+                    continue
+
+                ref_dir = self.reference_lib.project_refs_dir(ws_dir) / item.reference_id
+                updated = analyze_reference_item(
+                    item,
+                    workdir=ref_dir,
+                    run_asr=run_asr,
+                    whisper_model=self.config.whisper_model,
+                )
+                self.db.upsert_reference(updated)
+                analyzed.append(updated)
+                dna_json = ref_dir / "style_dna.json"
+                if dna_json.is_file():
+                    asset = self.workspaces.register_asset(
+                        m,
+                        run.run_id,
+                        AssetRole.STYLE_DNA,
+                        dna_json,
+                        metadata={"reference_id": updated.reference_id},
+                    )
+                    run.output_asset_ids.append(asset.asset_id)
+
+            self.reference_lib.save_project_manifest(ws_dir, analyzed)
+
+        return {
+            "project_id": project_id,
+            "total_references": len(analyzed),
+            "cached_reused": skipped_cached,
+            "metadata_only_count": metadata_only_count,
+            "references": [r.model_dump(mode="json") for r in analyzed],
+        }
+
+    def compare_and_select_references(
+        self,
+        project_id: str,
+        target_platform: str = "youtube_long",
+        selection_mode: SelectionMode | str = SelectionMode.BEST_SINGLE,
+        manual_reference_id: str | None = None,
+        adjustments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate all analyzed references against source footage, run Symposium Reference Conference, and lock StyleTransferPlan."""
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        refs = self.list_project_references(project_id)
+        if not refs:
+            raise ValueError(f"No references available to compare for project {project_id}.")
+
+        # Ensure pending local videos are analyzed cleanly first
+        if any(r.analysis_status == ReferenceAnalysisStatus.PENDING for r in refs):
+            self.analyze_project_references(project_id, run_asr=True)
+            refs = self.list_project_references(project_id)
+
+        try:
+            analysis = self.load_analysis(project_id)
+        except FileNotFoundError:
+            analysis = self.analyze_project(project_id)
+
+        mode_enum = SelectionMode(selection_mode) if isinstance(selection_mode, str) else selection_mode
+        if manual_reference_id:
+            mode_enum = SelectionMode.MANUAL_OVERRIDE
+
+        evaluations = [
+            evaluate_reference_against_source(
+                ref,
+                analysis,
+                target_platform=target_platform,
+                creator_niche=manifest.project.creator_niche,
+            )
+            for ref in refs
+        ]
+        ranked = sorted(
+            evaluations,
+            key=lambda e: (1 if e.is_feasible else 0, e.heuristic_compatibility_score),
+            reverse=True,
+        )
+
+        conference = self.symposium.run_reference_conference(
+            project_id=project_id,
+            analysis=analysis,
+            references=refs,
+            ranked_evaluations=ranked,
+            target_platform=target_platform,
+            selection_mode=mode_enum,
+            manual_reference_id=manual_reference_id,
+        )
+        refs_by_id = {r.reference_id: r for r in refs}
+        selected_ref = refs_by_id[conference.selected_reference_id]
+        plan, _profile = build_style_transfer_plan(
+            project_id=project_id,
+            primary_ref=selected_ref,
+            refs_by_id=refs_by_id,
+            conference=conference,
+            target_platform=target_platform,
+            adjustments=adjustments,
+        )
+
+        comp_dir = self.reference_lib.project_refs_dir(ws_dir) / "comparison"
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        ranking_path = comp_dir / f"ranking_{target_platform}.json"
+        ranking_path.write_text(
+            json.dumps([r.model_dump(mode="json") for r in ranked], indent=2),
+            encoding="utf-8",
+        )
+        conf_path = self.reference_lib.project_refs_dir(ws_dir) / "symposium_discussion.json"
+        conf_path.write_text(conference.model_dump_json(indent=2), encoding="utf-8")
+        sel_path = self.reference_lib.project_refs_dir(ws_dir) / "selected_style.json"
+        sel_path.write_text(selected_ref.model_dump_json(indent=2), encoding="utf-8")
+        plan_path = self.reference_lib.project_refs_dir(ws_dir) / "style_transfer_plan.json"
+        plan_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+
+        with self.workspaces.track_run(
+            project_id,
+            "compare_and_select_references",
+            {"target_platform": target_platform, "selection_mode": mode_enum.value, "selected": selected_ref.reference_id},
+        ) as (m2, run):
+            m2.project.editing_style = plan.parameters.base_style_profile
+            a_plan = self.workspaces.register_asset(m2, run.run_id, AssetRole.STYLE_TRANSFER_REPORT, plan_path)
+            run.output_asset_ids.append(a_plan.asset_id)
+            self.workspaces.add_decision(
+                run,
+                step="reference_selection",
+                actor="symposium_reference_conference",
+                decision=f"Selected reference '{selected_ref.title}' ({mode_enum.value}) -> style `{plan.parameters.base_style_profile}`",
+                evidence_ids=[selected_ref.reference_id],
+                rationale=conference.final_rationale,
+            )
+
+        return {
+            "project_id": project_id,
+            "target_platform": target_platform,
+            "ranking_path": str(ranking_path),
+            "ranked_evaluations": [r.model_dump(mode="json") for r in ranked],
+            "conference": conference.model_dump(mode="json"),
+            "selected_reference": selected_ref.model_dump(mode="json"),
+            "style_transfer_plan": plan.model_dump(mode="json"),
+        }
+
+    def adjust_style_transfer_plan(
+        self,
+        project_id: str,
+        adjustments: dict[str, Any],
+        target_platform: str | None = None,
+    ) -> dict[str, Any]:
+        """Update StyleTransferParameters interactively without re-analyzing references."""
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        refs_dir = self.reference_lib.project_refs_dir(ws_dir)
+        sel_path = refs_dir / "selected_style.json"
+        conf_path = refs_dir / "symposium_discussion.json"
+        if not sel_path.is_file() or not conf_path.is_file():
+            raise FileNotFoundError("Select a reference style before adjusting style transfer parameters.")
+
+        selected_ref = ReferenceItem.model_validate_json(sel_path.read_text(encoding="utf-8"))
+        conference = ReferenceConferenceRecord.model_validate_json(conf_path.read_text(encoding="utf-8"))
+        refs = self.list_project_references(project_id)
+        refs_by_id = {r.reference_id: r for r in refs}
+        refs_by_id.setdefault(selected_ref.reference_id, selected_ref)
+        plat = target_platform or conference.target_platform
+
+        plan_path = refs_dir / "style_transfer_plan.json"
+        merged_adj: dict[str, Any] = {}
+        if plan_path.is_file() and not adjustments.get("reset"):
+            try:
+                prev_plan = StyleTransferPlan.model_validate_json(plan_path.read_text(encoding="utf-8"))
+                merged_adj = dict(prev_plan.applied_adjustments or {})
+                merged_adj.setdefault("pacing_multiplier", prev_plan.parameters.pacing_multiplier)
+            except Exception:
+                merged_adj = {}
+
+        incoming = {k: v for k, v in (adjustments or {}).items() if k != "reset"}
+        cur_mult = float(merged_adj.get("pacing_multiplier", 1.0))
+        if "pacing_multiplier" in incoming:
+            merged_adj["pacing_multiplier"] = max(0.5, min(1.8, float(incoming["pacing_multiplier"])))
+            merged_adj.pop("increase_pacing", None)
+            merged_adj.pop("decrease_pacing", None)
+        elif incoming.get("increase_pacing"):
+            merged_adj["pacing_multiplier"] = round(min(1.8, cur_mult + 0.25), 2)
+        elif incoming.get("decrease_pacing"):
+            merged_adj["pacing_multiplier"] = round(max(0.5, cur_mult - 0.20), 2)
+
+        for k, v in incoming.items():
+            if k in {"pacing_multiplier", "increase_pacing", "decrease_pacing"}:
+                continue
+            merged_adj[k] = v
+
+        if incoming.get("subtitle_minimal"):
+            merged_adj.pop("subtitle_bold", None)
+        elif incoming.get("subtitle_bold"):
+            merged_adj.pop("subtitle_minimal", None)
+        if incoming.get("disable_memes") or incoming.get("enable_memes") is False:
+            merged_adj["disable_memes"] = True
+            merged_adj["enable_memes"] = False
+        elif incoming.get("enable_memes") is True or incoming.get("disable_memes") is False:
+            merged_adj["disable_memes"] = False
+            merged_adj["enable_memes"] = True
+
+        plan, _profile = build_style_transfer_plan(
+            project_id=project_id,
+            primary_ref=selected_ref,
+            refs_by_id=refs_by_id,
+            conference=conference,
+            target_platform=plat,
+            adjustments=merged_adj,
+        )
+        plan_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+        manifest.project.editing_style = plan.parameters.base_style_profile
+        self.workspaces.save_manifest(manifest)
+        return {"project_id": project_id, "style_transfer_plan": plan.model_dump(mode="json")}
+
+    def apply_single_reference_with_dna(
+        self,
+        project_id: str,
+        reference_video_path: Path,
+        target_platform: str = "youtube_long",
+    ) -> dict[str, Any]:
+        """Upgrade single-reference style application to produce real StyleDNA, contact sheet, and transfer plan."""
+        ing = self.ingest_reference_files(project_id, [reference_video_path], platform="local")
+        ref_id = ing["references"][0]["reference_id"]
+        self.analyze_project_references(project_id, reference_ids=[ref_id], run_asr=True)
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        has_source = any(a.role == AssetRole.SOURCE_MEDIA for a in manifest.assets) or (ws_dir / "transcripts" / "analysis_bundle.json").is_file()
+        if has_source:
+            sel = self.compare_and_select_references(project_id, target_platform=target_platform, manual_reference_id=ref_id)
+            dna = sel["selected_reference"].get("style_dna") or {}
+            plan_dict = sel["style_transfer_plan"]
+            base_style = plan_dict["parameters"]["base_style_profile"]
+            contact_sheet = sel["selected_reference"].get("contact_sheet_path")
+        else:
+            refs = self.list_project_references(project_id)
+            ref_item = next((r for r in refs if r.reference_id == ref_id), refs[0])
+            conf = ReferenceConferenceRecord(
+                conference_id=f"refconf_{uuid.uuid4().hex[:8]}",
+                project_id=project_id,
+                target_platform=target_platform,
+                selection_mode=SelectionMode.MANUAL_OVERRIDE,
+                selected_reference_id=ref_item.reference_id,
+                final_rationale="Single-reference StyleDNA extraction completed prior to source footage ingest.",
+            )
+            plan_obj, _ = build_style_transfer_plan(
+                project_id=project_id,
+                primary_ref=ref_item,
+                refs_by_id={r.reference_id: r for r in refs},
+                conference=conf,
+                target_platform=target_platform,
+            )
+            refs_dir = self.reference_lib.project_refs_dir(ws_dir)
+            (refs_dir / "selected_style.json").write_text(ref_item.model_dump_json(indent=2), encoding="utf-8")
+            (refs_dir / "symposium_discussion.json").write_text(conf.model_dump_json(indent=2), encoding="utf-8")
+            (refs_dir / "style_transfer_plan.json").write_text(plan_obj.model_dump_json(indent=2), encoding="utf-8")
+            manifest.project.editing_style = plan_obj.parameters.base_style_profile
+            self.workspaces.save_manifest(manifest)
+            dna = ref_item.style_dna.model_dump(mode="json") if ref_item.style_dna else {}
+            plan_dict = plan_obj.model_dump(mode="json")
+            base_style = plan_obj.parameters.base_style_profile
+            contact_sheet = ref_item.contact_sheet_path
+
+        from symposium_studio.engines.analysis.styles import get_style_profile
+
+        prof = get_style_profile(base_style)
+        return {
+            "project_id": project_id,
+            "editing_style": base_style,
+            "profile": prof.model_dump(mode="json"),
+            "reference_id": ref_id,
+            "style_dna": dna,
+            "contact_sheet_path": contact_sheet,
+            "style_transfer_plan": plan_dict,
+        }
+
+    def get_reference_state(self, project_id: str) -> dict[str, Any]:
+        """Return complete project Multi-Reference workspace state for Web UI & diagnostics."""
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        refs_dir = self.reference_lib.project_refs_dir(ws_dir)
+        refs = [r.model_dump(mode="json") for r in self.list_project_references(project_id)]
+        rankings: dict[str, Any] = {}
+        comp_dir = refs_dir / "comparison"
+        if comp_dir.is_dir():
+            for rf in sorted(comp_dir.glob("ranking_*.json")):
+                rankings[rf.stem.replace("ranking_", "")] = json.loads(rf.read_text(encoding="utf-8"))
+        conf = json.loads((refs_dir / "symposium_discussion.json").read_text(encoding="utf-8")) if (refs_dir / "symposium_discussion.json").is_file() else None
+        selected = json.loads((refs_dir / "selected_style.json").read_text(encoding="utf-8")) if (refs_dir / "selected_style.json").is_file() else None
+        plan = json.loads((refs_dir / "style_transfer_plan.json").read_text(encoding="utf-8")) if (refs_dir / "style_transfer_plan.json").is_file() else None
+        sim = json.loads((refs_dir / "style_similarity.json").read_text(encoding="utf-8")) if (refs_dir / "style_similarity.json").is_file() else None
+        return {
+            "project_id": project_id,
+            "references": refs,
+            "rankings_by_platform": rankings,
+            "conference": conf,
+            "selected_reference": selected,
+            "style_transfer_plan": plan,
+            "style_similarity": sim,
+        }
+
+    def render_with_reference_style(
+        self,
+        project_id: str,
+        target_platform: str = "youtube_long",
+        adjustments: dict[str, Any] | None = None,
+        include_shorts: bool = True,
+        include_tiktok: bool = False,
+        include_reels: bool = False,
+        short_variants_per_platform: int = 1,
+    ) -> dict[str, Any]:
+        """Execute end-to-end StyleDNA -> Timeline Edits -> Rendered Video -> StyleSimilarityReport -> Publish Gate."""
+        if adjustments:
+            self.adjust_style_transfer_plan(project_id, adjustments, target_platform=target_platform)
+        manifest = self.workspaces.get_manifest(project_id)
+        ws_dir = Path(manifest.project.workspace_dir)
+        refs_dir = self.reference_lib.project_refs_dir(ws_dir)
+        plan_path = refs_dir / "style_transfer_plan.json"
+        sel_path = refs_dir / "selected_style.json"
+        if not plan_path.is_file() or not sel_path.is_file():
+            raise FileNotFoundError("Compare and select a reference first before rendering with reference style.")
+
+        plan = StyleTransferPlan.model_validate_json(plan_path.read_text(encoding="utf-8"))
+        selected_ref = ReferenceItem.model_validate_json(sel_path.read_text(encoding="utf-8"))
+        params = plan.parameters
+
+        analysis = self.load_analysis(project_id)
+        keywords = [k for t in analysis.topics for k in t.keywords][:6]
+        rep_files = sorted((ws_dir / "research").glob("*.json"))
+        if not rep_files:
+            self.run_research_report(project_id, "content_proposal", keywords)
+
+        try:
+            session, latest_anim = self._latest_symposium_and_anim(manifest)
+        except FileNotFoundError:
+            session, latest_anim = None, None
+        if not params.keep_structure_apply_rhythm_only or session is None:
+            pace_scale = 1.0 / max(0.80, min(1.35, params.pacing_multiplier))
+            session = self.run_symposium_conference(
+                project_id,
+                mode=ResearchMode.STANDARD,
+                style_name=params.base_style_profile,
+                target_min_sec=max(10.0, min(65.0, analysis.probe.duration_sec * 0.65 * pace_scale)),
+                target_max_sec=max(18.0, min(110.0, analysis.probe.duration_sec * 0.92 * pace_scale)),
+            )
+
+        anim_res = latest_anim
+        extra_anims: list[AnimationRenderResult] = []
+        if params.enable_educational_graphics or params.enable_memes:
+            tmpl = params.animation_engine_hint
+            if not params.enable_memes and tmpl == "meme_reaction_card":
+                tmpl = "kinetic_callout"
+            if tmpl == "meme_reaction_card" and params.enable_memes:
+                meme_anims, _ = self._generate_zoomer_meme_cards(manifest, analysis, session, max_cards=4)
+                anim_res = meme_anims[0]
+                extra_anims = meme_anims[1:]
+            else:
+                anim_res = self.generate_animation(project_id, template_id=tmpl, duration_sec=min(5.0, max(2.2, analysis.probe.duration_sec * 0.15)))
+
+        sfx_map = ensure_project_sfx(ws_dir / "effects", download_clicks=False)
+        if params.sfx_click_min_spacing_sec <= 4.0:
+            dl_clicks = download_click_sounds(ws_dir / "effects", allow_network=False)
+            sfx_map.update(dl_clicks.get("click_paths", {}))
+        yt_tl = build_timeline_from_storyboard(
+            project_id=project_id,
+            title=manifest.project.name,
+            analysis=analysis,
+            storyboard=session.storyboard,
+            style_name=params.base_style_profile,
+            animation_result=anim_res,
+            platform_format=TargetPlatformFormat.YOUTUBE_LONG,
+            sfx_paths=sfx_map,
+            extra_overlays=extra_anims,
+        )
+        yt_tl = apply_style_transfer_plan_to_timeline(yt_tl, plan)
+        if params.sfx_click_min_spacing_sec <= 4.0:
+            yt_tl, _ = add_click_sounds_to_timeline(
+                yt_tl,
+                sfx_map,
+                style_name=params.base_style_profile,
+                min_spacing_sec=params.sfx_click_min_spacing_sec,
+                replace_existing=True,
+                bump_revision=False,
+            )
+            for ae in yt_tl.audio_events:
+                if ae.role == "sfx":
+                    ae.gain_db = round(max(-24.0, min(-5.0, params.sfx_gain_db)), 1)
+
+        yt_tl_json = ws_dir / "timelines" / f"{yt_tl.timeline_id}_youtube.json"
+        yt_tl_json.write_text(yt_tl.model_dump_json(indent=2), encoding="utf-8")
+        yt_otio = ws_dir / "timelines" / f"{yt_tl.timeline_id}_youtube.otio"
+        export_otio(yt_tl, yt_otio)
+
+        yt_mp4 = ws_dir / "renders" / f"{manifest.project.slug}_ref_youtube_1080p.mp4"
+        yt_render_files = render_timeline(yt_tl, yt_mp4, ws_dir)
+        if isinstance(yt_render_files.get("rendered_timeline"), RenderTimeline):
+            yt_tl = yt_render_files["rendered_timeline"]
+            yt_tl_json.write_text(yt_tl.model_dump_json(indent=2), encoding="utf-8")
+
+        thumb_png = ws_dir / "thumbnails" / f"{manifest.project.slug}_ref_thumbnail.png"
+        render_thumbnail(
+            Path(analysis.probe.path),
+            headline=manifest.project.name,
+            badge=selected_ref.title[:26],
+            out_png=thumb_png,
+            capture_sec=yt_tl.clips[0].source_start_sec if yt_tl.clips else 0.5,
+        )
+
+        yt_qa = run_quality_assurance(project_id, yt_mp4, yt_tl, ws_dir / "reports" / "qa_frames", analysis=analysis)
+        yt_qa_path = ws_dir / "reports" / f"qa_{yt_tl.timeline_id}.json"
+        yt_qa_path.write_text(yt_qa.model_dump_json(indent=2), encoding="utf-8")
+        all_qa = [yt_qa]
+
+        similarity = measure_post_render_style_similarity(project_id, yt_tl, selected_ref, yt_mp4, qa_report=yt_qa)
+        sim_path = refs_dir / "style_similarity.json"
+        sim_path.write_text(similarity.model_dump_json(indent=2), encoding="utf-8")
+
+        short_outputs: dict[str, list[dict[str, Any]]] = {}
+        short_style = "zoomer_vlog" if params.base_style_profile in {"zoomer_vlog", "comedy"} else "short_form_viral"
+        for enabled, fmt, role in (
+            (include_shorts, TargetPlatformFormat.YOUTUBE_SHORTS, AssetRole.RENDER_SHORT),
+            (include_tiktok, TargetPlatformFormat.TIKTOK, AssetRole.RENDER_TIKTOK),
+            (include_reels, TargetPlatformFormat.INSTAGRAM_REELS, AssetRole.RENDER_REEL),
+        ):
+            if not enabled:
+                continue
+            v_tls = build_vertical_short_timelines(
+                project_id=project_id,
+                base_title=manifest.project.name,
+                analysis=analysis,
+                animation_result=anim_res,
+                platform_format=fmt,
+                max_variants=short_variants_per_platform,
+                sfx_paths=sfx_map,
+                style_name=short_style,
+                extra_overlays=extra_anims,
+            )
+            short_outputs[fmt.value] = []
+            for idx_v, vtl in enumerate(v_tls):
+                vtl = apply_style_transfer_plan_to_timeline(vtl, plan)
+                if params.sfx_click_min_spacing_sec <= 4.0:
+                    vtl, _ = add_click_sounds_to_timeline(
+                        vtl,
+                        sfx_map,
+                        style_name=short_style,
+                        min_spacing_sec=params.sfx_click_min_spacing_sec,
+                        replace_existing=True,
+                        bump_revision=False,
+                    )
+                    for ae in vtl.audio_events:
+                        if ae.role == "sfx":
+                            ae.gain_db = round(max(-24.0, min(-5.0, params.sfx_gain_db)), 1)
+                v_json = ws_dir / "timelines" / f"{vtl.timeline_id}_{fmt.value}.json"
+                v_json.write_text(vtl.model_dump_json(indent=2), encoding="utf-8")
+                v_otio = ws_dir / "timelines" / f"{vtl.timeline_id}_{fmt.value}.otio"
+                export_otio(vtl, v_otio)
+                v_mp4 = ws_dir / "shorts" / f"{manifest.project.slug}_ref_{fmt.value}_{idx_v + 1}.mp4"
+                v_rf = render_timeline(vtl, v_mp4, ws_dir)
+                if isinstance(v_rf.get("rendered_timeline"), RenderTimeline):
+                    vtl = v_rf["rendered_timeline"]
+                    v_json.write_text(vtl.model_dump_json(indent=2), encoding="utf-8")
+                v_qa = run_quality_assurance(project_id, v_mp4, vtl, ws_dir / "reports" / "qa_frames", analysis=analysis)
+                v_qa_path = ws_dir / "reports" / f"qa_{vtl.timeline_id}.json"
+                v_qa_path.write_text(v_qa.model_dump_json(indent=2), encoding="utf-8")
+                all_qa.append(v_qa)
+                short_outputs[fmt.value].append(
+                    {"timeline_id": vtl.timeline_id, "video_path": str(v_mp4), "qa": v_qa.model_dump(mode="json")}
+                )
+
+        readiness = evaluate_publish_readiness(all_qa)
+        with self.workspaces.track_run(
+            project_id,
+            "render_with_reference_style",
+            {"reference_id": selected_ref.reference_id, "target_platform": target_platform},
+        ) as (m2, run):
+            m2.project.status = readiness["recommended_status"]
+            self.workspaces.register_asset(m2, run.run_id, AssetRole.RENDER_YOUTUBE, yt_mp4)
+            self.workspaces.register_asset(m2, run.run_id, AssetRole.CAPTION_FILE, Path(yt_render_files["srt_path"]))
+            self.workspaces.register_asset(m2, run.run_id, AssetRole.QA_REPORT, yt_qa_path)
+            self.workspaces.register_asset(m2, run.run_id, AssetRole.STYLE_TRANSFER_REPORT, sim_path)
+
+        return {
+            "project_id": project_id,
+            "project_status": readiness["recommended_status"],
+            "publish_readiness": readiness,
+            "selected_reference": selected_ref.model_dump(mode="json"),
+            "style_transfer_plan": plan.model_dump(mode="json"),
+            "style_similarity": similarity.model_dump(mode="json"),
+            "youtube": {
+                "timeline": yt_tl.model_dump(mode="json"),
+                "video_path": str(yt_mp4),
+                "srt_path": yt_render_files["srt_path"],
+                "ass_path": yt_render_files["ass_path"],
+                "thumbnail_path": str(thumb_png),
+                "qa": yt_qa.model_dump(mode="json"),
+            },
+            "vertical_variants": short_outputs,
+        }
+
+    def run_multi_reference_pipeline(
+        self,
+        *,
+        project_id: str | None = None,
+        name: str | None = None,
+        source_video_path: Path | None = None,
+        reference_paths: list[Path] | None = None,
+        reference_urls: list[str] | None = None,
+        workspace_reference_paths: list[str] | None = None,
+        library_reference_ids: list[str] | None = None,
+        target_platform: str = "youtube_long",
+        selection_mode: SelectionMode | str = SelectionMode.BEST_SINGLE,
+        manual_reference_id: str | None = None,
+        adjustments: dict[str, Any] | None = None,
+        include_shorts: bool = True,
+        include_tiktok: bool = False,
+        include_reels: bool = False,
+        short_variants_per_platform: int = 1,
+        run_asr_on_refs: bool = True,
+        allow_url_network: bool = False,
+        creator_niche: str = "science_engineering",
+    ) -> dict[str, Any]:
+        """Execute end-to-end Multi-Reference ingest, analysis, Symposium comparison, selection, and rendering."""
+        if project_id is None:
+            if source_video_path is None:
+                raise ValueError("source_video_path is required when project_id is not provided.")
+            manifest = self.create_project(name=name or "Multi-Reference Project", creator_niche=creator_niche)
+            project_id = manifest.project.project_id
+            self.ingest_video(project_id, Path(source_video_path))
+        elif source_video_path is not None:
+            manifest = self.workspaces.get_manifest(project_id)
+            if not any(a.role == AssetRole.SOURCE_MEDIA for a in manifest.assets):
+                self.ingest_video(project_id, Path(source_video_path))
+
+        try:
+            self.load_analysis(project_id)
+        except FileNotFoundError:
+            self.analyze_project(project_id)
+
+        ingested: list[dict[str, Any]] = []
+        if reference_paths:
+            res_files = self.ingest_reference_files(project_id, [Path(p) for p in reference_paths])
+            ingested.extend(res_files["references"])
+        for rel in workspace_reference_paths or []:
+            res_ws = self.ingest_reference_workspace_file(project_id, rel)
+            ingested.append({**res_ws["reference"], "cache_hit": res_ws["cache_hit"]})
+        for url in reference_urls or []:
+            res_url = self.ingest_reference_url(project_id, url, allow_network=allow_url_network)
+            ingested.append({**res_url["reference"], "cache_hit": res_url["cache_hit"]})
+        for rid in library_reference_ids or []:
+            res_lib = self.import_library_reference(project_id, rid)
+            ingested.append({**res_lib["reference"], "cache_hit": True})
+
+        analysis_summary = self.analyze_project_references(project_id, run_asr=run_asr_on_refs)
+        selection = self.compare_and_select_references(
+            project_id,
+            target_platform=target_platform,
+            selection_mode=selection_mode,
+            manual_reference_id=manual_reference_id,
+            adjustments=adjustments,
+        )
+        render = self.render_with_reference_style(
+            project_id,
+            target_platform=target_platform,
+            include_shorts=include_shorts,
+            include_tiktok=include_tiktok,
+            include_reels=include_reels,
+            short_variants_per_platform=short_variants_per_platform,
+        )
+        return {
+            "project_id": project_id,
+            "ingested_references": ingested,
+            "analysis_summary": analysis_summary,
+            "selection": selection,
+            "render": render,
+        }
 
     def run_campaign_pipeline(
         self,

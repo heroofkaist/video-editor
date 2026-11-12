@@ -100,10 +100,12 @@ def analyze_visual_context(
     duration = total_frames / fps if fps > 0 else 0.0
 
     cascades = []
-    for fname in ("haarcascade_frontalface_default.xml", "haarcascade_frontalface_alt2.xml"):
-        cp = Path(cv2.data.haarcascades) / fname
-        if cp.exists():
-            cascades.append(cv2.CascadeClassifier(str(cp)))
+    cascade_cls = getattr(cv2, "CascadeClassifier", None)
+    if cascade_cls is not None:
+        for fname in ("haarcascade_frontalface_default.xml", "haarcascade_frontalface_alt2.xml"):
+            cp = Path(cv2.data.haarcascades) / fname
+            if cp.exists():
+                cascades.append(cascade_cls(str(cp)))
 
     samples: list[VisualContextSample] = []
     prev_gray: np.ndarray | None = None

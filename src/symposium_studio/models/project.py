@@ -14,6 +14,7 @@ def utc_now_iso() -> str:
 
 WORKSPACE_SUBDIRS: tuple[str, ...] = (
     "source",
+    "references",
     "transcripts",
     "research",
     "symposium",
@@ -34,6 +35,9 @@ WORKSPACE_SUBDIRS: tuple[str, ...] = (
 
 class AssetRole(str, Enum):
     SOURCE_MEDIA = "source_media"
+    REFERENCE_VIDEO = "reference_video"
+    STYLE_DNA = "style_dna"
+    STYLE_TRANSFER_REPORT = "style_transfer_report"
     TRANSCRIPT = "transcript"
     RESEARCH_REPORT = "research_report"
     SYMPOSIUM_LOG = "symposium_log"

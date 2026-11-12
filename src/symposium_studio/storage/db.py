@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from symposium_studio.models.growth import ContentExperimentRecord
 from symposium_studio.models.project import AssetRecord, ProjectRecord, RunRecord
+from symposium_studio.models.reference import ReferenceItem
 from symposium_studio.models.research import ResearchReport, ViralContentItem
 from symposium_studio.models.social import FunnelLink, GrowthMetricSnapshot
 
@@ -155,6 +156,22 @@ class StudioDatabase:
                     updated_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS reference_items (
+                    reference_id TEXT PRIMARY KEY,
+                    project_id TEXT,
+                    title TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    sha256 TEXT,
+                    platform TEXT NOT NULL,
+                    analysis_status TEXT NOT NULL,
+                    duration_sec REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_reference_sha256 ON reference_items(sha256);
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_index USING fts5(
                     entity_type,
@@ -584,6 +601,79 @@ class StudioDatabase:
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [ContentExperimentRecord.model_validate_json(r["payload_json"]) for r in rows]
+
+    def upsert_reference(self, ref: ReferenceItem) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO reference_items (
+                    reference_id, project_id, title, source_type, sha256,
+                    platform, analysis_status, duration_sec, created_at, updated_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(reference_id) DO UPDATE SET
+                    project_id = COALESCE(excluded.project_id, reference_items.project_id),
+                    title = excluded.title,
+                    sha256 = COALESCE(excluded.sha256, reference_items.sha256),
+                    platform = excluded.platform,
+                    analysis_status = excluded.analysis_status,
+                    duration_sec = excluded.duration_sec,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    ref.reference_id,
+                    ref.project_id,
+                    ref.title,
+                    ref.source_type.value,
+                    ref.sha256,
+                    ref.platform,
+                    ref.analysis_status.value,
+                    ref.duration_sec,
+                    ref.created_at,
+                    ref.updated_at,
+                    ref.model_dump_json(),
+                ),
+            )
+            dna_notes = " ".join(ref.style_dna.editorial_notes) if ref.style_dna else ""
+            body = f"{ref.platform} {ref.creator} {ref.source_type.value} {ref.analysis_status.value} {dna_notes}"
+            self._upsert_fts(conn, "reference", ref.reference_id, ref.project_id or "global", ref.title, body)
+
+    def get_reference(self, reference_id: str) -> ReferenceItem | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT payload_json FROM reference_items WHERE reference_id = ?", (reference_id,)).fetchone()
+        return ReferenceItem.model_validate_json(row["payload_json"]) if row else None
+
+    def get_reference_by_sha256(self, sha256: str) -> ReferenceItem | None:
+        if not sha256:
+            return None
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM reference_items WHERE sha256 = ? ORDER BY updated_at DESC",
+                (sha256,),
+            ).fetchall()
+        for r in rows:
+            item = ReferenceItem.model_validate_json(r["payload_json"])
+            if item.style_dna is not None:
+                return item
+        return ReferenceItem.model_validate_json(rows[0]["payload_json"]) if rows else None
+
+    def list_references(
+        self,
+        project_id: str | None = None,
+        limit: int = 200,
+    ) -> list[ReferenceItem]:
+        with self._connect() as conn:
+            if project_id:
+                rows = conn.execute(
+                    "SELECT payload_json FROM reference_items WHERE project_id = ? ORDER BY updated_at DESC LIMIT ?",
+                    (project_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT payload_json FROM reference_items ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [ReferenceItem.model_validate_json(r["payload_json"]) for r in rows]
 
     def search_all(self, query: str, limit: int = 25, project_id: str | None = None) -> list[dict[str, Any]]:
         cleaned = " ".join(tok for tok in query.strip().split() if tok)

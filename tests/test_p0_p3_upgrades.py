@@ -1248,3 +1248,428 @@ def test_multilingual_asr_repetition_loop_and_code_switch_detection() -> None:
     assert "Data Structure quiz" in audited.segments[0].text
 
 
+def test_p0_word_level_asr_alignment_beyond_energy_envelopes(tmp_path: Path) -> None:
+    """Verify align_captions_to_final_audio anchors directly to decoded ASR word timestamps rather than RMS alone."""
+    wav_path = tmp_path / "speech_final.wav"
+    sr = 16000
+    dur_sec = 5.0
+    n_samples = int(sr * dur_sec)
+    t = np.linspace(0.0, dur_sec, n_samples, endpoint=False)
+    sig = 0.002 * np.sin(2.0 * np.pi * 180.0 * t)
+    # Create steady uniform modulation from 0.4s to 4.2s so RMS envelopes alone cannot tell words apart
+    m = (t >= 0.4) & (t <= 4.2)
+    sig[m] = 0.35 * np.sin(2.0 * np.pi * 240.0 * t[m])
+    pcm = (np.clip(sig, -0.95, 0.95) * 32767.0).astype(np.int16)
+    import wave
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+
+    clip = VideoClipNode(
+        clip_id="clip_0",
+        source_path="dummy.mp4",
+        source_start_sec=10.0,
+        source_end_sec=15.0,
+        timeline_start_sec=0.0,
+        timeline_end_sec=5.0,
+    )
+    tl = RenderTimeline(
+        timeline_id="tl_asr_sync",
+        project_id="proj_asr_sync",
+        title="ASR Word Sync Test",
+        clips=[clip],
+        segment_mappings=[
+            SegmentTimelineMapping(
+                mapping_id="m0",
+                source_segment_id="seg_0",
+                clip_id="clip_0",
+                source_start_sec=10.3,
+                source_end_sec=14.0,
+                timeline_start_sec=0.3,
+                timeline_end_sec=4.0,
+                language="kk",
+                text_excerpt="Бірінші тест нормально",
+                cue_ids=["cue_0", "cue_1"],
+            )
+        ],
+        captions=[
+            CaptionCue(
+                cue_id="cue_0",
+                clip_id="clip_0",
+                source_segment_id="seg_0",
+                source_start_sec=10.3,
+                source_end_sec=11.8,
+                start_sec=0.3,
+                end_sec=1.8,
+                text="Бірінші тест",
+                words=[
+                    {"word": "Бірінші", "start_sec": 0.3, "end_sec": 1.0, "probability": 0.9},
+                    {"word": "тест", "start_sec": 1.0, "end_sec": 1.8, "probability": 0.9},
+                ],
+            ),
+            CaptionCue(
+                cue_id="cue_1",
+                clip_id="clip_0",
+                source_segment_id="seg_0",
+                source_start_sec=12.0,
+                source_end_sec=13.5,
+                start_sec=2.0,
+                end_sec=3.5,
+                text="нормально",
+                words=[
+                    {"word": "нормально", "start_sec": 2.0, "end_sec": 3.5, "probability": 0.9},
+                ],
+            ),
+        ],
+    )
+
+    # Actual final audio pronounced "Бірінші" at 1.45-2.05, skipped/merged a middle token slightly, "нормально" at 3.25-3.95!
+    asr_words = [
+        {"word": "Бірінші", "start_sec": 1.45, "end_sec": 2.05, "probability": 0.94},
+        {"word": "test", "start_sec": 2.20, "end_sec": 2.65, "probability": 0.91},  # cross-script match for тест!
+        {"word": "нормально", "start_sec": 3.25, "end_sec": 3.95, "probability": 0.96},
+    ]
+
+    aligned = align_captions_to_final_audio(tl, wav_path, final_asr_words=asr_words, use_asr_alignment=False)
+    c0, c1 = aligned.captions[0], aligned.captions[1]
+    assert c0.aligned_to_final_audio is True
+    assert abs(c0.words[0]["start_sec"] - 1.45) <= 0.02
+    assert abs(c0.words[1]["start_sec"] - 2.20) <= 0.02
+    assert abs(c1.words[0]["start_sec"] - 3.25) <= 0.02
+    assert c0.source_start_sec == 10.3  # source timestamp stays untouched!
+    assert c0.words[0]["alignment_source"] == "asr_word_match"
+
+    integrity_ok = validate_subtitle_integrity(aligned, final_audio_wav=wav_path, final_asr_words=asr_words)
+    assert integrity_ok["passed"] is True
+    assert integrity_ok["asr_matched_word_count"] == 3
+    assert integrity_ok["mean_word_onset_drift_sec"] is not None
+    assert integrity_ok["mean_word_onset_drift_sec"] <= 0.05
+
+    # Sabotage a matched word timestamp to verify ASR_WORD_DRIFT_EXCEEDED catches sync drift
+    bad = aligned.model_copy(deep=True)
+    bad.captions[1].words[0]["start_sec"] = 2.55
+    bad.captions[1].words[0]["end_sec"] = 2.95
+    integrity_bad = validate_subtitle_integrity(bad, final_audio_wav=wav_path, final_asr_words=asr_words)
+    assert any(m["code"] == "ASR_WORD_DRIFT_EXCEEDED" for m in integrity_bad["misaligned"])
+
+
+def test_p0_multilingual_asr_verification_parity_mlx_and_faster_whisper(tmp_path: Path) -> None:
+    """Ensure mlx-whisper and faster-whisper execute identical chunked kk/ru/en alternate verification as whisper.cpp."""
+    from types import SimpleNamespace
+    from symposium_studio.engines.analysis.transcribe import (
+        _transcribe_with_faster_whisper,
+        _transcribe_with_mlx_whisper,
+    )
+
+    wav_path = tmp_path / "multilingual_32s.wav"
+    sr = 16000
+    dur = 32.0
+    t = np.linspace(0.0, dur, int(sr * dur), endpoint=False)
+    # Speech bursts separated by pauses around 16s so _plan_wav_chunks yields >=2 chunks
+    sig = np.zeros_like(t)
+    sig[(t >= 1.0) & (t <= 14.0)] = 0.25 * np.sin(2.0 * np.pi * 220.0 * t[(t >= 1.0) & (t <= 14.0)])
+    sig[(t >= 17.0) & (t <= 30.0)] = 0.25 * np.sin(2.0 * np.pi * 260.0 * t[(t >= 17.0) & (t <= 30.0)])
+    import wave
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes((np.clip(sig, -0.95, 0.95) * 32767.0).astype(np.int16).tobytes())
+
+    class FakeMLX:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def transcribe(self, path: str, **kwargs: Any) -> dict[str, Any]:
+            lang = kwargs.get("language")
+            self.calls.append((Path(path).name, lang))
+            if "000" in Path(path).name:
+                return {
+                    "language": "kk",
+                    "segments": [
+                        {"start": 0.5, "end": 4.0, "text": "Бірінші курс өте қызық", "avg_logprob": -0.25, "no_speech_prob": 0.02}
+                    ],
+                }
+            if lang is None or lang == "ko":
+                # Outlier Korean misfire + repetition hallucination loop
+                return {
+                    "language": "ko",
+                    "segments": [
+                        {"start": 0.4, "end": 5.0, "text": "가나다 가나다 가나다 가나다", "avg_logprob": -1.25, "no_speech_prob": 0.35}
+                    ],
+                }
+            if lang == "en":
+                return {
+                    "language": "en",
+                    "segments": [
+                        {"start": 0.4, "end": 5.0, "text": "Data Structure quiz tomorrow", "avg_logprob": -0.18, "no_speech_prob": 0.02}
+                    ],
+                }
+            return {
+                "language": lang,
+                "segments": [
+                    {"start": 0.4, "end": 5.0, "text": "непонятно что", "avg_logprob": -0.85, "no_speech_prob": 0.20}
+                ],
+            }
+
+    fake_mlx = FakeMLX()
+    res_mlx = _transcribe_with_mlx_whisper(wav_path, dur, "mlx-community/whisper-small-mlx", language=None, mlx_module=fake_mlx)
+    assert {"kk", "en"}.issubset(set(res_mlx.languages_observed))
+    assert any(s.verification_status == "alternate_hypothesis_selected" and "Data Structure" in s.text for s in res_mlx.segments)
+    assert any(s.candidate_alternatives for s in res_mlx.segments)
+
+    class FakeFWModel:
+        def transcribe(self, path: str, language: str | None = None, word_timestamps: bool = True) -> tuple[list[Any], Any]:
+            if "000" in Path(path).name:
+                segs = [SimpleNamespace(start=0.5, end=4.0, text="Бүгін лаборатория бар", avg_logprob=-0.22, no_speech_prob=0.03, words=[])]
+                return segs, SimpleNamespace(language="kk", language_probability=0.92)
+            if language is None:
+                segs = [SimpleNamespace(start=0.4, end=5.0, text="тест тест тест тест тест", avg_logprob=-1.35, no_speech_prob=0.3, words=[])]
+                return segs, SimpleNamespace(language="tr", language_probability=0.41)
+            if language == "ru":
+                segs = [SimpleNamespace(start=0.4, end=5.0, text="И сейчас проверим генератор", avg_logprob=-0.16, no_speech_prob=0.02, words=[])]
+                return segs, SimpleNamespace(language="ru", language_probability=0.96)
+            segs = [SimpleNamespace(start=0.4, end=5.0, text="stub", avg_logprob=-0.95, no_speech_prob=0.35, words=[])]
+            return segs, SimpleNamespace(language=language, language_probability=0.55)
+
+    res_fw = _transcribe_with_faster_whisper(wav_path, dur, "small", language=None, whisper_model=FakeFWModel())
+    assert {"kk", "ru"}.issubset(set(res_fw.languages_observed))
+    assert any(s.verification_status == "alternate_hypothesis_selected" and "проверим генератор" in s.text for s in res_fw.segments)
+
+
+def test_p0_qa_gate_blocks_ready_for_publish_and_approved_publish(tmp_path: Path) -> None:
+    """Critical QA or subtitle integrity errors must set requires_review and block approved_publish / API publish."""
+    import pytest
+    from fastapi.testclient import TestClient
+    from symposium_studio.api.app import create_app
+    from symposium_studio.config import StudioConfig
+    from symposium_studio.engines.distribution import execute_publish
+    from symposium_studio.engines.production import evaluate_publish_readiness
+    from symposium_studio.models.social import PublishingMode, PublishRequest, QualityAssuranceReport, QualityCheckIssue
+    from symposium_studio.studio import SymposiumStudio
+
+    cfg = StudioConfig(repo_root=tmp_path, workspaces_root=tmp_path / "ws", db_path=tmp_path / "ws" / "s.db")
+    studio = SymposiumStudio(cfg)
+    manifest = studio.create_project("QA Gate Project")
+    pid = manifest.project.project_id
+    studio.ingest_video(pid, _make_pulsed_speech_video(tmp_path / "src.mp4", duration_sec=6.0, speech_windows=[(0.5, 5.2)]))
+    manifest = studio.workspaces.get_manifest(pid)
+    ws_dir = Path(manifest.project.workspace_dir)
+
+    bad_qa = QualityAssuranceReport(
+        qa_id="qa_fail",
+        project_id=pid,
+        artifact_path=str(ws_dir / "renders" / "out.mp4"),
+        passed=False,
+        width=1920,
+        height=1080,
+        fps=30.0,
+        duration_sec=5.0,
+        has_video=True,
+        has_audio=True,
+        issues=[
+            QualityCheckIssue(
+                severity="error",
+                code="SUBTITLE_INTEGRITY_ERROR",
+                message="Subtitle integrity (misaligned): UNADJUSTED_SOURCE_TIMESTAMP_REUSE",
+            )
+        ],
+    )
+    (ws_dir / "reports").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "reports" / "qa_tl_bad.json").write_text(bad_qa.model_dump_json(indent=2), encoding="utf-8")
+
+    # Simulate non-passing status after failed QA
+    m = studio.workspaces.get_manifest(pid)
+    readiness = studio.get_publish_readiness(pid)
+    assert readiness["ready_for_publish"] is False
+    assert readiness["recommended_status"] == "requires_review"
+    m.project.status = readiness["recommended_status"]
+    studio.workspaces.save_manifest(m)
+
+    with pytest.raises(PermissionError, match="QA gate"):
+        execute_publish(
+            PublishRequest(
+                project_id=pid,
+                platform="telegram",
+                mode=PublishingMode.APPROVED_PUBLISH,
+                approval_confirmed=True,
+                approval_reason="Verified by editor",
+                artifact_path=str(ws_dir / "renders" / "out.mp4"),
+                metadata={"text": "test", "chat_id": "@test"},
+            ),
+            ws_dir,
+        )
+
+    app = create_app(cfg)
+    client = TestClient(app)
+    r_gate = client.get(f"/api/projects/{pid}/publish-readiness")
+    assert r_gate.status_code == 200
+    assert r_gate.json()["ready_for_publish"] is False
+
+    r_pub = client.post(
+        f"/api/projects/{pid}/publish",
+        json={
+            "project_id": pid,
+            "platform": "telegram",
+            "mode": "approved_publish",
+            "approval_confirmed": True,
+            "approval_reason": "Try bypass",
+            "artifact_path": str(ws_dir / "renders" / "out.mp4"),
+            "metadata": {"text": "post"},
+        },
+    )
+    assert r_pub.status_code == 409
+
+    good_readiness = evaluate_publish_readiness(
+        [
+            QualityAssuranceReport(
+                qa_id="qa_ok",
+                project_id=pid,
+                artifact_path=str(ws_dir / "renders" / "out.mp4"),
+                passed=True,
+                width=1920,
+                height=1080,
+                fps=30.0,
+                duration_sec=5.0,
+                has_video=True,
+                has_audio=True,
+            )
+        ]
+    )
+    assert good_readiness["ready_for_publish"] is True
+    assert good_readiness["recommended_status"] == "ready_for_publish"
+
+
+def test_p0_monotonic_words_and_pause_localized_asr_alignment(tmp_path: Path) -> None:
+    """Reproduce real-audio failure class: pause-smeared ASR tokens, far short-word distractors, and short-cue monotonic word clamping."""
+    import wave
+
+    wav_path = tmp_path / "paused_speech.wav"
+    sr = 16000
+    dur_sec = 14.0
+    t = np.linspace(0.0, dur_sec, int(sr * dur_sec), endpoint=False)
+    sig = 0.0015 * np.sin(2.0 * np.pi * 140.0 * t)
+    # Two clear speech windows separated by a 4.0s pause [2.8, 6.8], plus burst at [9.5, 11.8]
+    for s0, e0 in ((0.4, 2.8), (6.8, 8.6), (9.5, 11.8)):
+        m = (t >= s0) & (t <= e0)
+        sig[m] = 0.30 * np.sin(2.0 * np.pi * 230.0 * t[m])
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes((np.clip(sig, -0.95, 0.95) * 32767.0).astype(np.int16).tobytes())
+
+    clip = VideoClipNode(
+        clip_id="clip_00",
+        source_path="dummy.mp4",
+        source_start_sec=0.5,
+        source_end_sec=14.5,
+        timeline_start_sec=0.0,
+        timeline_end_sec=14.0,
+    )
+    tl = RenderTimeline(
+        timeline_id="tl_mono",
+        project_id="proj_mono",
+        title="Monotonic Pause Guard",
+        clips=[clip],
+        segment_mappings=[
+            SegmentTimelineMapping(
+                mapping_id="m0",
+                source_segment_id="seg_0",
+                clip_id="clip_00",
+                source_start_sec=0.9,
+                source_end_sec=12.3,
+                timeline_start_sec=0.4,
+                timeline_end_sec=11.8,
+                language="en",
+                text_excerpt="First burst words then second burst is fine",
+                cue_ids=["c0", "c1", "c2", "c3"],
+            )
+        ],
+        captions=[
+            CaptionCue(
+                cue_id="c0",
+                clip_id="clip_00",
+                source_segment_id="seg_0",
+                source_start_sec=0.9,
+                source_end_sec=1.5,
+                start_sec=0.4,
+                end_sec=1.0,
+                text="First burst",
+                words=[
+                    {"word": "First", "start_sec": 0.4, "end_sec": 0.7},
+                    {"word": "burst", "start_sec": 0.7, "end_sec": 1.0},
+                ],
+            ),
+            CaptionCue(
+                cue_id="c1",
+                clip_id="clip_00",
+                source_segment_id="seg_0",
+                source_start_sec=1.55,
+                source_end_sec=2.15,
+                start_sec=1.05,
+                end_sec=1.65,
+                text="words then",
+                words=[
+                    {"word": "words", "start_sec": 1.05, "end_sec": 1.35},
+                    {"word": "then", "start_sec": 1.35, "end_sec": 1.65},
+                ],
+            ),
+            CaptionCue(
+                cue_id="c2",
+                clip_id="clip_00",
+                source_segment_id="seg_0",
+                source_start_sec=7.3,
+                source_end_sec=8.9,
+                start_sec=6.8,
+                end_sec=8.4,
+                text="second burst",
+                words=[
+                    {"word": "second", "start_sec": 6.8, "end_sec": 7.6},
+                    {"word": "burst", "start_sec": 7.6, "end_sec": 8.4},
+                ],
+            ),
+            CaptionCue(
+                cue_id="c3",
+                clip_id="clip_00",
+                source_segment_id="seg_0",
+                source_start_sec=10.0,
+                source_end_sec=12.1,
+                start_sec=9.5,
+                end_sec=11.6,
+                text="is fine",
+                words=[
+                    {"word": "is", "start_sec": 9.5, "end_sec": 10.2},
+                    {"word": "fine", "start_sec": 10.2, "end_sec": 11.6},
+                ],
+            ),
+        ],
+    )
+
+    # Inject noisy Whisper-like artifacts: smeared token across silence (0.05..6.2), and early false 2-letter distractor "is" at 2.3s!
+    noisy_asr_words = [
+        {"word": "First", "start_sec": 0.42, "end_sec": 0.85, "probability": 0.91},
+        {"word": "is", "start_sec": 2.25, "end_sec": 2.35, "probability": 0.55},  # 2-char distractor right after c1
+        {"word": "burst", "start_sec": 7.55, "end_sec": 8.35, "probability": 0.93},
+        {"word": "fine", "start_sec": 10.25, "end_sec": 11.55, "probability": 0.96},
+    ]
+    aligned = align_captions_to_final_audio(tl, wav_path, final_asr_words=noisy_asr_words, use_asr_alignment=False)
+    rep = validate_subtitle_integrity(aligned, final_audio_wav=wav_path, final_asr_words=noisy_asr_words)
+    assert rep["passed"] is True, rep
+    assert rep["out_of_order"] == []
+    assert rep["misaligned"] == []
+    # c1 ("words then") must stay inside the first speech island [0.4, 2.8] and NOT get dragged past 6.8s!
+    assert aligned.captions[1].end_sec <= 3.1
+    # Every word inside every cue must be strictly monotonic
+    for cue in aligned.captions:
+        prev_we = cue.start_sec - 0.001
+        for w in cue.words:
+            assert w["start_sec"] >= prev_we
+            assert w["end_sec"] > w["start_sec"]
+            prev_we = w["end_sec"]
+
+

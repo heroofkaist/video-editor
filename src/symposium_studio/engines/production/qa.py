@@ -166,6 +166,17 @@ def run_quality_assurance(
                     message=str(c_issue),
                 )
             )
+    pre_integrity = timeline.subtitle_integrity or {}
+    if pre_integrity and pre_integrity.get("passed") is False:
+        for cat in ("missing", "duplicated", "out_of_order", "misaligned"):
+            for item in (pre_integrity.get(cat) or [])[:3]:
+                issues.append(
+                    QualityCheckIssue(
+                        severity="error",
+                        code="SUBTITLE_INTEGRITY_ERROR",
+                        message=f"Render-stage subtitle integrity ({cat}): {item.get('code')} @ {item.get('time_sec', item.get('clip_id', ''))}",
+                    )
+                )
 
     editorial_checks: dict[str, Any] = {}
     # 1. Opening hook clean-start verification
@@ -314,3 +325,75 @@ def run_quality_assurance(
         verification_frame_paths=frame_paths,
         issues=issues,
     )
+
+
+def evaluate_publish_readiness(
+    qa_reports: list[QualityAssuranceReport] | list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Evaluate strict publication gate: critical QA/subtitle integrity errors block ready_for_publish."""
+    critical_errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    checked_artifacts: list[dict[str, Any]] = []
+
+    for raw in qa_reports:
+        rep = raw if isinstance(raw, QualityAssuranceReport) else QualityAssuranceReport.model_validate(raw)
+        artifact_errors: list[dict[str, Any]] = []
+        for iss in rep.issues:
+            entry = {
+                "artifact_path": rep.artifact_path,
+                "code": iss.code,
+                "severity": iss.severity,
+                "message": iss.message,
+                "timestamp_sec": iss.timestamp_sec,
+            }
+            if iss.severity == "error":
+                artifact_errors.append(entry)
+                critical_errors.append(entry)
+            elif iss.severity == "warning":
+                warnings.append(entry)
+
+        integrity = (rep.caption_quality or {}).get("integrity") or {}
+        if integrity and integrity.get("passed") is False and not artifact_errors:
+            entry = {
+                "artifact_path": rep.artifact_path,
+                "code": "SUBTITLE_INTEGRITY_FAILED",
+                "severity": "error",
+                "message": f"Subtitle integrity reported {integrity.get('error_count', 1)} error(s).",
+            }
+            artifact_errors.append(entry)
+            critical_errors.append(entry)
+
+        if not rep.passed and not artifact_errors:
+            entry = {
+                "artifact_path": rep.artifact_path,
+                "code": "QA_FAILED",
+                "severity": "error",
+                "message": f"QA failed for {Path(rep.artifact_path).name}.",
+            }
+            artifact_errors.append(entry)
+            critical_errors.append(entry)
+
+        checked_artifacts.append(
+            {
+                "artifact_path": rep.artifact_path,
+                "passed": bool(rep.passed) and len(artifact_errors) == 0,
+                "error_count": len(artifact_errors),
+            }
+        )
+
+    ready = bool(checked_artifacts) and len(critical_errors) == 0 and all(a["passed"] for a in checked_artifacts)
+    blocking_reasons = [f"{e['code']}: {e['message']}" for e in critical_errors[:10]]
+    if not checked_artifacts:
+        blocking_reasons = ["No QA reports found for rendered deliverables."]
+
+    return {
+        "ready_for_publish": ready,
+        "recommended_status": "ready_for_publish" if ready else "requires_review",
+        "total_reports": len(checked_artifacts),
+        "passed_reports": sum(1 for a in checked_artifacts if a["passed"]),
+        "failed_reports": sum(1 for a in checked_artifacts if not a["passed"]),
+        "critical_errors": critical_errors,
+        "warning_count": len(warnings),
+        "blocking_reasons": blocking_reasons,
+        "artifacts": checked_artifacts,
+    }

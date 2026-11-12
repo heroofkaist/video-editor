@@ -15,7 +15,7 @@ from symposium_studio.engines.production.directors import (
     select_closing_payoff,
     snap_ending_boundary,
 )
-from symposium_studio.engines.production.qa import run_quality_assurance
+from symposium_studio.engines.production.qa import evaluate_publish_readiness, run_quality_assurance
 from symposium_studio.engines.production.renderer import ensure_project_sfx, render_thumbnail, render_timeline
 from symposium_studio.engines.production.timeline_builder import (
     add_click_sounds_to_timeline,
@@ -37,6 +37,7 @@ __all__ = [
     "ensure_project_sfx",
     "evaluate_ending_closure",
     "evaluate_hook_candidates",
+    "evaluate_publish_readiness",
     "export_otio",
     "plan_coherent_beat_sequence",
     "remap_edited_timeline",

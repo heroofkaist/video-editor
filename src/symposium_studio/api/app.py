@@ -18,6 +18,7 @@ from symposium_studio.engines.distribution import execute_publish
 from symposium_studio.engines.effects import search_effects, search_internet_clicks
 from symposium_studio.engines.research import import_explicit_item, infer_platform_from_url
 from symposium_studio.engines.symposium import AGENT_ROSTER
+from symposium_studio.models.reference import SelectionMode
 from symposium_studio.models.research import ContentCategory, ResearchPlatform
 from symposium_studio.models.social import PublishingMode, PublishRequest
 from symposium_studio.models.symposium import ResearchMode
@@ -132,6 +133,61 @@ class InspectUrlRequest(BaseModel):
 
 class StyleCloneRequest(BaseModel):
     reference_video_path: str
+    target_platform: str = "youtube_long"
+
+
+class ReferenceAddRequest(BaseModel):
+    file_paths: list[str] = Field(default_factory=list)
+    workspace_paths: list[str] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
+    library_reference_ids: list[str] = Field(default_factory=list)
+    platform: str = "local"
+    creator: str = ""
+    allow_network: bool = False
+
+
+class ReferenceAnalyzeRequest(BaseModel):
+    reference_ids: list[str] | None = None
+    run_asr: bool = True
+    force: bool = False
+
+
+class ReferenceCompareRequest(BaseModel):
+    target_platform: str = "youtube_long"
+    selection_mode: SelectionMode = SelectionMode.BEST_SINGLE
+    manual_reference_id: str | None = None
+    adjustments: dict[str, Any] | None = None
+
+
+class ReferenceAdjustRequest(BaseModel):
+    adjustments: dict[str, Any] = Field(default_factory=dict)
+    target_platform: str | None = None
+
+
+class ReferenceRenderRequest(BaseModel):
+    target_platform: str = "youtube_long"
+    adjustments: dict[str, Any] | None = None
+    include_shorts: bool = True
+    include_tiktok: bool = False
+    include_reels: bool = False
+    short_variants_per_platform: int = 1
+
+
+class ReferencePipelineRequest(BaseModel):
+    reference_paths: list[str] = Field(default_factory=list)
+    workspace_reference_paths: list[str] = Field(default_factory=list)
+    reference_urls: list[str] = Field(default_factory=list)
+    library_reference_ids: list[str] = Field(default_factory=list)
+    target_platform: str = "youtube_long"
+    selection_mode: SelectionMode = SelectionMode.BEST_SINGLE
+    manual_reference_id: str | None = None
+    adjustments: dict[str, Any] | None = None
+    include_shorts: bool = True
+    include_tiktok: bool = False
+    include_reels: bool = False
+    short_variants_per_platform: int = 1
+    run_asr_on_refs: bool = True
+    allow_url_network: bool = False
 
 
 class TelegramSyncRequest(BaseModel):
@@ -285,7 +341,181 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
         if not ref.exists():
             raise HTTPException(status_code=404, detail=f"Reference video not found: {ref}")
         try:
-            return studio.apply_reference_style(project_id, ref)
+            return studio.apply_single_reference_with_dna(project_id, ref, target_platform=req.target_platform)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    # --- Multi-Reference Video Intelligence & Style Transfer ---
+    @app.get("/api/references")
+    def list_library_references(limit: int = Query(default=100, le=200)) -> list[dict[str, Any]]:
+        return [r.model_dump(mode="json") for r in studio.list_library_references(limit=limit)]
+
+    @app.get("/api/references/{reference_id}/contact-sheet")
+    def serve_reference_contact_sheet(reference_id: str) -> FileResponse:
+        item = studio.db.get_reference(reference_id)
+        if not item or not item.contact_sheet_path:
+            raise HTTPException(status_code=404, detail="Reference contact sheet not found.")
+        cs = Path(item.contact_sheet_path).resolve()
+        ws_root = cfg.workspaces_root.resolve()
+        if not str(cs).startswith(str(ws_root)) or not cs.is_file():
+            raise HTTPException(status_code=404, detail="Contact sheet file missing.")
+        return FileResponse(path=cs)
+
+    @app.get("/api/projects/{project_id}/references")
+    def get_project_references(project_id: str) -> dict[str, Any]:
+        try:
+            return studio.get_reference_state(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/projects/{project_id}/references/upload")
+    async def upload_project_references(project_id: str, files: list[UploadFile] = File(...)) -> dict[str, Any]:
+        if not files:
+            raise HTTPException(status_code=400, detail="At least one reference video file must be uploaded.")
+        with tempfile.TemporaryDirectory() as td:
+            paths: list[Path] = []
+            titles: list[str] = []
+            for idx, uf in enumerate(files):
+                safe_name = Path(uf.filename or f"reference_{idx + 1}.mp4").name
+                dest = Path(td) / f"{idx:02d}_{safe_name}"
+                with dest.open("wb") as out_f:
+                    shutil.copyfileobj(uf.file, out_f)
+                paths.append(dest)
+                titles.append(Path(safe_name).stem)
+            try:
+                return studio.ingest_reference_files(project_id, paths, titles=titles)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc))
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/projects/{project_id}/references/add")
+    def add_project_references(project_id: str, req: ReferenceAddRequest) -> dict[str, Any]:
+        if not (req.file_paths or req.workspace_paths or req.urls or req.library_reference_ids):
+            raise HTTPException(status_code=400, detail="Provide file_paths, workspace_paths, urls, or library_reference_ids.")
+        added: list[dict[str, Any]] = []
+        cache_hits = 0
+        try:
+            if req.file_paths:
+                res_f = studio.ingest_reference_files(
+                    project_id,
+                    [Path(p) for p in req.file_paths],
+                    platform=req.platform,
+                    creator=req.creator,
+                )
+                added.extend(res_f["references"])
+                cache_hits += int(res_f["cache_hits"])
+            for rel in req.workspace_paths:
+                res_ws = studio.ingest_reference_workspace_file(project_id, rel)
+                if res_ws["cache_hit"]:
+                    cache_hits += 1
+                added.append({**res_ws["reference"], "cache_hit": res_ws["cache_hit"]})
+            for url in req.urls:
+                res_u = studio.ingest_reference_url(
+                    project_id,
+                    url,
+                    creator=req.creator,
+                    allow_network=req.allow_network,
+                )
+                if res_u["cache_hit"]:
+                    cache_hits += 1
+                added.append({**res_u["reference"], "cache_hit": res_u["cache_hit"]})
+            for rid in req.library_reference_ids:
+                res_l = studio.import_library_reference(project_id, rid)
+                cache_hits += 1
+                added.append({**res_l["reference"], "cache_hit": True})
+            return {"project_id": project_id, "ingested_count": len(added), "cache_hits": cache_hits, "references": added}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/projects/{project_id}/references/analyze")
+    def analyze_project_references(project_id: str, req: ReferenceAnalyzeRequest = ReferenceAnalyzeRequest()) -> dict[str, Any]:
+        try:
+            return studio.analyze_project_references(
+                project_id,
+                reference_ids=req.reference_ids,
+                run_asr=req.run_asr,
+                force=req.force,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/projects/{project_id}/references/compare")
+    def compare_project_references(project_id: str, req: ReferenceCompareRequest = ReferenceCompareRequest()) -> dict[str, Any]:
+        try:
+            return studio.compare_and_select_references(
+                project_id,
+                target_platform=req.target_platform,
+                selection_mode=req.selection_mode,
+                manual_reference_id=req.manual_reference_id,
+                adjustments=req.adjustments,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/projects/{project_id}/references/adjust")
+    def adjust_project_reference_plan(project_id: str, req: ReferenceAdjustRequest) -> dict[str, Any]:
+        try:
+            return studio.adjust_style_transfer_plan(
+                project_id,
+                adjustments=req.adjustments,
+                target_platform=req.target_platform,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/projects/{project_id}/references/render")
+    def render_project_with_reference_style(
+        project_id: str,
+        req: ReferenceRenderRequest = ReferenceRenderRequest(),
+    ) -> dict[str, Any]:
+        try:
+            return studio.render_with_reference_style(
+                project_id,
+                target_platform=req.target_platform,
+                adjustments=req.adjustments,
+                include_shorts=req.include_shorts,
+                include_tiktok=req.include_tiktok,
+                include_reels=req.include_reels,
+                short_variants_per_platform=req.short_variants_per_platform,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/projects/{project_id}/references/pipeline")
+    def run_project_reference_pipeline(project_id: str, req: ReferencePipelineRequest) -> dict[str, Any]:
+        try:
+            return studio.run_multi_reference_pipeline(
+                project_id=project_id,
+                reference_paths=[Path(p) for p in req.reference_paths] if req.reference_paths else None,
+                workspace_reference_paths=req.workspace_reference_paths or None,
+                reference_urls=req.reference_urls or None,
+                library_reference_ids=req.library_reference_ids or None,
+                target_platform=req.target_platform,
+                selection_mode=req.selection_mode,
+                manual_reference_id=req.manual_reference_id,
+                adjustments=req.adjustments,
+                include_shorts=req.include_shorts,
+                include_tiktok=req.include_tiktok,
+                include_reels=req.include_reels,
+                short_variants_per_platform=req.short_variants_per_platform,
+                run_asr_on_refs=req.run_asr_on_refs,
+                allow_url_network=req.allow_url_network,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -387,9 +617,22 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             project_id, telegram_channel=req.telegram_channel, threads_max_chars=req.threads_max_chars
         ).model_dump(mode="json")
 
+    @app.get("/api/projects/{project_id}/publish-readiness")
+    def publish_readiness(project_id: str) -> dict[str, Any]:
+        return studio.get_publish_readiness(project_id)
+
     @app.post("/api/projects/{project_id}/publish")
     def publish(project_id: str, req: PublishRequest) -> dict[str, Any]:
         manifest = studio.workspaces.get_manifest(project_id)
+        readiness = studio.get_publish_readiness(project_id)
+        if req.mode == PublishingMode.APPROVED_PUBLISH and (
+            manifest.project.status != "ready_for_publish" or not readiness["ready_for_publish"]
+        ):
+            reasons = "; ".join(readiness.get("blocking_reasons") or ["Critical QA checks have not passed."])
+            raise HTTPException(
+                status_code=409,
+                detail=f"Publication blocked: project status is '{manifest.project.status}'. {reasons}",
+            )
         try:
             return execute_publish(req, Path(manifest.project.workspace_dir))
         except PermissionError as exc:
