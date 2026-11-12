@@ -50,6 +50,27 @@ DEFAULT_CLICK_SOUNDS: dict[str, dict[str, str]] = {
         "search_query": "switch click",
         "description": "Clean toggle switch click for card dismissals and cuts",
     },
+    "camera_shutter": {
+        "title": "Holga Shutter Click",
+        "url": "https://upload.wikimedia.org/wikipedia/commons/e/ec/Holga_shuttersound.ogg",
+        "license": "Public domain",
+        "search_query": "camera shutter",
+        "description": "Crisp mechanical shutter snap for zoom punch-ins and reveals",
+    },
+    "typewriter_key": {
+        "title": "Mechanical Typewriter Key Click",
+        "url": "https://upload.wikimedia.org/wikipedia/commons/2/25/WWS_Typewriter.ogg",
+        "license": "CC BY 4.0",
+        "search_query": "typewriter key",
+        "description": "Rapid mechanical key tap for kinetic text & fast cuts",
+    },
+    "pop_click": {
+        "title": "Short Broadcast 2-Pop Click",
+        "url": "https://upload.wikimedia.org/wikipedia/commons/8/8b/2-pop_1frame_of_1khz.ogg",
+        "license": "Public domain",
+        "search_query": "pop sound",
+        "description": "Short snappy UI pop accent for meme cards and callouts",
+    },
 }
 
 
@@ -296,7 +317,20 @@ def download_click_sounds(
 
         # Graceful fallback if network unavailable or preset download failed
         if not out_wav.exists() or out_wav.stat().st_size < 1000:
-            synth_key = preset if preset in {"mouse_click", "mechanical_click", "switch_click", "ui_pop"} else "mouse_click"
+            synth_key = (
+                preset
+                if preset
+                in {
+                    "mouse_click",
+                    "mechanical_click",
+                    "switch_click",
+                    "ui_pop",
+                    "camera_shutter",
+                    "typewriter_key",
+                    "pop_click",
+                }
+                else "mouse_click"
+            )
             synthesize_sfx(synth_key, out_wav, duration_sec=0.14)
         fallback_count += 1
         click_paths[preset] = str(out_wav.resolve())

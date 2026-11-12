@@ -66,11 +66,14 @@ def synthesize_sfx(preset_id: str, out_path: Path, duration_sec: float = 0.65, s
         sig = np.sin(phase) * np.exp(-24.0 * t) * 0.5
         return _write_wav(out_path, sig, sample_rate)
 
-    if preset_id in {"mouse_click", "mechanical_click", "switch_click"}:
+    if preset_id in {"mouse_click", "mechanical_click", "switch_click", "camera_shutter", "typewriter_key", "pop_click"}:
         click_cfg = {
             "mouse_click": (0.11, 1850.0, 62.0),
             "mechanical_click": (0.13, 1320.0, 52.0),
             "switch_click": (0.12, 2350.0, 68.0),
+            "camera_shutter": (0.16, 1520.0, 44.0),
+            "typewriter_key": (0.10, 2600.0, 74.0),
+            "pop_click": (0.12, 920.0, 42.0),
         }
         dur, body_hz, decay = click_cfg[preset_id]
         dur = max(0.08, min(dur, duration_sec))

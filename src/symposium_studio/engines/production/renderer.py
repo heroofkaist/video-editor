@@ -6,8 +6,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from symposium_studio.engines.analysis.probe import probe_media
 from symposium_studio.engines.analysis.transcribe import extract_raw_mono_wav
 from symposium_studio.engines.effects.library import EFFECTS_CATALOG
 from symposium_studio.engines.effects.sfx_synth import synthesize_ambient_bed, synthesize_sfx
@@ -199,6 +200,15 @@ def render_timeline(
         # avoids per-clip AAC encoder priming delay & concat drift across multi-cut timelines).
         fps_int = max(1, int(round(timeline.fps)))
         actual_clip_durs: list[float] = []
+        src_dims: dict[str, tuple[int, int]] = {}
+        for cl in timeline.clips:
+            if cl.source_path not in src_dims and Path(cl.source_path).is_file():
+                try:
+                    info = probe_media(Path(cl.source_path))
+                    src_dims[cl.source_path] = (info.width, info.height)
+                except Exception:
+                    src_dims[cl.source_path] = (0, 0)
+
         for idx, clip in enumerate(timeline.clips):
             clip_out = tmp / f"seg_{idx:03d}.mkv"
             dur = max(0.25, clip.source_end_sec - clip.source_start_sec)
@@ -218,33 +228,65 @@ def render_timeline(
             out_frames = target_frames
 
             push_fx = next((fx for fx in clip.effects if fx.preset_id == "smooth_push_in"), None)
+            sw, sh = src_dims.get(clip.source_path, (0, 0))
+            src_portrait = sw > 0 and sh > 0 and sh > sw * 1.15
 
-            if is_vertical:
-                base_crop = (
-                    f"crop=min(iw\\,ih*9/16):ih:"
-                    f"max(0\\,min(iw-min(iw\\,ih*9/16)\\,iw*{clip.crop_center_x:.4f}-min(iw\\,ih*9/16)/2)):0,"
+            if not is_vertical and src_portrait:
+                stage_w = max(
+                    int(round(h * 9 / 16)) & ~1,
+                    min(int(round(w * 0.56)) & ~1, int(round(h * sw / max(sh, 1))) & ~1),
                 )
-            else:
-                base_crop = ""
-
-            if push_fx is not None:
-                z_delta = float((push_fx.parameters or {}).get("zoom_delta", 0.06))
+                if push_fx is not None:
+                    z_delta = float((push_fx.parameters or {}).get("zoom_delta", 0.06))
+                    fg_chain = (
+                        f"[fg_src]scale={stage_w}:{h}:force_original_aspect_ratio=increase,"
+                        f"crop={stage_w}:{h}:(iw-{stage_w})/2:(ih-{h})*0.32,"
+                        f"zoompan=z='{z:.3f}+{z_delta:.3f}*min(1\\,on/{out_frames})':"
+                        f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*0.34':d=1:s={stage_w}x{h}:fps={fps_int},"
+                        f"setsar=1,drawbox=x=0:y=0:w=iw:h=ih:color=#E2E8F0@0.35:t=3,setpts=PTS-STARTPTS[fg]"
+                    )
+                else:
+                    fg_chain = (
+                        f"[fg_src]scale={int(round(stage_w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
+                        f"crop={stage_w}:{h}:(iw-{stage_w})/2:(ih-{h})*0.34,"
+                        f"setsar=1,drawbox=x=0:y=0:w=iw:h=ih:color=#E2E8F0@0.35:t=3,setpts=PTS-STARTPTS[fg]"
+                    )
                 vf = (
-                    f"{speed_vf}fps={fps_int},{base_crop}"
-                    f"scale={w}:{h}:force_original_aspect_ratio=increase,"
-                    f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.32,"
-                    f"zoompan=z='{z:.3f}+{z_delta:.3f}*min(1\\,on/{out_frames})':"
-                    f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*0.34':d=1:s={w}x{h}:fps={fps_int},"
-                    f"setsar=1,{grade_vf}{trans_vf},"
+                    f"{speed_vf}fps={fps_int},split=2[bg_src][fg_src];"
+                    f"[bg_src]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+                    f"gblur=sigma=28,eq=brightness=-0.10:saturation=0.85,setsar=1,setpts=PTS-STARTPTS[bg];"
+                    f"{fg_chain};"
+                    f"[bg][fg]overlay=(W-w)/2:(H-h)/2:eof_action=pass,"
+                    f"{grade_vf}{trans_vf},"
                     f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
                 )
             else:
-                vf = (
-                    f"{speed_vf}{base_crop}"
-                    f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
-                    f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.34,setsar=1,{grade_vf}{trans_vf},"
-                    f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
-                )
+                if is_vertical:
+                    base_crop = (
+                        f"crop=min(iw\\,ih*9/16):ih:"
+                        f"max(0\\,min(iw-min(iw\\,ih*9/16)\\,iw*{clip.crop_center_x:.4f}-min(iw\\,ih*9/16)/2)):0,"
+                    )
+                else:
+                    base_crop = ""
+
+                if push_fx is not None:
+                    z_delta = float((push_fx.parameters or {}).get("zoom_delta", 0.06))
+                    vf = (
+                        f"{speed_vf}fps={fps_int},{base_crop}"
+                        f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                        f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.32,"
+                        f"zoompan=z='{z:.3f}+{z_delta:.3f}*min(1\\,on/{out_frames})':"
+                        f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*0.34':d=1:s={w}x{h}:fps={fps_int},"
+                        f"setsar=1,{grade_vf}{trans_vf},"
+                        f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
+                    )
+                else:
+                    vf = (
+                        f"{speed_vf}{base_crop}"
+                        f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
+                        f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.34,setsar=1,{grade_vf}{trans_vf},"
+                        f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
+                    )
 
             atempo_chain = _build_atempo_chain(spd)
             afade_d = min(0.025, exact_dur * 0.12)
@@ -542,7 +584,15 @@ def render_thumbnail(
                 break
         if best_frame is None:
             raise RuntimeError(f"Failed to extract thumbnail frame from {source_video}")
-        base = Image.open(best_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
+        raw_im = Image.open(best_frame).convert("RGBA")
+        if raw_im.height > raw_im.width * 1.15:
+            bg = raw_im.resize((1280, 720), Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(24))
+            fg_w = max(320, int(round(720 * raw_im.width / max(raw_im.height, 1))))
+            fg = raw_im.resize((fg_w, 720), Image.Resampling.LANCZOS)
+            bg.paste(fg, ((1280 - fg_w) // 2, 0))
+            base = bg
+        else:
+            base = raw_im.resize((1280, 720), Image.Resampling.LANCZOS)
 
     # Dark left gradient scrim kept compact so subject & right-hand board stay crisp
     overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))

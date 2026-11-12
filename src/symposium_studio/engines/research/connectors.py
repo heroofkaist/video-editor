@@ -679,6 +679,41 @@ _MEME_TOPIC_HINTS: dict[str, tuple[str, ...]] = {
 
 _REACTION_QUERY_TABLE: list[tuple[tuple[str, ...], str, str]] = [
     (
+        ("распаков", "короб", "посыл", "unbox", "gift", "package", "box", "merch", "welcome", "откро", "порвет", "порвёт"),
+        "opening mystery box meme",
+        "Unboxing & Mystery",
+    ),
+    (
+        ("каист", "kaist", "корей", "korea", "нупцук", "нутцук", "nupzuki", "общаг", "dorm", "campus", "orientation", "ориентац"),
+        "confused translation meme",
+        "Campus / Culture Shock",
+    ),
+    (
+        ("ожидал больше", "как будто бы", "так себе", "разочар", "нету", "забыл", "увы", "disappoint"),
+        "disappointed stare meme",
+        "Underwhelmed Reality",
+    ),
+    (
+        ("жарк", "пот", "душн", "бег", "успел", "через 20 минут", "опазд", "hot", "sweat", "rush", "late"),
+        "sweating meme",
+        "Panic / Rush Moment",
+    ),
+    (
+        ("гус", "утк", "плюш", "игруш", "goose", "duck", "plush", "mascot", "маскот"),
+        "untitled goose meme",
+        "Mascot / Goose Meme",
+    ),
+    (
+        ("почему-то", "стран", "чего", "как так", "зачем", "huh", "wait what", "confused"),
+        "huh cat meme",
+        "Wait What / Huh",
+    ),
+    (
+        ("кажется", "наверное", "типа", "может", "doubt", "sus", "side eye"),
+        "side eye meme",
+        "Skeptical Side-Eye",
+    ),
+    (
         ("ожида", "реальн", "капсул", "два года", "2 года", "жыл", "expect", "future", "capsule"),
         "expectations vs reality",
         "Expectation vs Reality",
@@ -694,7 +729,7 @@ _REACTION_QUERY_TABLE: list[tuple[tuple[str, ...], str, str]] = [
         "Lock In & Grind Mode",
     ),
     (
-        ("шок", "стран", "не знаю", "офиге", "wtf", "shocked", "crazy", "unexpected", "what"),
+        ("шок", "не знаю", "офиге", "wtf", "shocked", "crazy", "unexpected", "what"),
         "shocked cat",
         "Shocked Reaction",
     ),
@@ -716,11 +751,20 @@ _REACTION_QUERY_TABLE: list[tuple[tuple[str, ...], str, str]] = [
 ]
 
 _FALLBACK_REACTION_SLUGS: list[tuple[str, str]] = [
+    ("huh cat meme", "Wait What / Huh"),
+    ("side eye meme", "Skeptical Side-Eye"),
+    ("let him cook", "Payoff Reaction"),
     ("locked in", "Lock In Reaction"),
     ("shocked cat", "Shocked Reaction"),
-    ("calculating math", "Brain Overload"),
-    ("let him cook", "Payoff Reaction"),
+    ("disappointed stare meme", "Underwhelmed Reality"),
 ]
+
+_SPAM_BANNER_SLUG_RE = re.compile(
+    r"(happy[-_]birthday|good[-_]morning|good[-_]night|anniversary|veteran|"
+    r"memorial[-_]day|congratulations|valentine|merry[-_]christmas|happy[-_]easter|"
+    r"subscribe[-_]now|thank[-_]you[-_]gif|countdown[-_]banner)",
+    re.I,
+)
 
 
 def _derive_meme_reaction_queries(query: str) -> list[tuple[str, str]]:
@@ -732,12 +776,12 @@ def _derive_meme_reaction_queries(query: str) -> list[tuple[str, str]]:
             matched.append((search_q, label))
             seen_slugs.add(search_q)
     for search_q, label in _FALLBACK_REACTION_SLUGS:
-        if len(matched) >= 4:
+        if len(matched) >= 6:
             break
         if search_q not in seen_slugs:
             matched.append((search_q, label))
             seen_slugs.add(search_q)
-    return matched[:5]
+    return matched[:7]
 
 
 def _humanize_slug(raw_slug: str) -> str:
@@ -766,7 +810,7 @@ def _fetch_tenor_reaction_items(query_pairs: list[tuple[str, str]], per_query: i
         for folder, fname in matches:
             h_prefix = folder[:11]
             prio = 2 if folder.endswith("AAAPo") else (1 if folder.endswith("AAAP1") else 0)
-            if prio == 0 or h_prefix in seen_ids:
+            if prio == 0 or h_prefix in seen_ids or _SPAM_BANNER_SLUG_RE.search(fname):
                 continue
             prev = best_by_hash.get(h_prefix)
             if prev is None or prio > prev[2]:
@@ -825,7 +869,7 @@ def _fetch_giphy_reaction_items(query_pairs: list[tuple[str, str]], per_query: i
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
     items: list[ViralContentItem] = []
     seen_ids: set[str] = set()
-    for q_text, theme_label in query_pairs[:3]:
+    for q_text, theme_label in query_pairs[:5]:
         slug_url = quote(re.sub(r"\s+", "-", q_text.strip().lower()))
         try:
             resp = httpx.get(f"https://giphy.com/search/{slug_url}", headers=headers, timeout=6.0, follow_redirects=True)
@@ -964,18 +1008,22 @@ class MemeTrendConnector(PlatformConnector):
         items: list[ViralContentItem] = []
         query_pairs = _derive_meme_reaction_queries(query)
 
-        # 1. Contextual animated reaction MP4s/GIFs (Tenor + GIPHY) + finished community memes (meme-api)
-        tenor_items = _fetch_tenor_reaction_items(query_pairs, per_query=2)
-        giphy_items = _fetch_giphy_reaction_items(query_pairs, per_query=1)
-        community_items = _fetch_meme_api_items(query, limit=max(4, limit // 2))
+        # 1. Contextual animated reaction MP4s/GIFs (Tenor + GIPHY first) + finished community memes (meme-api)
+        tenor_items = _fetch_tenor_reaction_items(query_pairs, per_query=3)
+        giphy_items = _fetch_giphy_reaction_items(query_pairs, per_query=2)
+        community_items = _fetch_meme_api_items(query, limit=max(2, limit // 4))
 
-        # Interleave so downstream download_trending_meme_assets gets a balanced mix of animations + memes
-        pools = [tenor_items, giphy_items, community_items]
-        max_len = max((len(p) for p in pools), default=0)
-        for idx in range(max_len):
-            for pool in pools:
+        # Prioritize live animated reactions first so video editors get crisp motion memes
+        anim_pools = [tenor_items, giphy_items]
+        max_anim = max((len(p) for p in anim_pools), default=0)
+        for idx in range(max_anim):
+            for pool in anim_pools:
                 if idx < len(pool) and len(items) < limit:
                     items.append(pool[idx])
+        for cm in community_items:
+            if len(items) >= limit:
+                break
+            items.append(cm)
 
         # 2. Fallback to Imgflip / official Reddit JSON when live reaction pools returned insufficient items
         if len(items) < limit:
@@ -1196,7 +1244,7 @@ def score_meme_for_beat(meme_meta: dict[str, Any], beat_text: str) -> float:
     res_bonus = 0.20 if (w >= 400 and h >= 260) else (0.10 if (w >= 280 and h >= 200) else -0.20)
     # Reject tall skinny text-heavy comics unless really high-res
     aspect_pen = -0.35 if (w > 0 and h > w * 1.45 and w < 600) else 0.0
-    video_bonus = 0.10 if meme_meta.get("media_kind") == "video" else 0.0
+    video_bonus = 0.14 if meme_meta.get("media_kind") == "video" else 0.0
     return round(max(0.0, min(1.0, rel_score + res_bonus + aspect_pen + video_bonus)), 3)
 
 

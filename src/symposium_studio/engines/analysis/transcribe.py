@@ -24,7 +24,9 @@ from symposium_studio.models.media import (
 )
 
 _PHANTOM_SUBTITLE_RE = re.compile(
-    r"(субтитры\s+(делал|создавал|предоставлены|подготовил)|добавил\s+субтитры|dimatorzok|корректор\s+а\.?\s*егорова|subtitles\s+by\b)",
+    r"(субтитры\s+(делал|создавал|предоставлены|подготовил)|добавил\s+субтитры|dimatorzok|корректор\s+а\.?\s*егорова|subtitles\s+by\b"
+    r"|(?:интригующая|динамичная|тревожная|весел[аяо]|грустная|спокойная)\s+музыка\b|музыкальная\s+заставка\b"
+    r"|продолжение\s+следует\.?|^\s*[\[(]?(?:music|applause|laughter|silence|музыка|аплодисменты|смех|тишина)[\])]?\.?\s*$)",
     flags=re.IGNORECASE | re.UNICODE,
 )
 _CYRILLIC_RE = re.compile(r"[а-яёәіңғүұқөһ]", flags=re.IGNORECASE)
@@ -607,6 +609,7 @@ def audit_and_verify_transcript(result: TranscriptResult) -> TranscriptResult:
     cleaned_count = 0
     lang_chars: dict[str, int] = {}
 
+    audited_segments = []
     for seg in result.segments:
         if seg.verification_status == "human_confirmed":
             confirmed_count += 1
@@ -615,6 +618,9 @@ def audit_and_verify_transcript(result: TranscriptResult) -> TranscriptResult:
             high_conf_count += 1
         else:
             cleaned_txt, was_cleaned = _clean_hallucinated_repeats(seg.text)
+            if was_cleaned and not cleaned_txt:
+                cleaned_count += 1
+                continue
             if was_cleaned and cleaned_txt:
                 seg.text = cleaned_txt
                 if not seg.low_confidence_reason:
@@ -674,10 +680,12 @@ def audit_and_verify_transcript(result: TranscriptResult) -> TranscriptResult:
                     if not flags:
                         high_conf_count += 1
 
+        audited_segments.append(seg)
         seg_lang = seg.language or result.detected_language or "unknown"
         if seg_lang != "unknown":
             lang_chars[seg_lang] = lang_chars.get(seg_lang, 0) + max(1, len(seg.text))
 
+    result.segments = audited_segments
     ordered_langs = [k for k, _ in sorted(lang_chars.items(), key=lambda kv: kv[1], reverse=True)]
     if not ordered_langs and result.languages_observed:
         ordered_langs = list(result.languages_observed)

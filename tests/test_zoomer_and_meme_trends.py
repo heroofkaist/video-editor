@@ -847,3 +847,174 @@ def test_tenor_animated_meme_filter_and_cutaway_blur_render(monkeypatch: Any, tm
     out_mp4 = tmp_path / "rendered_cutaway.mp4"
     render_timeline(tl, out_mp4, tmp_path)
     assert out_mp4.is_file() and out_mp4.stat().st_size > 10_000
+
+
+def test_rotated_portrait_blur_pillar_phantom_cleanup_and_expanded_clicks(tmp_path: Path) -> None:
+    """Verify rotation-aware probe, portrait-in-16:9 blur stage render, phantom cleanup, and 7 click SFX presets."""
+    from symposium_studio.engines.analysis.probe import probe_media
+    from symposium_studio.engines.analysis.transcribe import audit_and_verify_transcript
+    from symposium_studio.engines.effects.sound_downloader import DEFAULT_CLICK_SOUNDS, download_click_sounds
+    from symposium_studio.engines.production.renderer import render_timeline
+    from symposium_studio.engines.research.connectors import _derive_meme_reaction_queries
+    from symposium_studio.models.symposium import Storyboard, StoryboardBeat
+
+    # 1. Phantom stage-direction hallucination dropped cleanly by audit_and_verify_transcript
+    phantom_tr = TranscriptResult(
+        engine="whisper.cpp",
+        model="ggml-large-v3-q5_0.bin",
+        detected_language="ru",
+        language_probability=0.9,
+        duration_sec=12.0,
+        segments=[
+            TranscriptSegment(
+                segment_id="s0",
+                start_sec=0.2,
+                end_sec=3.0,
+                text="Сегодня распаковка welcome gift.",
+                language="ru",
+                confidence=0.88,
+            ),
+            TranscriptSegment(
+                segment_id="s1",
+                start_sec=4.0,
+                end_sec=9.0,
+                text="ИНТРИГУЮЩАЯ МУЗЫКА",
+                language="ru",
+                confidence=0.45,
+            ),
+        ],
+    )
+    audited = audit_and_verify_transcript(phantom_tr)
+    assert len(audited.segments) == 1
+    assert audited.segments[0].segment_id == "s0"
+    assert audited.quality_report is not None and audited.quality_report.hallucinations_cleaned >= 1
+
+    # 2. Topical meme queries cover unboxing / campus / disappointment / goose contexts
+    q_slugs = [q for q, _ in _derive_meme_reaction_queries("распаковка KAIST welcome gift гусём ожидал большего")]
+    assert "opening mystery box meme" in q_slugs
+    assert "confused translation meme" in q_slugs
+    assert "disappointed stare meme" in q_slugs
+
+    # 3. Rotation-metadata coded landscape clip probes as vertical portrait + portrait-in-16:9 blur render
+    raw_land = tmp_path / "raw_landscape.mp4"
+    rot_clip = tmp_path / "rotated_portrait.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=#2563EB:s=640x360:d=3.0:r=24",
+            "-f", "lavfi", "-i", "sine=frequency=220:duration=3.0:sample_rate=48000",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            str(raw_land),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-display_rotation:v:0", "90",
+            "-i", str(raw_land),
+            "-c", "copy",
+            str(rot_clip),
+        ],
+        check=True,
+    )
+    p_rot = probe_media(rot_clip)
+    assert p_rot.height > p_rot.width
+
+    port_src = tmp_path / "portrait_clean.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=#FACC15:s=360x640:d=6.0:r=24",
+            "-f", "lavfi", "-i", "sine=frequency=240:duration=6.0:sample_rate=48000",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            str(port_src),
+        ],
+        check=True,
+    )
+    dl = download_click_sounds(tmp_path / "fx", presets=list(DEFAULT_CLICK_SOUNDS.keys()), allow_network=False)
+    assert {"camera_shutter", "typewriter_key", "pop_click"}.issubset(set(dl["click_paths"].keys()))
+
+    bundle = MediaAnalysisBundle(
+        project_id="proj_port",
+        probe=probe_media(port_src),
+        transcript=TranscriptResult(
+            engine="whisper.cpp",
+            model="test",
+            detected_language="ru",
+            language_probability=0.9,
+            duration_sec=6.0,
+            segments=[
+                TranscriptSegment(
+                    segment_id="sp0",
+                    start_sec=0.3,
+                    end_sec=2.6,
+                    text="Нам дали коробку",
+                    confidence=0.9,
+                    words=[
+                        WordTimestamp(word="Нам", start_sec=0.4, end_sec=0.9, probability=0.9),
+                        WordTimestamp(word="дали", start_sec=1.0, end_sec=1.6, probability=0.9),
+                        WordTimestamp(word="коробку", start_sec=1.7, end_sec=2.4, probability=0.9),
+                    ],
+                ),
+                TranscriptSegment(
+                    segment_id="sp1",
+                    start_sec=2.9,
+                    end_sec=5.5,
+                    text="А внутри гусь",
+                    confidence=0.9,
+                    words=[
+                        WordTimestamp(word="А", start_sec=3.0, end_sec=3.4, probability=0.9),
+                        WordTimestamp(word="внутри", start_sec=3.6, end_sec=4.3, probability=0.9),
+                        WordTimestamp(word="гусь", start_sec=4.5, end_sec=5.3, probability=0.9),
+                    ],
+                ),
+            ],
+        ),
+    )
+    sb = Storyboard(
+        storyboard_id="sb_port",
+        project_id="proj_port",
+        selected_strategy="Portrait in 16:9 Stage",
+        target_duration_sec=5.5,
+        beats=[
+            StoryboardBeat(
+                beat_index=0,
+                role="hook",
+                source_start_sec=0.2,
+                source_end_sec=2.8,
+                target_duration_sec=2.5,
+                visual_treatment="jump_cut_and_zoom",
+            ),
+            StoryboardBeat(
+                beat_index=1,
+                role="payoff",
+                source_start_sec=2.8,
+                source_end_sec=5.6,
+                target_duration_sec=2.6,
+                visual_treatment="jump_cut_and_zoom",
+            ),
+        ],
+    )
+    sfx_map = ensure_project_sfx(tmp_path / "fx", download_clicks=False)
+    sfx_map.update(dl["click_paths"])
+    tl = build_timeline_from_storyboard(
+        project_id="proj_port",
+        title="Portrait Stage Render",
+        analysis=bundle,
+        storyboard=sb,
+        style_name=EditingStyleName.ZOOMER_VLOG.value,
+        platform_format=TargetPlatformFormat.YOUTUBE_LONG,
+        sfx_paths=sfx_map,
+    )
+    out_yt = tmp_path / "portrait_stage_yt.mp4"
+    render_timeline(tl, out_yt, tmp_path / "ws_port")
+    assert out_yt.is_file() and out_yt.stat().st_size > 10_000
+    assert probe_media(out_yt).width == 1920 and probe_media(out_yt).height == 1080
+    # Left pillar is darkened blurred backdrop while center is bright yellow portrait stage
+    frame_png = tmp_path / "chk.png"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "1.0", "-i", str(out_yt), "-vframes", "1", str(frame_png)], check=True)
+    im = Image.open(frame_png).convert("RGB")
+    edge_px = im.getpixel((120, 540))
+    center_px = im.getpixel((960, 540))
+    assert sum(center_px) > sum(edge_px) + 30

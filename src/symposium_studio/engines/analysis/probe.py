@@ -83,6 +83,18 @@ def probe_media(media_path: Path) -> MediaProbeResult:
 
     width = int(v_stream.get("width", 0))
     height = int(v_stream.get("height", 0))
+    rot_raw = (v_stream.get("tags") or {}).get("rotate")
+    if rot_raw is None:
+        for sd in v_stream.get("side_data_list") or []:
+            if "rotation" in sd:
+                rot_raw = sd.get("rotation")
+                break
+    try:
+        rot_deg = abs(int(round(float(rot_raw or 0.0)))) % 360
+    except (TypeError, ValueError):
+        rot_deg = 0
+    if rot_deg in {90, 270} and width > 0 and height > 0:
+        width, height = height, width
     fps = _parse_fps(v_stream.get("avg_frame_rate") or v_stream.get("r_frame_rate"))
     duration = float(fmt.get("duration") or v_stream.get("duration") or 0.0)
 

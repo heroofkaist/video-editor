@@ -425,7 +425,7 @@ class SymposiumStudio:
                 )
         return session, anim_res
 
-    def _meme_batch_animations(self, ws_dir: Path, max_count: int = 4) -> list[AnimationRenderResult]:
+    def _meme_batch_animations(self, ws_dir: Path, max_count: int = 10) -> list[AnimationRenderResult]:
         anim_dir = ws_dir / "animations"
         if not anim_dir.exists():
             return []
@@ -522,7 +522,7 @@ class SymposiumStudio:
         manifest: ProjectManifest,
         analysis: MediaAnalysisBundle,
         session: SymposiumSession,
-        max_cards: int = 4,
+        max_cards: int = 10,
     ) -> tuple[list[AnimationRenderResult], list[dict[str, Any]]]:
         ws_dir = Path(manifest.project.workspace_dir)
         pid = manifest.project.project_id
@@ -551,34 +551,34 @@ class SymposiumStudio:
             b_e = min(analysis.probe.duration_sec, b_s + 8.0)
             slots.append((0, b_s, b_e, "hook", "", seg0.text if seg0 else manifest.project.name))
         else:
-            if len(beats) == 1:
-                raw_indices = [0]
-            elif len(beats) == 2:
-                raw_indices = [0, 1]
-            elif max_cards >= 4 and len(beats) >= 4:
-                raw_indices = [0, 1, len(beats) // 2, len(beats) - 1]
-            else:
-                raw_indices = [0, len(beats) // 2, len(beats) - 1]
-            seen_b: list[int] = []
-            for bi in raw_indices:
-                if bi not in seen_b and len(seen_b) < max_cards:
-                    seen_b.append(bi)
-            for bi in seen_b:
-                b = beats[bi]
-                ex = _beat_excerpt(b.source_start_sec, b.source_end_sec, b.evidence_ids)
-                slots.append((bi, b.source_start_sec, b.source_end_sec, b.role, b.visual_treatment, ex))
+            # Cover all narrative beats first, then subdivide longer beats into ~7-9s reaction windows up to max_cards
+            for bi, b in enumerate(beats):
+                if len(slots) >= max_cards:
+                    break
+                b_dur = max(1.0, b.source_end_sec - b.source_start_sec)
+                sub_parts = 1
+                if max_cards > len(beats) and b_dur >= 12.0:
+                    sub_parts = min(3, max(2, int(round(b_dur / 8.5))))
+                step = b_dur / sub_parts
+                for sp_i in range(sub_parts):
+                    if len(slots) >= max_cards:
+                        break
+                    s0 = round(b.source_start_sec + sp_i * step, 3)
+                    s1 = round(b.source_start_sec + (sp_i + 1) * step, 3)
+                    ex = _beat_excerpt(s0, s1, b.evidence_ids if sp_i == 0 else [])
+                    slots.append((bi, s0, s1, b.role, b.visual_treatment, ex))
 
         beat_text_blob = " ".join(s[5] for s in slots)
         full_text = " ".join(s.text for s in analysis.transcript.segments)
         query_seed = (
             f"{manifest.project.name} "
             f"{' '.join(k for t in analysis.topics for k in t.keywords[:6])} "
-            f"{beat_text_blob[:500]} {full_text[:400]}"
+            f"{beat_text_blob[:600]} {full_text[:500]}"
         )
-        live_memes = MemeTrendConnector().fetch_public_items(query=query_seed, limit=28)
+        live_memes = MemeTrendConnector().fetch_public_items(query=query_seed, limit=max(28, max_cards * 3))
         for it in live_memes:
             self.db.upsert_viral_item(it)
-        downloaded = download_trending_meme_assets(live_memes, ws_dir / "memes", max_count=max(max_cards * 2, 8))
+        downloaded = download_trending_meme_assets(live_memes, ws_dir / "memes", max_count=max(max_cards * 2, 16))
 
         anim_dir = ws_dir / "animations"
         anim_dir.mkdir(parents=True, exist_ok=True)
@@ -601,7 +601,26 @@ class SymposiumStudio:
                     best_score = sc
                     best_idx = cand_i
 
-            meme_meta = downloaded[best_idx] if (best_idx is not None and best_score >= 0.42) else {}
+            best_cand = downloaded[best_idx] if best_idx is not None else {}
+            accept_thresh = 0.22 if best_cand.get("media_kind") == "video" else 0.34
+            if best_idx is not None and best_score >= accept_thresh:
+                meme_meta = best_cand
+            else:
+                # Prefer any crisp non-mismatched animated reaction video before falling back to static text cards
+                vid_fallback = next(
+                    (
+                        (ci, cd)
+                        for ci, cd in enumerate(downloaded)
+                        if ci not in used_meme_indices
+                        and cd.get("media_kind") == "video"
+                        and score_meme_for_beat(cd, match_context) >= 0.16
+                    ),
+                    None,
+                )
+                if vid_fallback is not None:
+                    best_idx, meme_meta = vid_fallback
+                else:
+                    meme_meta = {}
             asset_raw = str(meme_meta.get("asset_path") or meme_meta.get("image_path") or "").strip()
             meme_topic = str(meme_meta.get("topic") or meme_meta.get("title") or "Visual Beat")
             src_asset = Path(asset_raw) if asset_raw else None
@@ -684,7 +703,7 @@ class SymposiumStudio:
         include_reels: bool = True,
         short_variants_per_platform: int = 1,
         extra_animations: list[AnimationRenderResult] | None = None,
-        download_click_sounds: bool = False,
+        download_click_sounds: bool | None = None,
         animation_result: AnimationRenderResult | None = None,
     ) -> dict[str, Any]:
         analysis = self.load_analysis(project_id)
@@ -693,12 +712,17 @@ class SymposiumStudio:
         anim_res = animation_result or latest_anim
         ws_dir = Path(manifest.project.workspace_dir)
 
+        resolved_clicks = (
+            manifest.project.editing_style in {"zoomer_vlog", "short_form_viral", "comedy"}
+            if download_click_sounds is None
+            else bool(download_click_sounds)
+        )
         resolved_extra = list(extra_animations or [])
         if manifest.project.editing_style == "zoomer_vlog" and (
             extra_animations is None
             or (anim_res is not None and any(a.scene_id == anim_res.scene_id for a in resolved_extra))
         ):
-            meme_batch = self._meme_batch_animations(ws_dir, max_count=4)
+            meme_batch = self._meme_batch_animations(ws_dir, max_count=10)
             if meme_batch:
                 anim_res = meme_batch[0]
                 resolved_extra = meme_batch[1:]
@@ -706,7 +730,7 @@ class SymposiumStudio:
             resolved_extra = [a for a in resolved_extra if a.scene_id != anim_res.scene_id]
 
         with self.workspaces.track_run(project_id, "build_and_render_deliverables") as (manifest, run):
-            sfx_map = ensure_project_sfx(ws_dir / "effects", download_clicks=download_click_sounds)
+            sfx_map = ensure_project_sfx(ws_dir / "effects", download_clicks=resolved_clicks)
             # 1. Main YouTube 16:9 timeline & render
             yt_tl = build_timeline_from_storyboard(
                 project_id=project_id,
@@ -1215,13 +1239,17 @@ class SymposiumStudio:
         downloaded_memes: list[dict[str, Any]] = []
         extra_anims: list[AnimationRenderResult] = []
         if chosen_tmpl == "meme_reaction_card" or editing_style == "zoomer_vlog":
-            meme_anims, downloaded_memes = self._generate_zoomer_meme_cards(manifest, analysis, session, max_cards=4)
+            meme_anims, downloaded_memes = self._generate_zoomer_meme_cards(manifest, analysis, session, max_cards=10)
             anim = meme_anims[0]
             extra_anims = meme_anims[1:]
         else:
             anim = self.generate_animation(pid, template_id=chosen_tmpl, duration_sec=6.5)
 
-        resolved_download_clicks = bool(discover_live_research) if download_click_sounds is None else bool(download_click_sounds)
+        resolved_download_clicks = (
+            bool(discover_live_research or editing_style in {"zoomer_vlog", "short_form_viral", "comedy"})
+            if download_click_sounds is None
+            else bool(download_click_sounds)
+        )
         renders = self.build_and_render_deliverables(
             pid,
             short_variants_per_platform=short_variants_per_platform,
