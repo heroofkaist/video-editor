@@ -41,6 +41,12 @@ class AnalyzeRequest(BaseModel):
     whisper_model: str | None = None
 
 
+class TranscriptPatchRequest(BaseModel):
+    corrections: dict[str, str] = Field(default_factory=dict)
+    language_overrides: dict[str, str] = Field(default_factory=dict)
+    mark_confirmed: bool = True
+
+
 class SymposiumRequest(BaseModel):
     mode: ResearchMode = ResearchMode.STANDARD
     style_name: str | None = None
@@ -210,6 +216,21 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             return studio.load_analysis(project_id).model_dump(mode="json")
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.patch("/api/projects/{project_id}/transcript")
+    def patch_transcript(project_id: str, req: TranscriptPatchRequest) -> dict[str, Any]:
+        try:
+            bundle = studio.update_transcript_segments(
+                project_id,
+                corrections=req.corrections,
+                language_overrides=req.language_overrides or None,
+                mark_confirmed=req.mark_confirmed,
+            )
+            return bundle.model_dump(mode="json")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     # --- Research Intelligence ---
     @app.get("/api/research/items")

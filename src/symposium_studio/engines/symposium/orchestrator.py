@@ -22,6 +22,12 @@ from symposium_studio.engines.growth.evaluator import (
     creative_director_gate_review,
     evaluate_candidate_edits,
 )
+from symposium_studio.engines.production.directors import (
+    evaluate_ending_closure,
+    plan_coherent_beat_sequence,
+    select_best_hook,
+    snap_ending_boundary,
+)
 from symposium_studio.engines.symposium.llm_provider import SymposiumLLMRouter
 from symposium_studio.models.growth import ContentExperimentRecord
 from symposium_studio.models.media import MediaAnalysisBundle
@@ -308,30 +314,18 @@ class SymposiumOrchestrator:
         if not hls:
             return []
         if analysis.probe.duration_sec <= target_max_sec:
-            return list(hls)
-
-        sorted_by_score = sorted(hls, key=lambda h: h.scores.composite_score, reverse=True)
-        hook = max(
-            hls[: min(3, len(hls))],
-            key=lambda h: h.scores.audience_curiosity + h.scores.composite_score,
+            return plan_coherent_beat_sequence(
+                analysis,
+                target_min_sec=max(10.0, analysis.probe.duration_sec * 0.7),
+                target_max_sec=target_max_sec,
+                strategy="hook_first",
+            )
+        return plan_coherent_beat_sequence(
+            analysis,
+            target_min_sec=target_min_sec,
+            target_max_sec=target_max_sec,
+            strategy="hook_first",
         )
-
-        selected = [hook]
-        total = hook.duration_sec
-        for cand in sorted_by_score:
-            if cand.highlight_id == hook.highlight_id:
-                continue
-            if total >= target_min_sec and total + cand.duration_sec > target_max_sec:
-                continue
-            if total + cand.duration_sec <= target_max_sec + 6.0:
-                selected.append(cand)
-                total += cand.duration_sec
-            if total >= target_min_sec and len(selected) >= 3:
-                if any(s.visual_opportunity_type for s in selected):
-                    break
-
-        rest = sorted([s for s in selected if s.highlight_id != hook.highlight_id], key=lambda x: x.start_sec)
-        return [hook, *rest]
 
     def _build_specialist_proposal(
         self,
@@ -660,13 +654,24 @@ class SymposiumOrchestrator:
                 for h in analysis.highlights
                 if h.highlight_id not in {x.highlight_id for x in revised_hls}
                 and not any(u["end_sec"] > h.start_sec and u["start_sec"] < h.end_sec for u in unc_segments)
+                and not any(
+                    max(0.0, min(h.end_sec, x.end_sec) - max(h.start_sec, x.start_sec))
+                    >= min(h.duration_sec, x.duration_sec) * 0.35
+                    for x in revised_hls
+                )
             ]
             target_prop = by_agent.get("story_producer") or proposals[0]
-            if overlapping_hls and clean_alternatives and len(revised_hls) > 1:
-                dropped = overlapping_hls[-1]
+            # Never swap away a strong verified opening premise hook or final closure beat
+            non_anchor_overlapping = [
+                h for h in overlapping_hls if h.highlight_id not in {revised_hls[0].highlight_id, revised_hls[-1].highlight_id}
+            ]
+            if non_anchor_overlapping and clean_alternatives and len(revised_hls) > 2:
+                dropped = non_anchor_overlapping[-1]
                 replacement = max(clean_alternatives, key=lambda x: x.scores.composite_score)
                 idx = revised_hls.index(dropped)
                 revised_hls[idx] = replacement
+                if len(revised_hls) > 2:
+                    revised_hls = [revised_hls[0]] + sorted(revised_hls[1:-1], key=lambda x: x.start_sec) + [revised_hls[-1]]
                 res_msg = (
                     f"Swapped low-confidence ASR beat `{dropped.highlight_id}` ({dropped.start_sec:.1f}-{dropped.end_sec:.1f}s) "
                     f"for clean high-confidence beat `{replacement.highlight_id}` ({replacement.start_sec:.1f}-{replacement.end_sec:.1f}s)."
@@ -724,7 +729,73 @@ class SymposiumOrchestrator:
                 )
             )
 
-        # 4. Check duration & dead-air pause trims
+        # 4. Hook & Ending Director Coherence Validation
+        if revised_hls and analysis.transcript.segments:
+            best_hook = select_best_hook(analysis)
+            hook_cand = revised_hls[0]
+            if best_hook["clean_start"] and (
+                hook_cand.scores.context_dependency < 0.60
+                or (
+                    hook_cand.highlight_id != best_hook["highlight_id"]
+                    and best_hook["hook_score"] > 0.72
+                )
+            ):
+                matching = next((h for h in analysis.highlights if h.highlight_id == best_hook["highlight_id"]), None)
+                if matching is not None:
+                    h_start = min(hook_cand.start_sec, best_hook["start_sec"]) if hook_cand.end_sec <= best_hook["end_sec"] and hook_cand.start_sec <= 2.0 else best_hook["start_sec"]
+                    h_end = max(hook_cand.end_sec, best_hook["end_sec"])
+                    revised_hls[0] = matching.model_copy(
+                        update={
+                            "role": "hook",
+                            "start_sec": h_start,
+                            "end_sec": h_end,
+                            "duration_sec": round(max(1.0, h_end - h_start), 3),
+                        }
+                    )
+                    revisions.append(
+                        f"Hook Director enforced self-contained premise `{matching.highlight_id}` ({h_start:.1f}-{h_end:.1f}s)."
+                    )
+            else:
+                same_hook = hook_cand.highlight_id == best_hook["highlight_id"]
+                h_start = min(hook_cand.start_sec, best_hook["start_sec"]) if same_hook else hook_cand.start_sec
+                h_end = max(hook_cand.end_sec, best_hook["end_sec"]) if same_hook else hook_cand.end_sec
+                revised_hls[0] = hook_cand.model_copy(
+                    update={
+                        "start_sec": h_start,
+                        "end_sec": h_end,
+                        "duration_sec": round(max(1.0, h_end - h_start), 3),
+                    }
+                )
+
+            last_hl = revised_hls[-1]
+            s_start, s_end, end_rep = snap_ending_boundary(
+                analysis, last_hl.start_sec, last_hl.end_sec, max_extend_sec=8.0
+            )
+            if abs(s_end - last_hl.end_sec) > 0.25 or not end_rep.get("closure_ok", True):
+                revised_hls[-1] = last_hl.model_copy(
+                    update={
+                        "role": "payoff",
+                        "start_sec": s_start,
+                        "end_sec": s_end,
+                        "duration_sec": round(max(1.0, s_end - s_start), 3),
+                    }
+                )
+                msg = (
+                    f"Ending Director snapped closing beat `{last_hl.highlight_id}` to sentence closure ({s_start:.1f}-{s_end:.1f}s, {end_rep.get('closure_type')})."
+                )
+                revisions.append(msg)
+                hook_prop = by_agent.get("hook_scientist") or proposals[0]
+                challenges.append(
+                    ModeratorChallenge(
+                        challenge_id=f"mod_{uuid.uuid4().hex[:6]}",
+                        target_proposal_id=hook_prop.proposal_id,
+                        issue_type="pacing_conflict",
+                        description="Verified opening hook completeness and final sentence-boundary closure across assembled storyboard.",
+                        resolution=msg,
+                    )
+                )
+
+        # 5. Check duration & dead-air pause trims
         if brief["long_pauses"]:
             ed = by_agent.get("professional_video_editor") or proposals[0]
             res_msg = f"Trimmed or bridged {len(brief['long_pauses'])} dead pause interval(s) >= 1.0s at beat boundaries."
@@ -784,6 +855,7 @@ class SymposiumOrchestrator:
             style_name=style_name,
             prior_experiments=prior_experiments,
             target_max_sec=target_max_sec,
+            target_min_sec=target_min_sec,
         )
         best_cand = candidates[0] if candidates else None
         prior_learnings = [
@@ -793,9 +865,28 @@ class SymposiumOrchestrator:
             if note.startswith("Historical ")
         ][:5]
 
-        # Seed Round 1 beats from highest-ranked candidate edit (or duration selector fallback)
+        # Seed Round 1 beats from highest-ranked candidate edit using cohesive hook/ending bounds
         hl_map = {h.highlight_id: h for h in analysis.highlights}
+        strat_mode = (
+            "tight_viral"
+            if best_cand and "Tight Viral" in best_cand.strategy_name
+            else ("mechanism_proof" if best_cand and "Mechanism" in best_cand.strategy_name else "hook_first")
+        )
+        cand_cap = (
+            min(target_max_sec, max(target_min_sec + 15.0, target_max_sec * 0.85))
+            if strat_mode == "tight_viral"
+            else target_max_sec
+        )
         initial_hls = (
+            plan_coherent_beat_sequence(
+                analysis,
+                target_min_sec=min(cand_cap, max(24.0, target_min_sec * 0.90)),
+                target_max_sec=cand_cap,
+                strategy=strat_mode,
+            )
+            if best_cand
+            else []
+        ) or (
             [hl_map[hid] for hid in best_cand.beat_highlight_ids if hid in hl_map]
             if best_cand and best_cand.beat_highlight_ids
             else []

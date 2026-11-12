@@ -7,6 +7,11 @@ import statistics
 import uuid
 from typing import Any
 
+from symposium_studio.engines.production.directors import (
+    evaluate_ending_closure,
+    plan_coherent_beat_sequence,
+    select_best_hook,
+)
 from symposium_studio.models.growth import (
     CREATOR_CORE_AUDIENCE,
     CandidateEditEvaluation,
@@ -144,57 +149,67 @@ def _prior_experiment_lift(
     return 0.0, [f"Historical neutral baseline across {len(matched)} comparable experiment(s) ({avg_ratio:.2f}x median)."]
 
 
+def _candidate_duration_window(
+    mode: str,
+    target_min_sec: float,
+    target_max_sec: float,
+) -> tuple[float, float]:
+    """Resolve candidate `(target_min, target_max)` bounds while honoring caller minimums."""
+    eff_min = target_min_sec if target_min_sec > 0.0 else max(24.0, target_max_sec * 0.65)
+    if mode == "hook_first":
+        cap = target_max_sec
+    elif mode == "mechanism_proof":
+        cap = min(max(95.0, target_max_sec), target_max_sec + 10.0)
+    else:  # tight_viral
+        cap = (
+            min(target_max_sec, max(eff_min + 15.0, target_max_sec * 0.85))
+            if target_min_sec > 0.0
+            else min(62.0, target_max_sec)
+        )
+    tmin = min(cap, max(24.0, eff_min * 0.90 if target_min_sec > 0.0 else cap * 0.65))
+    return tmin, cap
+
+
 def _select_candidate_beats(
     hls: list[HighlightProposal],
     mode: str,
     uncertain_spans: list[tuple[float, float]],
     target_max_sec: float,
+    analysis: MediaAnalysisBundle | None = None,
+    target_min_sec: float = 0.0,
 ) -> list[HighlightProposal]:
     if not hls:
         return []
-    curiosity_sorted = sorted(
+    target_min, cap = _candidate_duration_window(mode, target_min_sec, target_max_sec)
+    if analysis is not None:
+        planned = plan_coherent_beat_sequence(
+            analysis,
+            target_min_sec=target_min,
+            target_max_sec=cap,
+            strategy=mode,
+        )
+        if planned:
+            return planned
+
+    # Fallback when called standalone without full MediaAnalysisBundle
+    hook_pick = max(
         hls,
-        key=lambda h: (h.scores.audience_curiosity + h.scores.emotional_intensity, h.scores.composite_score),
-        reverse=True,
+        key=lambda h: (h.scores.context_dependency >= 0.65, h.scores.audience_curiosity + h.scores.story_relevance + h.scores.composite_score),
     )
-    visual_sorted = sorted(
-        hls,
-        key=lambda h: (h.scores.educational_value + h.scores.visual_opportunity, h.scores.composite_score),
-        reverse=True,
-    )
-
-    def _is_clean(h: HighlightProposal) -> bool:
-        return not any(u_end > h.start_sec and u_start < h.end_sec for u_start, u_end in uncertain_spans)
-
-    if mode == "hook_first":
-        seed = [curiosity_sorted[0]]
-        pool = sorted(hls, key=lambda h: h.scores.composite_score, reverse=True)
-        cap = target_max_sec
-    elif mode == "mechanism_proof":
-        clean_first = [h for h in visual_sorted if _is_clean(h)] or visual_sorted
-        seed = [clean_first[0]]
-        pool = clean_first[1:] + sorted(hls, key=lambda h: h.start_sec)
-        cap = min(95.0, target_max_sec + 10.0)
-    else:  # tight_viral
-        hook_pick = max(hls[: min(3, len(hls))], key=lambda h: h.scores.audience_curiosity)
-        seed = [hook_pick]
-        pool = [h for h in sorted(hls, key=lambda h: h.scores.composite_score, reverse=True) if h.duration_sec <= 28.0] or list(hls)
-        cap = min(62.0, target_max_sec)
-
-    chosen = list(seed)
-    seen = {h.highlight_id for h in chosen}
-    total = sum(h.duration_sec for h in chosen)
-    for h in pool:
-        if h.highlight_id in seen:
+    chosen = [hook_pick]
+    total = hook_pick.duration_sec
+    for h in sorted(hls, key=lambda x: x.start_sec):
+        if h.highlight_id == hook_pick.highlight_id:
+            continue
+        if max(0.0, min(h.end_sec, hook_pick.end_sec) - max(h.start_sec, hook_pick.start_sec)) >= min(h.duration_sec, hook_pick.duration_sec) * 0.35:
             continue
         if total + h.duration_sec > cap and len(chosen) >= 2:
             continue
         chosen.append(h)
-        seen.add(h.highlight_id)
         total += h.duration_sec
         if len(chosen) >= 6:
             break
-    return chosen
+    return [chosen[0]] + sorted(chosen[1:], key=lambda x: x.start_sec)
 
 
 def evaluate_candidate_edits(
@@ -204,6 +219,7 @@ def evaluate_candidate_edits(
     style_name: str,
     prior_experiments: list[ContentExperimentRecord] | None = None,
     target_max_sec: float = 90.0,
+    target_min_sec: float = 0.0,
 ) -> list[CandidateEditEvaluation]:
     """Generate 3 distinct candidate edit versions, score across all 11 growth dimensions, and rank them."""
     hls = analysis.highlights
@@ -235,11 +251,25 @@ def evaluate_candidate_edits(
         3,
     )
 
+    hook_director = select_best_hook(analysis)
     candidates: list[CandidateEditEvaluation] = []
     for idx, (s_name, st_profile, mode) in enumerate(blueprints):
-        beats = _select_candidate_beats(hls, mode, uncertain_spans, target_max_sec=target_max_sec)
+        beats = _select_candidate_beats(
+            hls,
+            mode,
+            uncertain_spans,
+            target_max_sec=target_max_sec,
+            analysis=analysis,
+            target_min_sec=target_min_sec,
+        )
         dur = round(sum(b.duration_sec for b in beats), 2) if beats else round(min(target_max_sec, analysis.probe.duration_sec), 2)
         first = beats[0] if beats else None
+        last = beats[-1] if beats else None
+        ending_ev = (
+            evaluate_ending_closure(segs, last.start_sec, last.end_sec)
+            if last
+            else {"closure_ok": True, "closure_type": "no_beats"}
+        )
 
         avg_info = sum(b.scores.information_density for b in beats) / max(1, len(beats)) if beats else 0.55
         avg_vis = sum(b.scores.visual_opportunity for b in beats) / max(1, len(beats)) if beats else 0.55
@@ -252,15 +282,17 @@ def evaluate_candidate_edits(
         unc_overlap_cnt = sum(
             1 for b in beats if any(ue > b.start_sec and us < b.end_sec for us, ue in uncertain_spans)
         )
+        first_clean_bonus = 0.08 if (first and first.scores.context_dependency >= 0.68) else (-0.18 if first else 0.0)
+        closure_bonus = 0.07 if ending_ev.get("closure_ok") else -0.14
 
         sc = PerformancePredictionScorecard(
-            hook_strength=_clamp01((first.scores.audience_curiosity if first else 0.55) + hook_boost),
+            hook_strength=_clamp01((first.scores.audience_curiosity if first else 0.55) + hook_boost + first_clean_bonus),
             topic_relevance=_clamp01(relevance.momentum_score),
             clarity=_clamp01(avg_edu + clarity_boost - unc_overlap_cnt * 0.06),
             information_density=_clamp01(avg_info + (0.04 if has_tech else 0.0)),
             curiosity=_clamp01((first.scores.audience_curiosity if first else 0.55) + (0.06 if "?" in (first.transcript_excerpt if first else "") else 0.0)),
             emotional_engagement=_clamp01(avg_emo + (0.06 if mode != "mechanism_proof" else 0.02)),
-            narrative_progression=_clamp01(0.68 + (0.12 if len(beats) >= 3 else 0.04) - max(0, long_pause_count - 4) * 0.02 + compression_bonus * 0.5),
+            narrative_progression=_clamp01(0.68 + (0.12 if len(beats) >= 3 else 0.04) - max(0, long_pause_count - 4) * 0.02 + compression_bonus * 0.5 + closure_bonus),
             visual_quality=_clamp01(avg_vis * 0.7 + (0.22 if has_faces else 0.12) + 0.08),
             audience_compatibility=_clamp01(0.76 + (0.12 if has_tech else 0.04) + (0.05 if mode == "hook_first" else 0.02)),
             shareability=_clamp01((relevance.momentum_score * 0.45) + (first.scores.audience_curiosity if first else 0.55) * 0.35 + compression_bonus),
@@ -286,8 +318,8 @@ def evaluate_candidate_edits(
         high_ci = round(min(0.99, comp + base_uncertainty), 3)
 
         rationale = [
-            f"Hook strength {sc.hook_strength:.2f} anchored at {first.highlight_id if first else 'opening frame'} ({dur:.1f}s edit).",
-            f"Topic relevance {sc.topic_relevance:.2f} ({relevance.topic_timeliness}); {len(beats)} beats avoiding {unc_overlap_cnt} uncertain ASR overlap(s).",
+            f"Hook Director selected `{hook_director.get('highlight_id')}` (score={hook_director.get('hook_score', 0.0):.2f}, clean_start={hook_director.get('clean_start')}); {dur:.1f}s edit.",
+            f"Ending closure check: {ending_ev.get('closure_type')} (ok={ending_ev.get('closure_ok')}); {len(beats)} non-overlapping beats.",
             *lift_notes,
         ]
         if verified_research_n == 0:

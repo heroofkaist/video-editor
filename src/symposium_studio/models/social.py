@@ -112,10 +112,13 @@ class QualityAssuranceReport(BaseModel):
     has_audio: bool
     audio_mean_db: float | None = None
     audio_max_db: float | None = None
+    measured_lufs: float | None = None
     black_frame_intervals: list[dict[str, float]] = Field(default_factory=list)
     freeze_frame_intervals: list[dict[str, float]] = Field(default_factory=list)
     caption_count: int = 0
     overlay_count: int = 0
+    caption_quality: dict[str, Any] = Field(default_factory=dict)
+    editorial_checks: dict[str, Any] = Field(default_factory=dict)
     verification_frame_paths: list[str] = Field(default_factory=list)
     issues: list[QualityCheckIssue] = Field(default_factory=list)
 

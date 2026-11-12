@@ -77,6 +77,22 @@ class AudioNode(BaseModel):
     duck_under_speech: bool = False
 
 
+class SegmentTimelineMapping(BaseModel):
+    """Explicit lineage mapping between a source transcript segment slice and its edited timeline span."""
+
+    mapping_id: str
+    source_segment_id: str
+    clip_id: str
+    source_start_sec: float
+    source_end_sec: float
+    timeline_start_sec: float
+    timeline_end_sec: float
+    playback_speed: float = 1.0
+    language: str = "unknown"
+    text_excerpt: str = ""
+    cue_ids: list[str] = Field(default_factory=list)
+
+
 class CaptionCue(BaseModel):
     cue_id: str
     start_sec: float
@@ -85,6 +101,11 @@ class CaptionCue(BaseModel):
     words: list[dict[str, Any]] = Field(default_factory=list)
     low_confidence: bool = False
     style_preset: str = "kinetic_caption_pop"
+    clip_id: str | None = None
+    source_segment_id: str | None = None
+    source_start_sec: float | None = None
+    source_end_sec: float | None = None
+    aligned_to_final_audio: bool = False
 
 
 class CaptionSettings(BaseModel):
@@ -95,7 +116,7 @@ class CaptionSettings(BaseModel):
     safe_margin_bottom_px: int = 90
     safe_margin_top_px: int = 80
     highlight_active_word: bool = True
-    max_words_per_line: int = 5
+    max_words_per_line: int = 3
 
 
 class RenderTimeline(BaseModel):
@@ -112,6 +133,8 @@ class RenderTimeline(BaseModel):
     overlays: list[OverlayNode] = Field(default_factory=list)
     audio_events: list[AudioNode] = Field(default_factory=list)
     captions: list[CaptionCue] = Field(default_factory=list)
+    segment_mappings: list[SegmentTimelineMapping] = Field(default_factory=list)
+    subtitle_integrity: dict[str, Any] = Field(default_factory=dict)
     caption_settings: CaptionSettings = Field(default_factory=CaptionSettings)
     global_effects: list[EffectSpec] = Field(default_factory=list)
     edit_notes: list[str] = Field(default_factory=list)

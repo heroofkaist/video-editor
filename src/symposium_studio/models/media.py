@@ -44,6 +44,35 @@ class TranscriptSegment(BaseModel):
     low_confidence_reason: str | None = None
     speaker_id: str = "speaker_0"
     words: list[WordTimestamp] = Field(default_factory=list)
+    verification_status: str = "asr_raw"  # asr_raw | high_confidence | alternate_hypothesis_selected | uncertain_needs_review | human_confirmed
+    anomaly_flags: list[str] = Field(default_factory=list)
+    candidate_alternatives: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TranscriptReviewItem(BaseModel):
+    segment_id: str
+    start_sec: float
+    end_sec: float
+    text: str
+    language: str = "unknown"
+    confidence: float = 0.0
+    reasons: list[str] = Field(default_factory=list)
+    candidate_alternatives: list[dict[str, Any]] = Field(default_factory=list)
+    verification_status: str = "uncertain_needs_review"
+
+
+class TranscriptQualityReport(BaseModel):
+    total_segments: int = 0
+    high_confidence_count: int = 0
+    uncertain_count: int = 0
+    human_confirmed_count: int = 0
+    anomalous_segment_count: int = 0
+    hallucinations_cleaned: int = 0
+    mean_confidence: float = 0.0
+    code_switching_detected: bool = False
+    languages_observed: list[str] = Field(default_factory=list)
+    review_queue: list[TranscriptReviewItem] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class TranscriptResult(BaseModel):
@@ -56,6 +85,7 @@ class TranscriptResult(BaseModel):
     segments: list[TranscriptSegment] = Field(default_factory=list)
     uncertain_segment_ids: list[str] = Field(default_factory=list)
     verbatim_preserved: bool = True
+    quality_report: TranscriptQualityReport | None = None
 
 
 class SpeakerTurn(BaseModel):

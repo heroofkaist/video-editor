@@ -7,6 +7,7 @@ from symposium_studio.engines.research.connectors import (
     import_explicit_item,
     import_items_from_json,
     infer_platform_from_url,
+    score_meme_for_beat,
 )
 from symposium_studio.engines.research.engine import ResearchIntelligenceEngine
 
@@ -18,4 +19,5 @@ __all__ = [
     "import_explicit_item",
     "import_items_from_json",
     "infer_platform_from_url",
+    "score_meme_for_beat",
 ]

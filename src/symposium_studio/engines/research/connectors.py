@@ -789,9 +789,10 @@ def _fetch_tenor_reaction_items(query_pairs: list[tuple[str, str]], per_query: i
                     metrics=PublicEngagementMetrics(
                         platform=ResearchPlatform.INSTAGRAM_POST,
                         metric_source="tenor_reaction_search",
-                        views=100_000,
-                        channel_baseline_views=45_000,
-                        audience_normalized_ratio=2.22,
+                        views=None,
+                        likes=None,
+                        channel_baseline_views=None,
+                        audience_normalized_ratio=None,
                         captured_at=utc_now_iso(),
                     ),
                     category=ContentCategory.INTERNET_TRENDS,
@@ -809,10 +810,10 @@ def _fetch_tenor_reaction_items(query_pairs: list[tuple[str, str]], per_query: i
                             editing_translation="Cut away full-frame over blurred backdrop for 1.4-1.9s on punchline + SFX.",
                         )
                     ],
-                    evidence=f"Live Tenor search query='{q_text}' -> verified animated clip slug='{fname}'.",
+                    evidence=f"Live Tenor search query='{q_text}' -> verified animated clip slug='{fname}' (unscored reaction media; view count unavailable).",
                     confidence=0.90,
                     platform_relative_score=0.0,
-                    score_basis="within_platform_normalized",
+                    score_basis="unscored_reaction_media",
                     provenance_type="live_public_api",
                 )
             )
@@ -850,9 +851,10 @@ def _fetch_giphy_reaction_items(query_pairs: list[tuple[str, str]], per_query: i
                     metrics=PublicEngagementMetrics(
                         platform=ResearchPlatform.INSTAGRAM_POST,
                         metric_source="giphy_reaction_search",
-                        views=85_000,
-                        channel_baseline_views=40_000,
-                        audience_normalized_ratio=2.12,
+                        views=None,
+                        likes=None,
+                        channel_baseline_views=None,
+                        audience_normalized_ratio=None,
                         captured_at=utc_now_iso(),
                     ),
                     category=ContentCategory.INTERNET_TRENDS,
@@ -862,10 +864,10 @@ def _fetch_giphy_reaction_items(query_pairs: list[tuple[str, str]], per_query: i
                     narrative_structure="Spoken beat -> animated GIF punch -> quick jump back.",
                     visual_effects=["cutaway_blur_fill", "sfx_punch"],
                     reusable_techniques=[],
-                    evidence=f"Live GIPHY search query='{q_text}' -> media id '{gid}'.",
+                    evidence=f"Live GIPHY search query='{q_text}' -> media id '{gid}' (unscored reaction media; view count unavailable).",
                     confidence=0.88,
                     platform_relative_score=0.0,
-                    score_basis="within_platform_normalized",
+                    score_basis="unscored_reaction_media",
                     provenance_type="live_public_api",
                 )
             )
@@ -918,10 +920,10 @@ def _fetch_meme_api_items(query: str, limit: int = 6) -> list[ViralContentItem]:
                     metrics=PublicEngagementMetrics(
                         platform=ResearchPlatform.INSTAGRAM_POST,
                         metric_source="meme_api_reddit",
-                        views=ups * 35,
+                        views=None,
                         likes=ups,
-                        channel_baseline_views=2500,
-                        audience_normalized_ratio=round(max(1.0, ups / 80.0), 2),
+                        channel_baseline_views=None,
+                        audience_normalized_ratio=None,
                         captured_at=utc_now_iso(),
                     ),
                     category=ContentCategory.INTERNET_TRENDS,
@@ -931,10 +933,10 @@ def _fetch_meme_api_items(query: str, limit: int = 6) -> list[ViralContentItem]:
                     narrative_structure="Spoken joke -> finished community meme cutaway.",
                     visual_effects=["cutaway_blur_fill", "sfx_punch"],
                     reusable_techniques=[],
-                    evidence=f"Public meme-api.com r/{p.get('subreddit', sub)} post upvotes={ups:,}.",
+                    evidence=f"Public meme-api.com r/{p.get('subreddit', sub)} post upvotes={ups:,} (no view count exposed).",
                     confidence=0.89,
                     platform_relative_score=0.0,
-                    score_basis="within_platform_normalized",
+                    score_basis="unscored_reaction_media",
                     provenance_type="live_public_api",
                 )
             )
@@ -1095,7 +1097,7 @@ class MemeTrendConnector(PlatformConnector):
                                 metrics=PublicEngagementMetrics(
                                     platform=ResearchPlatform.INSTAGRAM_POST,
                                     metric_source="reddit_public_json",
-                                    views=ups,
+                                    views=None,
                                     likes=ups,
                                     comments=int(p.get("num_comments") or 0),
                                     captured_at=utc_now_iso(),
@@ -1111,13 +1113,13 @@ class MemeTrendConnector(PlatformConnector):
                                         name="Current Community Meme Reference",
                                         mechanism=f"Top trending Reddit /r/memes post ({ups:,} upvotes) ready for visual callback.",
                                         applicable_niches=["internet_trends", "comedy", "personal_storytelling"],
-                                        editing_translation="Overlay cleanly in upper-right PIP during relatable story beat.",
+                                        editing_translation="Overlay cleanly in safe non-occluding frame during relatable story beat.",
                                     )
                                 ],
                                 evidence=f"Public Reddit /r/memes JSON score={ups:,}, comments={int(p.get('num_comments') or 0):,}.",
                                 confidence=0.88,
                                 platform_relative_score=0.0,
-                                score_basis="within_platform_normalized",
+                                score_basis="unscored_reaction_media",
                                 provenance_type="live_public_api",
                             )
                         )
@@ -1162,12 +1164,48 @@ def _probe_video_clip(path: Path) -> tuple[int, int, int, float] | None:
         return None
 
 
+def score_meme_for_beat(meme_meta: dict[str, Any], beat_text: str) -> float:
+    """Score how contextually appropriate & visually crisp a downloaded meme asset is for a specific beat."""
+    low_beat = (beat_text or "").lower()
+    meme_blob = f"{meme_meta.get('topic', '')} {meme_meta.get('title', '')}".lower()
+
+    beat_queries = _derive_meme_reaction_queries(low_beat)
+    explicit_labels = [lbl.lower() for _, lbl in beat_queries]
+    matched_theme = any(lbl in meme_blob for lbl in explicit_labels)
+
+    # Check direct keyword overlap between beat queries and meme metadata
+    beat_kw_tokens: set[str] = set()
+    for q_txt, lbl in beat_queries:
+        for w in re.findall(r"[a-zа-яёәіңғүұқөһ0-9]+", f"{q_txt} {lbl}".lower()):
+            if len(w) >= 3:
+                beat_kw_tokens.add(w)
+    meme_tokens = set(re.findall(r"[a-zа-яёәіңғүұқөһ0-9]+", meme_blob))
+    overlap = len(beat_kw_tokens & meme_tokens)
+
+    # Penalize literal mismatches (e.g. 'Expectations vs Reality' floor plan on an unrelated quiz beat)
+    if "expectation vs reality" in meme_blob and not any(k in low_beat for k in ("ожида", "реальн", "салыстыр", "expect")):
+        return 0.10
+    if any(k in meme_blob for k in ("locked in", "stressed studying", "big brain")) and any(
+        k in low_beat for k in ("семестр", "қиын", "quiz", "data structure", "gpa", "дисциплин", "мамандық", "резюме")
+    ):
+        overlap += 2
+
+    rel_score = 0.65 if matched_theme else min(0.55, overlap * 0.22)
+    w = int(meme_meta.get("width") or 0)
+    h = int(meme_meta.get("height") or 0)
+    res_bonus = 0.20 if (w >= 400 and h >= 260) else (0.10 if (w >= 280 and h >= 200) else -0.20)
+    # Reject tall skinny text-heavy comics unless really high-res
+    aspect_pen = -0.35 if (w > 0 and h > w * 1.45 and w < 600) else 0.0
+    video_bonus = 0.10 if meme_meta.get("media_kind") == "video" else 0.0
+    return round(max(0.0, min(1.0, rel_score + res_bonus + aspect_pen + video_bonus)), 3)
+
+
 def download_trending_meme_assets(
     items: list[ViralContentItem],
     dest_dir: Path,
     max_count: int = 4,
 ) -> list[dict[str, Any]]:
-    """Download and validate animated GIF/MP4 reaction memes and community meme images locally."""
+    """Download and quality-gate animated reaction memes and clean meme images locally."""
     import tempfile
 
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1216,8 +1254,11 @@ def download_trending_meme_assets(
                         if not raw_meta:
                             continue
                         rw, rh, rframes, rdur = raw_meta
-                        # Reject static 1-frame preview thumbnails (0.04s) from Tenor/Giphy HTML
-                        if rw < 140 or rh < 100 or (rframes > 0 and rframes < 6) or (rdur > 0 and rdur < 0.35):
+                        # Reject static 1-frame preview thumbnails (0.04s) and ultra-low-res thumbnails
+                        if rw < 200 or rh < 150 or (rframes > 0 and rframes < 6) or (rdur > 0 and rdur < 0.35):
+                            continue
+                        # Reject extreme portrait/tall slivers when below usable cut size
+                        if rh > rw * 1.75 and rw < 360:
                             continue
                         subprocess.run(
                             [
@@ -1244,7 +1285,7 @@ def download_trending_meme_assets(
                             check=True,
                         )
                     meta = _probe_video_clip(out_mp4)
-                if out_mp4.is_file() and meta and meta[0] >= 140 and meta[3] >= 0.35:
+                if out_mp4.is_file() and meta and meta[0] >= 200 and meta[1] >= 150 and meta[3] >= 0.35:
                     downloaded.append(
                         {
                             "item_id": it.item_id,
@@ -1257,20 +1298,28 @@ def download_trending_meme_assets(
                             "width": meta[0],
                             "height": meta[1],
                             "duration_sec": round(meta[3], 3),
-                            "usage_count": it.metrics.views,
+                            "usage_count": it.metrics.likes or it.metrics.views,
                             "metric_source": it.metrics.metric_source,
                         }
                     )
             else:
                 out_png = dest_dir / f"{safe_id}.png"
+                img_w, img_h = 0, 0
                 if not out_png.exists():
                     resp = httpx.get(url, timeout=8.0, follow_redirects=True)
                     if resp.status_code != 200 or len(resp.content) < 512 or len(resp.content) > 8_000_000:
                         continue
                     img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                    # Reject tiny blurry icons and dense vertical multi-panel text comics unreadable as corner cards
+                    if img.width < 220 or img.height < 180 or img.height > img.width * 1.55:
+                        continue
                     img.thumbnail((960, 720), Image.Resampling.LANCZOS)
                     img.save(out_png, format="PNG")
-                if out_png.is_file() and out_png.stat().st_size > 512:
+                    img_w, img_h = img.width, img.height
+                elif out_png.is_file():
+                    with Image.open(out_png) as existing_im:
+                        img_w, img_h = existing_im.width, existing_im.height
+                if out_png.is_file() and out_png.stat().st_size > 512 and img_w >= 220 and img_h >= 180 and img_h <= img_w * 1.55:
                     downloaded.append(
                         {
                             "item_id": it.item_id,
@@ -1280,7 +1329,9 @@ def download_trending_meme_assets(
                             "media_kind": "image",
                             "asset_path": str(out_png.resolve()),
                             "image_path": str(out_png.resolve()),
-                            "usage_count": it.metrics.views,
+                            "width": img_w,
+                            "height": img_h,
+                            "usage_count": it.metrics.likes or it.metrics.views,
                             "metric_source": it.metrics.metric_source,
                         }
                     )

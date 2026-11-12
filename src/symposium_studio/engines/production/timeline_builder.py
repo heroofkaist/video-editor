@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from pathlib import Path
@@ -10,8 +11,15 @@ from typing import Any
 import opentimelineio as otio
 
 from symposium_studio.engines.analysis.styles import get_style_profile
+from symposium_studio.engines.production.directors import (
+    _overlap_ratio,
+    _tight_speech_start,
+    select_best_hook,
+    select_closing_payoff,
+    snap_ending_boundary,
+)
 from symposium_studio.models.animation import AnimationRenderResult
-from symposium_studio.models.media import MediaAnalysisBundle, SilenceInterval, TranscriptSegment
+from symposium_studio.models.media import HighlightProposal, HighlightScoreBreakdown, MediaAnalysisBundle, SilenceInterval, TranscriptSegment
 from symposium_studio.models.symposium import Storyboard
 from symposium_studio.models.timeline import (
     AudioNode,
@@ -21,10 +29,14 @@ from symposium_studio.models.timeline import (
     EffectSpec,
     OverlayNode,
     RenderTimeline,
+    SegmentTimelineMapping,
     TargetPlatformFormat,
     TransitionSpec,
     VideoClipNode,
 )
+
+_SENTENCE_END_PUNCT = (".", "!", "?", "…")
+_CLAUSE_PUNCT = (",", ";", ":", "—", "–")
 
 
 def _split_segment_into_short_cues(
@@ -35,6 +47,7 @@ def _split_segment_into_short_cues(
     speed: float,
     max_words: int,
     style_preset: str,
+    clip_id: str | None = None,
 ) -> list[CaptionCue]:
     """Map verbatim transcript words inside [clip_src_start, clip_src_end] onto output timeline timestamps."""
     words = [
@@ -44,17 +57,25 @@ def _split_segment_into_short_cues(
     ]
     if not words:
         if seg.words:
-            # Avoid emitting a duplicate whole-segment caption when subword midpoints fell cleanly into neighboring subclips
-            if seg.end_sec <= clip_src_start + 0.08 or seg.start_sec >= clip_src_end - 0.08:
+            # Rescue edge words that genuinely overlap >= 45% (or >= 140ms) inside this subclip;
+            # if none do, the subclip only caught an internal breath/pause inside seg -> emit nothing.
+            straddlers = [
+                w
+                for w in seg.words
+                if (min(w.end_sec, clip_src_end) - max(w.start_sec, clip_src_start))
+                >= max(0.14, 0.45 * max(0.04, w.end_sec - w.start_sec))
+            ]
+            if not straddlers:
                 return []
-            if any(clip_src_start <= (w.start_sec + w.end_sec) * 0.5 < clip_src_end for w in seg.words):
-                return []
+            words = straddlers
         if seg.end_sec <= clip_src_start or seg.start_sec >= clip_src_end:
             return []
         if min(seg.end_sec, clip_src_end) - max(seg.start_sec, clip_src_start) < 0.28:
             return []
-        s_rel = max(0.0, seg.start_sec - clip_src_start) / speed
-        e_rel = max(s_rel + 0.25, (min(clip_src_end, seg.end_sec) - clip_src_start) / speed)
+        ov_s = max(clip_src_start, seg.start_sec)
+        ov_e = min(clip_src_end, seg.end_sec)
+        s_rel = max(0.0, ov_s - clip_src_start) / speed
+        e_rel = max(s_rel + 0.25, (ov_e - clip_src_start) / speed)
         return [
             CaptionCue(
                 cue_id=f"cue_{uuid.uuid4().hex[:8]}",
@@ -63,33 +84,45 @@ def _split_segment_into_short_cues(
                 text=seg.text,
                 low_confidence=seg.low_confidence,
                 style_preset=style_preset,
+                clip_id=clip_id,
+                source_segment_id=seg.segment_id,
+                source_start_sec=round(ov_s, 3),
+                source_end_sec=round(ov_e, 3),
             )
         ]
 
     cues: list[CaptionCue] = []
     compact_burst = style_preset == "kinetic_caption_pop"
-    chunk_size = max(2, max_words) if compact_burst else max(3, max_words * 2)
+    chunk_size = min(3, max(2, max_words)) if compact_burst else min(4, max(2, max_words))
+    gap_limit = 0.28 if compact_burst else 0.42
     cur_grp: list[Any] = []
 
     def _emit_grp(grp: list[Any]) -> None:
         if not grp:
             return
-        s_rel = max(0.0, grp[0].start_sec - clip_src_start) / speed
-        raw_end_rel = (min(clip_src_end, grp[-1].end_sec) - clip_src_start) / speed
-        max_span = max(1.8, 0.58 * len(grp)) if compact_burst else max(2.8, 0.75 * len(grp))
+        src_s = float(grp[0].start_sec)
+        src_e = min(clip_src_end, float(grp[-1].end_sec))
+        s_rel = max(0.0, src_s - clip_src_start) / speed
+        raw_end_rel = (src_e - clip_src_start) / speed
+        max_span = max(2.6, 0.85 * len(grp)) if compact_burst else max(3.6, 1.05 * len(grp))
         e_rel = max(s_rel + 0.22, min(raw_end_rel, s_rel + max_span))
-        mapped_words = [
-            {
-                "word": w.word,
-                "start_sec": round(clip_tl_start + max(0.0, w.start_sec - clip_src_start) / speed, 3),
-                "end_sec": round(
-                    clip_tl_start
-                    + min(e_rel, max(0.0, min(clip_src_end, w.end_sec) - clip_src_start) / speed),
-                    3,
-                ),
-            }
-            for w in grp
-        ]
+        mapped_words = []
+        for w in grp:
+            w_src_s = float(w.start_sec)
+            w_src_e = min(clip_src_end, float(w.end_sec))
+            w_tl_s = round(clip_tl_start + max(0.0, w_src_s - clip_src_start) / speed, 3)
+            w_tl_e = round(clip_tl_start + min(e_rel, max(0.0, w_src_e - clip_src_start) / speed), 3)
+            w_tl_e = round(max(w_tl_s + 0.04, w_tl_e), 3)
+            mapped_words.append(
+                {
+                    "word": w.word,
+                    "start_sec": w_tl_s,
+                    "end_sec": w_tl_e,
+                    "source_start_sec": round(w_src_s, 3),
+                    "source_end_sec": round(max(w_src_s + 0.02, w_src_e), 3),
+                    "probability": round(float(getattr(w, "probability", 0.95)), 3),
+                }
+            )
         cues.append(
             CaptionCue(
                 cue_id=f"cue_{uuid.uuid4().hex[:8]}",
@@ -99,13 +132,44 @@ def _split_segment_into_short_cues(
                 words=mapped_words,
                 low_confidence=seg.low_confidence,
                 style_preset=style_preset,
+                clip_id=clip_id,
+                source_segment_id=seg.segment_id,
+                source_start_sec=round(src_s, 3),
+                source_end_sec=round(max(src_s + 0.04, src_e), 3),
             )
         )
 
-    for w in words:
+    def _run_len_ahead(start_idx: int) -> int:
+        cnt = 1
+        while start_idx + cnt < len(words):
+            prev_w = words[start_idx + cnt - 1]
+            nxt_w = words[start_idx + cnt]
+            if (nxt_w.start_sec - prev_w.end_sec) > gap_limit:
+                break
+            if prev_w.word.rstrip().endswith(_SENTENCE_END_PUNCT):
+                break
+            if prev_w.word.rstrip().endswith(_CLAUSE_PUNCT):
+                break
+            cnt += 1
+        return cnt
+
+    for i_w, w in enumerate(words):
         if cur_grp:
-            gap_here = w.start_sec - cur_grp[-1].end_sec
-            if len(cur_grp) >= chunk_size or (compact_burst and gap_here > 0.55):
+            prev_w = cur_grp[-1]
+            prev_txt = prev_w.word.rstrip()
+            gap_here = w.start_sec - prev_w.end_sec
+            hit_sentence_end = prev_txt.endswith(_SENTENCE_END_PUNCT)
+            hit_clause_end = len(cur_grp) >= 2 and prev_txt.endswith(_CLAUSE_PUNCT)
+            # Balance 4-word uninterrupted phrases into 2 + 2 instead of 3 + 1 orphan word
+            rem_run = _run_len_ahead(i_w)
+            balance_2_2 = chunk_size == 3 and len(cur_grp) == 2 and rem_run == 2
+            if (
+                len(cur_grp) >= chunk_size
+                or gap_here > gap_limit
+                or hit_sentence_end
+                or hit_clause_end
+                or balance_2_2
+            ):
                 _emit_grp(cur_grp)
                 cur_grp = []
         cur_grp.append(w)
@@ -124,6 +188,133 @@ def _crop_x_for_window(analysis: MediaAnalysisBundle, start_sec: float, end_sec:
     return analysis.recommended_crop_center_x
 
 
+def _build_segment_mappings(
+    segments: list[TranscriptSegment],
+    clips: list[VideoClipNode],
+    captions: list[CaptionCue],
+) -> list[SegmentTimelineMapping]:
+    """Build explicit source-segment <-> output-timeline mappings ordered by edited clips."""
+    mappings: list[SegmentTimelineMapping] = []
+    for c in clips:
+        spd = max(0.25, float(c.playback_speed))
+        for seg in segments:
+            ov_s = max(c.source_start_sec, seg.start_sec)
+            ov_e = min(c.source_end_sec, seg.end_sec)
+            if ov_e - ov_s <= 0.12:
+                continue
+            tl_s = round(c.timeline_start_sec + (ov_s - c.source_start_sec) / spd, 3)
+            tl_e = round(c.timeline_start_sec + (ov_e - c.source_start_sec) / spd, 3)
+            linked_cues = [
+                cue.cue_id
+                for cue in captions
+                if (cue.clip_id == c.clip_id and cue.source_segment_id == seg.segment_id)
+                or (
+                    cue.clip_id is None
+                    and min(cue.end_sec, tl_e) - max(cue.start_sec, tl_s) > 0.05
+                )
+            ]
+            # Only require/include excerpt words actually intersecting this clip slice
+            slice_words = [
+                w.word
+                for w in (seg.words or [])
+                if ov_s <= 0.5 * (w.start_sec + w.end_sec) < ov_e
+            ]
+            excerpt = " ".join(slice_words) if slice_words else (seg.text if ov_e - ov_s >= 0.45 else "")
+            if not excerpt.strip() and not linked_cues:
+                continue
+            mappings.append(
+                SegmentTimelineMapping(
+                    mapping_id=f"map_{uuid.uuid4().hex[:8]}",
+                    source_segment_id=seg.segment_id,
+                    clip_id=c.clip_id,
+                    source_start_sec=round(ov_s, 3),
+                    source_end_sec=round(ov_e, 3),
+                    timeline_start_sec=tl_s,
+                    timeline_end_sec=tl_e,
+                    playback_speed=spd,
+                    language=seg.language,
+                    text_excerpt=excerpt[:160],
+                    cue_ids=linked_cues,
+                )
+            )
+    return mappings
+
+
+def _build_timeline_captions(
+    segments: list[TranscriptSegment],
+    clips: list[VideoClipNode],
+    max_words: int,
+    style_preset: str,
+) -> list[CaptionCue]:
+    """Map transcript segments onto timeline clips without dropping words in uniform segments."""
+    captions: list[CaptionCue] = []
+    # Iterate clips in final timeline order so reordered clips always yield chronological captions
+    for c in clips:
+        for seg in segments:
+            if min(c.source_end_sec, seg.end_sec) - max(c.source_start_sec, seg.start_sec) <= 0.12:
+                continue
+            ov_for_seg = [
+                (cc, max(cc.source_start_sec, seg.start_sec), min(cc.source_end_sec, seg.end_sec))
+                for cc in clips
+                if min(cc.source_end_sec, seg.end_sec) - max(cc.source_start_sec, seg.start_sec) > 0.12
+            ]
+            seg_use = seg
+            words = seg.words or []
+            if len(words) >= 2 and ov_for_seg:
+                active_dur = sum(oe - os for _, os, oe in ov_for_seg)
+                seg_dur = max(0.05, seg.end_sec - seg.start_sec)
+                continuous_synthetic = all(
+                    (words[idx_w + 1].start_sec - words[idx_w].end_sec) <= 0.08
+                    for idx_w in range(len(words) - 1)
+                )
+                covers_bounds = (ov_for_seg[0][1] - seg.start_sec) <= 3.8 and (seg.end_sec - ov_for_seg[-1][2]) <= 1.2
+                any_dropped = any(
+                    not any(os <= (w.start_sec + w.end_sec) / 2.0 <= oe for _, os, oe in ov_for_seg)
+                    for w in words
+                )
+                if continuous_synthetic and covers_bounds and any_dropped and active_dur >= seg_dur * 0.25:
+                    cum_spans: list[tuple[float, float, float, float]] = []
+                    acc = 0.0
+                    for _, os, oe in ov_for_seg:
+                        dur = max(0.01, oe - os)
+                        cum_spans.append((acc, acc + dur, os, oe))
+                        acc += dur
+                    weights = [max(2.0, float(len(w.word)) + 1.0) for w in words]
+                    total_w = sum(weights) or float(len(words))
+                    adjusted_words = []
+                    w_acc = 0.0
+                    for w, weight in zip(words, weights):
+                        a0 = (w_acc / total_w) * acc
+                        w_acc += weight
+                        a1 = (w_acc / total_w) * acc
+                        mid = (a0 + a1) * 0.5
+                        s0, s1, os, oe = next(
+                            (sp for sp in cum_spans if sp[0] <= mid <= sp[1]),
+                            cum_spans[-1],
+                        )
+                        span_w = max(0.01, s1 - s0)
+                        f0 = max(0.0, min(1.0, (a0 - s0) / span_w))
+                        f1 = max(f0 + 0.02, min(1.0, (a1 - s0) / span_w))
+                        ws = round(os + f0 * (oe - os), 3)
+                        we = round(min(oe, max(ws + 0.04, os + f1 * (oe - os))), 3)
+                        adjusted_words.append(w.model_copy(update={"start_sec": ws, "end_sec": we}))
+                    seg_use = seg.model_copy(update={"words": adjusted_words})
+
+            captions.extend(
+                _split_segment_into_short_cues(
+                    seg=seg_use,
+                    clip_src_start=c.source_start_sec,
+                    clip_src_end=c.source_end_sec,
+                    clip_tl_start=c.timeline_start_sec,
+                    speed=c.playback_speed,
+                    max_words=max_words,
+                    style_preset=style_preset,
+                    clip_id=c.clip_id,
+                )
+            )
+    return captions
+
+
 def _split_beat_around_silences(
     src_start: float,
     src_end: float,
@@ -137,13 +328,14 @@ def _split_beat_around_silences(
     if not tight_cuts or (src_end - src_start) <= 2.4:
         return [(src_start, src_end)]
 
-    pad = 0.10
+    offset_pad = 0.20
+    onset_pad = 0.28
     raw_dead: list[tuple[float, float]] = []
     for sil in silences:
         if sil.duration_sec < min_gap_sec:
             continue
-        ds = max(src_start, sil.start_sec + pad)
-        de = min(src_end, sil.end_sec - pad)
+        ds = max(src_start, sil.start_sec + offset_pad)
+        de = min(src_end, sil.end_sec - onset_pad)
         if de - ds >= 0.16:
             raw_dead.append((ds, de))
 
@@ -153,8 +345,8 @@ def _split_beat_around_silences(
         key=lambda s: s.start_sec,
     )
     for idx_s in range(len(seg_sorted) - 1):
-        g0 = seg_sorted[idx_s].end_sec + pad
-        g1 = seg_sorted[idx_s + 1].start_sec - pad
+        g0 = seg_sorted[idx_s].end_sec + offset_pad
+        g1 = seg_sorted[idx_s + 1].start_sec - onset_pad
         if g1 - g0 >= max(0.32, min_gap_sec):
             ds = max(src_start, g0)
             de = min(src_end, g1)
@@ -224,31 +416,128 @@ def _is_meme_overlay(anim: AnimationRenderResult) -> bool:
     return False
 
 
+def _face_boxes_for_window(
+    analysis: MediaAnalysisBundle,
+    src_start: float,
+    src_end: float,
+) -> list[tuple[float, float, float, float]]:
+    """Collect normalized face/head/cap-brim boxes active within a clip window."""
+    boxes: list[tuple[float, float, float, float]] = []
+    for sample in analysis.visual_samples:
+        if sample.time_sec < src_start - 0.5 or sample.time_sec > src_end + 0.5:
+            continue
+        for f in sample.faces:
+            # Expand slightly upward to protect hat/cap brim & forehead headroom
+            x0 = max(0.0, f.x_norm - 0.02)
+            y0 = max(0.0, f.y_norm - 0.07)
+            x1 = min(1.0, f.x_norm + f.w_norm + 0.02)
+            y1 = min(1.0, f.y_norm + f.h_norm + 0.02)
+            boxes.append((x0, y0, x1, y1))
+    return boxes
+
+
+def _box_overlap_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ix0 = max(a[0], b[0])
+    iy0 = max(a[1], b[1])
+    ix1 = min(a[2], b[2])
+    iy1 = min(a[3], b[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0)
+
+
+def _is_meme_visual_acceptable(anim: AnimationRenderResult) -> bool:
+    """Reject broken/tiny assets and narrow vertical portrait text strips in video overlay slots."""
+    if anim.adapter_used != "meme_cutaway":
+        return True
+    w, h = int(anim.width or 0), int(anim.height or 0)
+    if w > 0 and h > 0:
+        if min(w, h) < 200:
+            return False
+        if h > w * 1.45 and w < 500:
+            return False
+    return True
+
+
+def _anim_beat_metadata(anim: AnimationRenderResult) -> tuple[float | None, float | None]:
+    """Read target source beat bounds attached in SceneSpec.parameters, if present."""
+    sp = Path(anim.scene_spec_path) if anim.scene_spec_path else None
+    if sp is None or not sp.is_file():
+        return None, None
+    try:
+        raw = json.loads(sp.read_text(encoding="utf-8"))
+        params = raw.get("parameters") or {}
+        bs = params.get("beat_source_start")
+        be = params.get("beat_source_end")
+        if bs is not None and be is not None:
+            return float(bs), float(be)
+    except Exception:
+        pass
+    return None, None
+
+
+def _pick_non_occluding_rect(
+    candidates: list[tuple[float, float, float, float, str]],
+    face_boxes: list[tuple[float, float, float, float]] | None,
+    prefer_left: bool,
+) -> tuple[float, float, float, float, str]:
+    if not face_boxes:
+        return candidates[0] if prefer_left else candidates[-1]
+    best = candidates[0]
+    best_pen = float("inf")
+    for idx, (cx, cy, cw, ch, mode) in enumerate(candidates):
+        rect = (cx, cy, cx + cw, cy + ch)
+        overlap = sum(_box_overlap_area(rect, fb) for fb in face_boxes)
+        tie_bias = 0.0 if ((prefer_left and idx == 0) or (not prefer_left and idx == len(candidates) - 1)) else 0.0005
+        pen = overlap + tie_bias
+        if pen < best_pen:
+            best_pen = pen
+            best = (cx, cy, cw, ch, mode)
+    return best
+
+
 def _overlay_placement(
     is_vertical: bool,
     crop_x: float,
     is_meme: bool,
     slot_idx: int = 0,
     is_direct_meme_asset: bool = False,
+    anim: AnimationRenderResult | None = None,
+    face_boxes: list[tuple[float, float, float, float]] | None = None,
 ) -> tuple[float, float, float, float, str]:
     if is_meme and (is_direct_meme_asset or is_vertical):
-        # Full-frame blurred-backdrop reaction cutaway on Shorts (never covers face!) or alternating YouTube slots
-        if is_vertical or slot_idx % 2 == 0:
+        tall_strip = bool(anim and anim.width > 0 and anim.height > anim.width * 1.45 and anim.width < 500)
+        # Full-frame blurred-backdrop reaction cutaway on Shorts or alternating YouTube slots
+        if (is_vertical or slot_idx % 2 == 0) and not tall_strip:
             return 0.0, 0.0, 1.0, 1.0, "cutaway_blur_fill"
-        if crop_x > 0.55:
-            return 0.025, 0.04, 0.22, 0.29, "corner_sticker_clean"
-        return 0.75, 0.04, 0.22, 0.29, "corner_sticker_clean"
+        # Pick the upper/mid corner with lowest face+cap occlusion
+        corner_cands = [
+            (0.025, 0.04, 0.22, 0.28, "corner_sticker_clean"),
+            (0.75, 0.04, 0.22, 0.28, "corner_sticker_clean"),
+            (0.025, 0.27, 0.21, 0.27, "corner_sticker_clean"),
+            (0.76, 0.27, 0.21, 0.27, "corner_sticker_clean"),
+        ]
+        # Keep index 0=left, last=right for default deterministic parity when no face boxes
+        return _pick_non_occluding_rect(
+            [corner_cands[0], corner_cands[2], corner_cands[3], corner_cands[1]],
+            face_boxes,
+            prefer_left=crop_x > 0.55,
+        )
     if is_vertical:
         if is_meme:
             return 0.0, 0.0, 1.0, 1.0, "cutaway_blur_fill"
         return 0.04, 0.055, 0.92, 0.34, "upper_stage_split"
-    if crop_x > 0.55:
-        if is_meme:
-            return 0.03, 0.05, 0.31, 0.40, "pip_top_left"
-        return 0.03, 0.06, 0.44, 0.54, "pip_top_left"
     if is_meme:
-        return 0.66, 0.05, 0.31, 0.40, "pip_top_right"
-    return 0.49, 0.07, 0.48, 0.58, "pip_top_right"
+        pip_cands = [
+            (0.03, 0.05, 0.30, 0.38, "pip_top_left"),
+            (0.67, 0.05, 0.30, 0.38, "pip_top_right"),
+        ]
+        return _pick_non_occluding_rect(pip_cands, face_boxes, prefer_left=crop_x > 0.55)
+    pip_std = [
+        (0.03, 0.06, 0.44, 0.54, "pip_top_left"),
+        (0.49, 0.07, 0.48, 0.58, "pip_top_right"),
+    ]
+    return _pick_non_occluding_rect(pip_std, face_boxes, prefer_left=crop_x > 0.55)
 
 
 def build_timeline_from_storyboard(
@@ -369,19 +658,6 @@ def build_timeline_from_storyboard(
             )
             clips.append(clip)
 
-            # Map verbatim captions inside trimmed sub-clip onto output timeline
-            for seg in analysis.transcript.segments:
-                captions.extend(
-                    _split_segment_into_short_cues(
-                        seg=seg,
-                        clip_src_start=sub_s,
-                        clip_src_end=sub_e,
-                        clip_tl_start=tl_start,
-                        speed=spd,
-                        max_words=3 if (is_vertical and is_zoomer) else (4 if is_vertical or is_zoomer else 6),
-                        style_preset=style.caption_preset,
-                    )
-                )
 
             if subclip_counter == 0 and ("vine_boom" in sfx_map or "sub_impact" in sfx_map):
                 hook_sfx = sfx_map["vine_boom"] if is_zoomer and "vine_boom" in sfx_map else sfx_map.get("sub_impact", sfx_map.get("vine_boom"))
@@ -399,24 +675,32 @@ def build_timeline_from_storyboard(
             cur_t = tl_end
             subclip_counter += 1
 
-    # Place original animation(s) / meme pop-ups onto distinct clips with safe non-overlapping pacing
-    if anim_pool and clips:
-        multi_mode = len(anim_pool) > 1 or tight_cuts
+    # Place original animation(s) / meme pop-ups onto their matched beat clips (or clean evenly-spaced slots)
+    usable_anims = [a for a in anim_pool if _is_meme_visual_acceptable(a)]
+    if usable_anims and clips:
+        multi_mode = len(usable_anims) > 1 or tight_cuts
         if not multi_mode:
             target_idx = next(
                 (i for i, b in enumerate(storyboard.beats) if b.animation_template is not None),
                 min(1, len(clips) - 1),
             )
             target_clip = clips[min(target_idx, len(clips) - 1)]
-            anim = anim_pool[0]
+            anim = usable_anims[0]
             dur_c = target_clip.timeline_end_sec - target_clip.timeline_start_sec
             ov_start = round(target_clip.timeline_start_sec + 0.25, 3)
             ov_end = round(min(target_clip.timeline_end_sec - 0.1, ov_start + min(max(2.0, dur_c - 0.3), anim.duration_sec)), 3)
             if ov_end > ov_start + 0.8:
                 is_meme = _is_meme_overlay(anim)
                 is_direct = anim.adapter_used == "meme_cutaway" or anim.output_path.lower().endswith((".mp4", ".gif", ".png", ".jpg", ".webp"))
+                faces = _face_boxes_for_window(analysis, target_clip.source_start_sec, target_clip.source_end_sec)
                 ox, oy, ow, oh, omode = _overlay_placement(
-                    is_vertical, target_clip.crop_center_x, is_meme, slot_idx=0, is_direct_meme_asset=is_direct
+                    is_vertical,
+                    target_clip.crop_center_x,
+                    is_meme,
+                    slot_idx=0,
+                    is_direct_meme_asset=is_direct,
+                    anim=anim,
+                    face_boxes=faces,
                 )
                 overlays.append(
                     OverlayNode(
@@ -431,7 +715,7 @@ def build_timeline_from_storyboard(
                         y_norm=oy,
                         w_norm=ow,
                         h_norm=oh,
-                        label=f"Meme Cutaway #1" if is_meme else f"Original Animation ({anim.adapter_used})",
+                        label="Meme Cutaway #1" if is_meme else f"Original Animation ({anim.adapter_used})",
                     )
                 )
                 sfx_key = "vine_boom" if is_meme and "vine_boom" in sfx_map else (
@@ -450,7 +734,7 @@ def build_timeline_from_storyboard(
                     )
         else:
             total_tl = max(1.0, cur_t)
-            n_items = min(4, len(anim_pool))
+            n_items = min(4, len(usable_anims))
             if n_items >= 4:
                 fracs = [0.08, 0.33, 0.58, 0.82]
             elif n_items == 3:
@@ -460,13 +744,39 @@ def build_timeline_from_storyboard(
             else:
                 fracs = [0.18]
             last_ov_end = -4.0
-            for a_i, anim in enumerate(anim_pool[:4]):
-                target_t = total_tl * fracs[a_i]
+            for a_i, anim in enumerate(usable_anims[:4]):
+                b_src_s, b_src_e = _anim_beat_metadata(anim)
+                matched_clip: VideoClipNode | None = None
+                if b_src_s is not None and b_src_e is not None:
+                    best_ov = 0.0
+                    for c in clips:
+                        ov_sec = max(0.0, min(c.source_end_sec, b_src_e) - max(c.source_start_sec, b_src_s))
+                        if ov_sec > best_ov:
+                            best_ov = ov_sec
+                            matched_clip = c
+                    if best_ov < 0.3:
+                        matched_clip = None
+
+                if matched_clip is not None:
+                    host_clip = matched_clip
+                    target_t = host_clip.timeline_start_sec + min(
+                        1.0, max(0.25, (host_clip.timeline_end_sec - host_clip.timeline_start_sec) * 0.25)
+                    )
+                else:
+                    target_t = total_tl * fracs[a_i]
+                    host_clip = next((c for c in clips if c.timeline_start_sec <= target_t <= c.timeline_end_sec), clips[-1])
+
                 is_meme = _is_meme_overlay(anim) or is_zoomer
                 is_direct = anim.adapter_used == "meme_cutaway" or anim.output_path.lower().endswith((".mp4", ".gif", ".png", ".jpg", ".webp"))
-                host_clip = next((c for c in clips if c.timeline_start_sec <= target_t <= c.timeline_end_sec), clips[-1])
+                faces = _face_boxes_for_window(analysis, host_clip.source_start_sec, host_clip.source_end_sec)
                 ox, oy, ow, oh, omode = _overlay_placement(
-                    is_vertical, host_clip.crop_center_x, is_meme, slot_idx=a_i, is_direct_meme_asset=is_direct
+                    is_vertical,
+                    host_clip.crop_center_x,
+                    is_meme,
+                    slot_idx=a_i,
+                    is_direct_meme_asset=is_direct,
+                    anim=anim,
+                    face_boxes=faces,
                 )
                 # Keep full-screen meme cutaways snappy (1.55-1.85s) so pacing pops; corner stickers up to 2.6s
                 desired_dur = 1.75 if omode == "cutaway_blur_fill" else min(2.7, max(1.6, anim.duration_sec))
@@ -522,7 +832,7 @@ def build_timeline_from_storyboard(
             )
         )
 
-    # Platform-specific safe caption settings
+    # Platform-specific safe caption settings (keep concise 2-3 word natural bursts)
     cap_settings = CaptionSettings(
         enabled=True,
         font_name="Verdana" if is_zoomer else "Helvetica Neue",
@@ -531,8 +841,16 @@ def build_timeline_from_storyboard(
         safe_margin_bottom_px=290 if platform_format == TargetPlatformFormat.TIKTOK else (270 if is_vertical else 92),
         safe_margin_top_px=120 if is_vertical else 50,
         highlight_active_word=True,
-        max_words_per_line=3 if (is_vertical and is_zoomer) else (4 if is_vertical or is_zoomer else 6),
+        max_words_per_line=3,
     )
+    captions = _build_timeline_captions(
+        analysis.transcript.segments,
+        clips,
+        max_words=cap_settings.max_words_per_line,
+        style_preset=style.caption_preset,
+    )
+    captions = sorted(captions, key=lambda c: (c.start_sec, c.end_sec))
+    segment_mappings = _build_segment_mappings(analysis.transcript.segments, clips, captions)
 
     tl = RenderTimeline(
         timeline_id=f"tl_{uuid.uuid4().hex[:8]}",
@@ -547,7 +865,8 @@ def build_timeline_from_storyboard(
         clips=clips,
         overlays=overlays,
         audio_events=audio_events,
-        captions=sorted(captions, key=lambda c: c.start_sec),
+        captions=captions,
+        segment_mappings=segment_mappings,
         caption_settings=cap_settings,
         edit_notes=[
             f"Built from Storyboard {storyboard.storyboard_id} using '{style.display_name}' profile.",
@@ -699,13 +1018,121 @@ def build_vertical_short_timelines(
         key=lambda h: (h.scores.audience_curiosity + h.scores.context_dependency + h.scores.visual_opportunity),
         reverse=True,
     )
-    chosen = ranked[:max_variants] if ranked else []
-
-    # If video is longer than ~45s and fewer than max_variants distinct highlights exist, partition clean non-overlapping slices
     total_dur = float(analysis.probe.duration_sec or 0.0)
-    if len(chosen) < max_variants and total_dur >= 24.0:
-        from symposium_studio.models.media import HighlightProposal, HighlightScoreBreakdown
+    chosen: list[HighlightProposal] = []
+    used_spans: list[tuple[float, float]] = []
 
+    def _is_distinct_window(cand_s: float, cand_e: float) -> bool:
+        for us, ue in used_spans:
+            if abs(cand_s - us) < 3.5:
+                return False
+            if _overlap_ratio(cand_s, cand_e, us, ue) >= 0.45:
+                return False
+        return True
+
+    def _snapped_highlight(
+        hl: HighlightProposal,
+        max_len: float = 42.0,
+        max_ext: float = 7.0,
+    ) -> HighlightProposal:
+        s0 = max(0.0, hl.start_sec)
+        raw_end = min(total_dur if total_dur > 0 else hl.end_sec, s0 + max_len)
+        e_target = min(raw_end, max(hl.end_sec, s0 + 14.0))
+        ns, ne, closure = snap_ending_boundary(analysis, s0, e_target, max_extend_sec=max_ext)
+        if total_dur > 0:
+            ne = min(total_dur, min(s0 + 46.0, max(ne, hl.end_sec)))
+        hl_copy = hl.model_copy(deep=True)
+        hl_copy.start_sec = round(ns, 3)
+        hl_copy.end_sec = round(max(ns + 4.0, ne), 3)
+        hl_copy.duration_sec = round(hl_copy.end_sec - hl_copy.start_sec, 2)
+        if not closure.get("closure_ok", True):
+            hl_copy.rationale = (
+                f"{hl_copy.rationale} [closure: {closure.get('closure_type')}]".strip()
+            )
+        return hl_copy
+
+    # 1. Variant 0 -> Editorial Hook Director choice (strongest self-contained opening)
+    if analysis.transcript.segments and max_variants >= 1:
+        best_hook = select_best_hook(analysis)
+        h_s = float(best_hook["start_sec"])
+        h_e = float(best_hook["end_sec"])
+        matched_hl = next(
+            (
+                h
+                for h in ranked
+                if h.highlight_id == best_hook.get("highlight_id")
+                or _overlap_ratio(h.start_sec, h.end_sec, h_s, h_e) >= 0.6
+            ),
+            None,
+        )
+        if matched_hl is not None:
+            cand_hl = matched_hl.model_copy(deep=True)
+            cand_hl.start_sec = round(h_s, 3)
+            cand_hl.end_sec = round(max(h_e, matched_hl.end_sec), 3)
+        else:
+            cand_hl = HighlightProposal(
+                highlight_id=str(best_hook.get("highlight_id") or "hl_hook_00"),
+                start_sec=round(h_s, 3),
+                end_sec=round(min(total_dur if total_dur > 0 else h_e, max(h_e, h_s + 16.0)), 3),
+                duration_sec=round(max(4.0, h_e - h_s), 2),
+                role="hook",
+                title="Opening Hook",
+                transcript_excerpt=str(best_hook.get("excerpt") or ""),
+                scores=HighlightScoreBreakdown(
+                    information_density=0.78,
+                    novelty=0.80,
+                    story_relevance=0.90,
+                    audience_curiosity=0.85,
+                    educational_value=0.72,
+                    emotional_intensity=0.70,
+                    visual_opportunity=0.75,
+                    context_dependency=0.92,
+                    composite_score=0.82,
+                ),
+            )
+        snapped_hook = _snapped_highlight(cand_hl, max_len=32.0, max_ext=8.0)
+        chosen.append(snapped_hook)
+        used_spans.append((snapped_hook.start_sec, snapped_hook.end_sec))
+
+    # 2. Reserve Closing Payoff variant for final slot when max_variants >= 3
+    payoff_hl: HighlightProposal | None = None
+    if max_variants >= 3 and analysis.transcript.segments:
+        payoff_hl = select_closing_payoff(analysis, used_spans)
+        if payoff_hl is not None and _is_distinct_window(payoff_hl.start_sec, payoff_hl.end_sec):
+            payoff_hl = _snapped_highlight(payoff_hl, max_len=36.0, max_ext=8.0)
+            used_spans.append((payoff_hl.start_sec, payoff_hl.end_sec))
+        else:
+            payoff_hl = None
+
+    # 3. Fill remaining middle slot(s) from non-overlapping top highlights
+    needed_middle = max(0, max_variants - len(chosen) - (1 if payoff_hl is not None else 0))
+    for h in ranked:
+        if len([c for c in chosen]) >= max_variants - (1 if payoff_hl is not None else 0):
+            break
+        if needed_middle <= 0:
+            break
+        if _is_distinct_window(h.start_sec, h.end_sec):
+            snapped = _snapped_highlight(h, max_len=38.0, max_ext=6.0)
+            if _is_distinct_window(snapped.start_sec, snapped.end_sec):
+                chosen.append(snapped)
+                used_spans.append((snapped.start_sec, snapped.end_sec))
+                needed_middle -= 1
+
+    if payoff_hl is not None:
+        chosen.append(payoff_hl)
+
+    # Relaxed fill from remaining highlights if strict non-overlap left fewer than max_variants
+    if len(chosen) < max_variants:
+        existing_starts = [round(c.start_sec, 1) for c in chosen]
+        for h in ranked:
+            if len(chosen) >= max_variants:
+                break
+            if all(abs(round(h.start_sec, 1) - es) >= 2.0 for es in existing_starts):
+                chosen.append(_snapped_highlight(h, max_len=36.0, max_ext=5.0))
+                existing_starts.append(round(h.start_sec, 1))
+
+    # If video is longer than ~24s and fewer than max_variants distinct highlights exist, partition clean non-overlapping slices
+    if len(chosen) < max_variants and total_dur >= 24.0:
         seg_len = min(35.0, max(12.0, total_dur / max_variants))
         existing_starts = [round(h.start_sec, 1) for h in chosen]
         for slot in range(max_variants):
@@ -715,28 +1142,27 @@ def build_vertical_short_timelines(
             en = round(min(total_dur, st + seg_len), 2)
             if any(abs(st - es) < 4.0 for es in existing_starts) or en - st < 8.0:
                 continue
-            chosen.append(
-                HighlightProposal(
-                    highlight_id=f"hl_slice_{slot}",
-                    start_sec=st,
-                    end_sec=en,
-                    duration_sec=round(en - st, 2),
-                    role="payoff" if slot == max_variants - 1 else "short_candidate",
-                    title=f"Short Segment {slot + 1}",
-                    transcript_excerpt="",
-                    scores=HighlightScoreBreakdown(
-                        information_density=0.75,
-                        novelty=0.72,
-                        story_relevance=0.78,
-                        audience_curiosity=0.72,
-                        educational_value=0.78,
-                        emotional_intensity=0.65,
-                        visual_opportunity=0.75,
-                        context_dependency=0.78,
-                        composite_score=0.75,
-                    ),
-                )
+            slice_hl = HighlightProposal(
+                highlight_id=f"hl_slice_{slot}",
+                start_sec=st,
+                end_sec=en,
+                duration_sec=round(en - st, 2),
+                role="payoff" if slot == max_variants - 1 else "short_candidate",
+                title=f"Short Segment {slot + 1}",
+                transcript_excerpt="",
+                scores=HighlightScoreBreakdown(
+                    information_density=0.75,
+                    novelty=0.72,
+                    story_relevance=0.78,
+                    audience_curiosity=0.72,
+                    educational_value=0.78,
+                    emotional_intensity=0.65,
+                    visual_opportunity=0.75,
+                    context_dependency=0.78,
+                    composite_score=0.75,
+                ),
             )
+            chosen.append(_snapped_highlight(slice_hl, max_len=36.0, max_ext=6.0))
             existing_starts.append(round(st, 1))
 
     role_labels = ["Hook Cut", "Mechanism Breakdown", "Payoff & Takeaway"]
@@ -793,7 +1219,7 @@ def build_vertical_short_timelines(
             platform_format=platform_format,
             sfx_paths=sfx_paths,
         )
-        # If tight silence cuts shrank a vertical Short under ~12s on a longer source video, expand its window naturally
+        # If tight silence cuts shrank a vertical Short under ~12s on a longer source video, expand and re-snap cleanly
         tl_dur = tl.clips[-1].timeline_end_sec if tl.clips else 0.0
         if tl_dur < 12.0 and total_dur >= 18.0:
             cur_span = max(1.0, sb.beats[0].source_end_sec - sb.beats[0].source_start_sec)
@@ -802,9 +1228,10 @@ def build_vertical_short_timelines(
             exp_end = min(total_dur, exp_start + ext_span)
             if exp_end - exp_start < ext_span:
                 exp_start = max(0.0, exp_end - ext_span)
+            exp_start, exp_end, _ = snap_ending_boundary(analysis, exp_start, exp_end, max_extend_sec=6.0)
             sb.beats[0].source_start_sec = round(exp_start, 3)
-            sb.beats[0].source_end_sec = round(exp_end, 3)
-            sb.beats[0].target_duration_sec = round(min(42.0, max(14.0, (exp_end - exp_start) * 0.65)), 2)
+            sb.beats[0].source_end_sec = round(min(total_dur, exp_end), 3)
+            sb.beats[0].target_duration_sec = round(min(42.0, max(14.0, (sb.beats[0].source_end_sec - sb.beats[0].source_start_sec) * 0.65)), 2)
             sb.target_duration_sec = sb.beats[0].target_duration_sec
             tl = build_timeline_from_storyboard(
                 project_id=project_id,
@@ -907,6 +1334,226 @@ def export_otio(timeline: RenderTimeline, out_path: Path) -> Path:
     return out_path
 
 
+def _find_clip_for_time(t: float, clips: list[VideoClipNode]) -> VideoClipNode | None:
+    for c in clips:
+        if c.timeline_start_sec - 0.05 <= t <= c.timeline_end_sec + 0.05:
+            return c
+    if not clips:
+        return None
+    return min(clips, key=lambda c: min(abs(t - c.timeline_start_sec), abs(t - c.timeline_end_sec)))
+
+
+def remap_edited_timeline(
+    timeline: RenderTimeline,
+    previous_clips: list[VideoClipNode] | None = None,
+) -> RenderTimeline:
+    """Recompute output timeline bounds, captions, words, overlays, SFX, and segment_mappings after clip edits.
+
+    Never reuses stale/unadjusted source or pre-edit output timestamps after cutting, trimming,
+    speed changes, or reordering clips.
+    """
+    tl = timeline.model_copy(deep=True)
+    ref_clips = [c.model_copy(deep=True) for c in (previous_clips if previous_clips is not None else tl.clips)]
+    old_by_id = {c.clip_id: c for c in ref_clips}
+
+    # 1. Recompute contiguous output positions from current clip order & source bounds
+    cur = 0.0
+    for clip in tl.clips:
+        spd = max(0.25, float(clip.playback_speed))
+        clip.timeline_start_sec = round(cur, 3)
+        dur = round(max(0.08, (float(clip.source_end_sec) - float(clip.source_start_sec)) / spd), 3)
+        clip.timeline_end_sec = round(cur + dur, 3)
+        cur += dur
+    new_by_id = {c.clip_id: c for c in tl.clips}
+
+    def _map_old_time(t: float, host_old: VideoClipNode | None) -> float:
+        if host_old is None:
+            return float(t)
+        host_new = new_by_id.get(host_old.clip_id)
+        if host_new is None:
+            return float(t)
+        old_dur = max(0.05, float(host_old.timeline_end_sec) - float(host_old.timeline_start_sec))
+        new_dur = max(0.05, float(host_new.timeline_end_sec) - float(host_new.timeline_start_sec))
+        # Use exact source mapping if speed changed or head trimmed cleanly
+        src_trim_shift = (float(host_new.source_start_sec) - float(host_old.source_start_sec)) / max(0.25, float(host_new.playback_speed))
+        src_pos = float(host_old.source_start_sec) + max(0.0, float(t) - float(host_old.timeline_start_sec)) * float(host_old.playback_speed)
+        if abs(src_trim_shift) > 0.01:
+            rel_s = max(0.0, min(new_dur, (src_pos - float(host_new.source_start_sec)) / max(0.25, float(host_new.playback_speed))))
+            return float(host_new.timeline_start_sec) + rel_s
+        ratio = new_dur / old_dur
+        return float(host_new.timeline_start_sec) + max(0.0, min(old_dur, float(t) - float(host_old.timeline_start_sec))) * ratio
+
+    # 2. Remap all captions & word timestamps directly from surviving edited clips
+    remapped_caps: list[CaptionCue] = []
+    for cap in tl.captions:
+        host_new = new_by_id.get(cap.clip_id or "")
+        host_old = old_by_id.get(cap.clip_id or "")
+        if host_new is None and host_old is None and ref_clips:
+            host_old = _find_clip_for_time(0.5 * (cap.start_sec + cap.end_sec), ref_clips)
+            if host_old is not None:
+                host_new = new_by_id.get(host_old.clip_id)
+        if host_new is None:
+            continue
+
+        spd = max(0.25, float(host_new.playback_speed))
+        if cap.source_start_sec is not None and cap.source_end_sec is not None:
+            # Anchor strictly to source-relative intervals clipped to edited host clip
+            c_src_s = float(cap.source_start_sec)
+            c_src_e = float(cap.source_end_sec)
+            if c_src_e <= host_new.source_start_sec + 0.04 or c_src_s >= host_new.source_end_sec - 0.04:
+                continue
+            ov_s = max(float(host_new.source_start_sec), c_src_s)
+            ov_e = min(float(host_new.source_end_sec), c_src_e)
+            if ov_e - ov_s < 0.08:
+                continue
+
+            new_words: list[dict[str, Any]] = []
+            for w in cap.words:
+                if "source_start_sec" in w and "source_end_sec" in w:
+                    ws0 = float(w["source_start_sec"])
+                    we0 = float(w["source_end_sec"])
+                    w_mid = 0.5 * (ws0 + we0)
+                    ov_w = min(we0, float(host_new.source_end_sec)) - max(ws0, float(host_new.source_start_sec))
+                    if not (host_new.source_start_sec <= w_mid <= host_new.source_end_sec or ov_w >= 0.45 * max(0.04, we0 - ws0)):
+                        continue
+                    ws_cl = max(float(host_new.source_start_sec), ws0)
+                    we_cl = min(float(host_new.source_end_sec), max(ws_cl + 0.02, we0))
+                    tl_ws = round(host_new.timeline_start_sec + (ws_cl - host_new.source_start_sec) / spd, 3)
+                    tl_we = round(max(tl_ws + 0.04, host_new.timeline_start_sec + (we_cl - host_new.source_start_sec) / spd), 3)
+                else:
+                    tl_ws = round(_map_old_time(float(w.get("start_sec", cap.start_sec)), host_old), 3)
+                    tl_we = round(max(tl_ws + 0.04, _map_old_time(float(w.get("end_sec", cap.end_sec)), host_old)), 3)
+                wd = dict(w)
+                wd["start_sec"] = tl_ws
+                wd["end_sec"] = tl_we
+                new_words.append(wd)
+
+            if cap.words and not new_words:
+                continue
+            new_cap = cap.model_copy(deep=True)
+            new_cap.clip_id = host_new.clip_id
+            new_cap.source_start_sec = round(ov_s, 3)
+            new_cap.source_end_sec = round(ov_e, 3)
+            if new_words:
+                new_cap.words = new_words
+                new_cap.text = " ".join(str(w["word"]) for w in new_words)
+                new_cap.start_sec = float(new_words[0]["start_sec"])
+                new_cap.end_sec = round(max(new_cap.start_sec + 0.12, float(new_words[-1]["end_sec"])), 3)
+            else:
+                new_cap.start_sec = round(host_new.timeline_start_sec + (ov_s - host_new.source_start_sec) / spd, 3)
+                new_cap.end_sec = round(max(new_cap.start_sec + 0.14, host_new.timeline_start_sec + (ov_e - host_new.source_start_sec) / spd), 3)
+            new_cap.aligned_to_final_audio = False
+            remapped_caps.append(new_cap)
+        else:
+            # Proportionally remap legacy/manual cues + their word dicts
+            ns = round(_map_old_time(cap.start_sec, host_old), 3)
+            ne = round(max(ns + 0.14, _map_old_time(cap.end_sec, host_old)), 3)
+            new_words = []
+            first_ws = float(cap.words[0].get("start_sec", 0.0)) if cap.words else 0.0
+            last_we = float(cap.words[-1].get("end_sec", 0.0)) if cap.words else 0.0
+            is_rel = cap.words and cap.start_sec > 0.35 and first_ws < 0.20 and last_we <= (cap.end_sec - cap.start_sec) + 0.20
+            scale = (ne - ns) / max(1e-4, cap.end_sec - cap.start_sec)
+            for w in cap.words:
+                wd = dict(w)
+                if is_rel:
+                    ws = round(float(w.get("start_sec", 0.0)) * scale, 3)
+                    we = round(max(ws + 0.04, float(w.get("end_sec", 0.1)) * scale), 3)
+                else:
+                    ws = round(_map_old_time(float(w.get("start_sec", cap.start_sec)), host_old), 3)
+                    we = round(max(ws + 0.04, _map_old_time(float(w.get("end_sec", cap.end_sec)), host_old)), 3)
+                wd["start_sec"] = ws
+                wd["end_sec"] = we
+                new_words.append(wd)
+            new_cap = cap.model_copy(deep=True)
+            new_cap.clip_id = host_new.clip_id
+            new_cap.start_sec = ns
+            new_cap.end_sec = ne
+            new_cap.words = new_words
+            new_cap.aligned_to_final_audio = False
+            remapped_caps.append(new_cap)
+
+    remapped_caps.sort(key=lambda c: (c.start_sec, c.end_sec))
+    tl.captions = remapped_caps
+
+    # 3. Remap overlays and audio events proportionally onto moved/edited clips
+    total_dur = max(0.2, tl.total_duration_sec)
+    if ref_clips:
+        kept_overlays: list[OverlayNode] = []
+        for ov in tl.overlays:
+            host_old = _find_clip_for_time(0.5 * (ov.timeline_start_sec + ov.timeline_end_sec), ref_clips)
+            if host_old is not None and host_old.clip_id in new_by_id:
+                ov_dur = max(0.35, ov.timeline_end_sec - ov.timeline_start_sec)
+                host_new = new_by_id[host_old.clip_id]
+                ns = round(max(0.0, min(total_dur - 0.35, _map_old_time(ov.timeline_start_sec, host_old))), 3)
+                ne = round(min(host_new.timeline_end_sec + 0.5, total_dur, ns + ov_dur), 3)
+                if ne > ns + 0.25:
+                    ov2 = ov.model_copy(deep=True)
+                    ov2.timeline_start_sec = ns
+                    ov2.timeline_end_sec = ne
+                    kept_overlays.append(ov2)
+        tl.overlays = kept_overlays
+
+        kept_audio: list[AudioNode] = []
+        for au in tl.audio_events:
+            if au.role == "music":
+                au2 = au.model_copy(deep=True)
+                au2.duration_sec = round(total_dur, 3)
+                kept_audio.append(au2)
+            else:
+                host_old = _find_clip_for_time(au.timeline_start_sec, ref_clips)
+                if host_old is not None and host_old.clip_id in new_by_id:
+                    au2 = au.model_copy(deep=True)
+                    au2.timeline_start_sec = round(max(0.0, min(total_dur - 0.05, _map_old_time(au.timeline_start_sec, host_old))), 3)
+                    kept_audio.append(au2)
+        tl.audio_events = kept_audio
+
+    # 4. Rebuild / remap explicit segment_mappings cleanly
+    new_mappings: list[SegmentTimelineMapping] = []
+    for m in tl.segment_mappings:
+        host_new = new_by_id.get(m.clip_id)
+        if host_new is None:
+            continue
+        ov_s = max(float(host_new.source_start_sec), float(m.source_start_sec))
+        ov_e = min(float(host_new.source_end_sec), float(m.source_end_sec))
+        if ov_e - ov_s <= 0.12:
+            continue
+        spd = max(0.25, float(host_new.playback_speed))
+        tl_s = round(host_new.timeline_start_sec + (ov_s - host_new.source_start_sec) / spd, 3)
+        tl_e = round(host_new.timeline_start_sec + (ov_e - host_new.source_start_sec) / spd, 3)
+        linked_cues = [
+            c.cue_id
+            for c in tl.captions
+            if (c.clip_id == host_new.clip_id and c.source_segment_id == m.source_segment_id)
+            or (min(c.end_sec, tl_e) - max(c.start_sec, tl_s) > 0.05)
+        ]
+        m2 = m.model_copy(deep=True)
+        m2.source_start_sec = round(ov_s, 3)
+        m2.source_end_sec = round(ov_e, 3)
+        m2.timeline_start_sec = tl_s
+        m2.timeline_end_sec = tl_e
+        m2.playback_speed = spd
+        m2.cue_ids = linked_cues
+        new_mappings.append(m2)
+    # Keep mappings ordered cleanly by final timeline order
+    new_mappings.sort(key=lambda m: (m.timeline_start_sec, m.timeline_end_sec))
+    tl.segment_mappings = new_mappings
+    return tl
+
+
+def reorder_timeline_clips(
+    timeline: RenderTimeline,
+    ordered_clip_ids: list[str],
+) -> RenderTimeline:
+    """Reorder or subset clips cleanly while recomputing all output subtitle, overlay, and mapping positions."""
+    old_clips = [c.model_copy(deep=True) for c in timeline.clips]
+    clip_map = {c.clip_id: c.model_copy(deep=True) for c in timeline.clips}
+    new_clips = [clip_map[cid] for cid in ordered_clip_ids if cid in clip_map]
+    tl = timeline.model_copy(deep=True)
+    tl.revision += 1
+    tl.clips = new_clips
+    return remap_edited_timeline(tl, previous_clips=old_clips)
+
+
 def apply_iterative_edit(timeline: RenderTimeline, instruction: str) -> tuple[RenderTimeline, list[str]]:
     """Apply structured iterative agent/user editing instructions to a RenderTimeline."""
     low = instruction.lower()
@@ -923,12 +1570,20 @@ def apply_iterative_edit(timeline: RenderTimeline, instruction: str) -> tuple[Re
 
     if "opening" in low and ("engag" in low or "hook" in low or "punch" in low):
         if tl.clips:
+            old_clips = [c.model_copy(deep=True) for c in tl.clips]
             tl.clips[0].zoom_scale = round(min(1.18, tl.clips[0].zoom_scale + 0.07), 2)
             tl.clips[0].label = f"[Hook Boosted] {tl.clips[0].label}"
-            # Trim 0.35s leading slack if clip is long enough
+            # Trim 0.35s leading slack and propagate shift through captions, words, overlays & mappings
             if tl.clips[0].source_end_sec - tl.clips[0].source_start_sec > 4.0:
                 tl.clips[0].source_start_sec = round(tl.clips[0].source_start_sec + 0.35, 3)
-            changes.append("Boosted opening clip punch-in zoom and tightened leading slack for stronger 0-2s hook.")
+                tl = remap_edited_timeline(tl, previous_clips=old_clips)
+            changes.append("Boosted opening clip punch-in zoom, tightened leading slack, and resynced timeline captions.")
+
+    if ("reverse" in low or "reorder" in low) and "clip" in low and len(tl.clips) >= 2:
+        rev_ids = [c.clip_id for c in reversed(tl.clips)]
+        tl = reorder_timeline_clips(tl, rev_ids)
+        tl.revision -= 1  # Avoid double-increment inside apply_iterative_edit
+        changes.append("Reordered clips cleanly and recomputed output timestamps and mappings.")
 
     if "disable caption" in low or "remove caption" in low:
         tl.caption_settings.enabled = False
@@ -936,21 +1591,11 @@ def apply_iterative_edit(timeline: RenderTimeline, instruction: str) -> tuple[Re
 
     if "speed up" in low or "faster" in low or "1.1x" in low or "slow down" in low or "slower" in low:
         factor = 0.94 if ("slow down" in low or "slower" in low) else 1.12
-        cur = 0.0
+        old_clips = [c.model_copy(deep=True) for c in tl.clips]
         for clip in tl.clips:
-            old_dur = max(0.2, clip.timeline_end_sec - clip.timeline_start_sec)
             clip.playback_speed = round(max(0.75, min(1.5, clip.playback_speed * factor)), 3)
-            new_dur = round((clip.source_end_sec - clip.source_start_sec) / clip.playback_speed, 3)
-            old_start = clip.timeline_start_sec
-            clip.timeline_start_sec = round(cur, 3)
-            clip.timeline_end_sec = round(cur + new_dur, 3)
-            ratio = new_dur / old_dur
-            for cap in tl.captions:
-                if cap.start_sec >= old_start - 0.01 and cap.start_sec < old_start + old_dur + 0.01:
-                    cap.start_sec = round(cur + (cap.start_sec - old_start) * ratio, 3)
-                    cap.end_sec = round(max(cap.start_sec + 0.2, cur + (cap.end_sec - old_start) * ratio), 3)
-            cur += new_dur
-        changes.append(f"Adjusted clip playback speeds by {factor}x and rescaled caption sync timestamps.")
+        tl = remap_edited_timeline(tl, previous_clips=old_clips)
+        changes.append(f"Adjusted clip playback speeds by {factor}x and resynced captions, words, overlays, and mappings.")
 
     if "cross dissolve" in low or "dissolve" in low or "dip to black" in low or "dip black" in low:
         t_type = "dip_black" if "dip" in low else "cross_dissolve"

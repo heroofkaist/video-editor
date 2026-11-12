@@ -8,10 +8,16 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from symposium_studio.engines.analysis.transcribe import extract_raw_mono_wav
 from symposium_studio.engines.effects.library import EFFECTS_CATALOG
 from symposium_studio.engines.effects.sfx_synth import synthesize_ambient_bed, synthesize_sfx
 from symposium_studio.engines.effects.sound_downloader import DEFAULT_CLICK_SOUNDS, download_click_sounds
-from symposium_studio.engines.production.captions import write_ass, write_srt
+from symposium_studio.engines.production.captions import (
+    align_captions_to_final_audio,
+    validate_subtitle_integrity,
+    write_ass,
+    write_srt,
+)
 from symposium_studio.models.timeline import RenderTimeline, TargetPlatformFormat
 
 
@@ -67,6 +73,110 @@ def _escape_ffmpeg_path(p: Path) -> str:
     return str(p.resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
+def _probe_media_duration(media_path: Path) -> float | None:
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(media_path),
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        val = float(out)
+        return val if val > 0.05 else None
+    except Exception:
+        return None
+
+
+def _remap_timeline_to_actual_durations(
+    timeline: RenderTimeline,
+    actual_clip_durs: list[float],
+) -> RenderTimeline:
+    """Remap timeline captions, overlays, and audio events to actual probed segment durations."""
+    if len(actual_clip_durs) != len(timeline.clips) or not timeline.clips:
+        return timeline
+
+    math_intervals = [(float(c.timeline_start_sec), float(c.timeline_end_sec)) for c in timeline.clips]
+    act_intervals: list[tuple[float, float]] = []
+    cur = 0.0
+    for d in actual_clip_durs:
+        d_pos = max(0.05, float(d))
+        act_intervals.append((cur, cur + d_pos))
+        cur += d_pos
+
+    def remap_t(t: float) -> float:
+        tf = float(t)
+        if tf <= math_intervals[0][0]:
+            return max(0.0, act_intervals[0][0] + (tf - math_intervals[0][0]))
+        for idx, ((ms, me), (as_, ae)) in enumerate(zip(math_intervals, act_intervals)):
+            if tf <= me + 1e-6:
+                span = max(1e-6, me - ms)
+                frac = max(0.0, min(1.0, (tf - ms) / span))
+                return as_ + frac * (ae - as_)
+            if idx + 1 < len(math_intervals) and tf < math_intervals[idx + 1][0]:
+                # Map tiny gap point proportionally between consecutive clips
+                gap_span = max(1e-6, math_intervals[idx + 1][0] - me)
+                act_gap = act_intervals[idx + 1][0] - ae
+                frac = (tf - me) / gap_span
+                return ae + frac * act_gap
+        last_me = math_intervals[-1][1]
+        last_ae = act_intervals[-1][1]
+        return max(0.0, last_ae + (tf - last_me))
+
+    remapped = timeline.model_copy(deep=True)
+    for clip, (as_, ae) in zip(remapped.clips, act_intervals):
+        clip.timeline_start_sec = round(as_, 4)
+        clip.timeline_end_sec = round(ae, 4)
+
+    for cap in remapped.captions:
+        old_s = float(cap.start_sec)
+        old_e = float(cap.end_sec)
+        new_s = round(remap_t(old_s), 3)
+        new_e = round(max(new_s + 0.08, remap_t(old_e)), 3)
+        if cap.words:
+            first_ws = float(cap.words[0].get("start_sec", 0.0))
+            last_we = float(cap.words[-1].get("end_sec", 0.0))
+            is_abs = old_s > 0.2 and first_ws >= old_s - 0.05 and last_we <= old_e + 0.15
+            if is_abs:
+                for w in cap.words:
+                    ws = remap_t(float(w.get("start_sec", old_s)))
+                    we = remap_t(float(w.get("end_sec", old_e)))
+                    w["start_sec"] = round(ws, 3)
+                    w["end_sec"] = round(max(ws + 0.04, we), 3)
+            else:
+                scale = (new_e - new_s) / max(1e-6, old_e - old_s)
+                if abs(scale - 1.0) > 0.002:
+                    for w in cap.words:
+                        ws = float(w.get("start_sec", 0.0)) * scale
+                        we = float(w.get("end_sec", 0.1)) * scale
+                        w["start_sec"] = round(ws, 3)
+                        w["end_sec"] = round(max(ws + 0.04, we), 3)
+        cap.start_sec = new_s
+        cap.end_sec = new_e
+
+    for ov in remapped.overlays:
+        ns = round(remap_t(ov.timeline_start_sec), 3)
+        ne = round(max(ns + 0.1, remap_t(ov.timeline_end_sec)), 3)
+        ov.timeline_start_sec = ns
+        ov.timeline_end_sec = ne
+
+    for au in remapped.audio_events:
+        au.timeline_start_sec = round(remap_t(au.timeline_start_sec), 3)
+
+    for sm in getattr(remapped, "segment_mappings", []):
+        sm.timeline_start_sec = round(remap_t(sm.timeline_start_sec), 3)
+        sm.timeline_end_sec = round(max(sm.timeline_start_sec, remap_t(sm.timeline_end_sec)), 3)
+
+    return remapped
+
+
 def render_timeline(
     timeline: RenderTimeline,
     output_mp4: Path,
@@ -85,21 +195,29 @@ def render_timeline(
         tmp = Path(tmpdir)
         clip_files: list[Path] = []
 
-        # 1. Render each source segment with portrait-biased reframing, smooth zoom motion, speed, and color polish
-        fps_int = int(round(timeline.fps))
+        # 1. Render each source segment frame-accurately into intermediate MKV (lossless PCM audio
+        # avoids per-clip AAC encoder priming delay & concat drift across multi-cut timelines).
+        fps_int = max(1, int(round(timeline.fps)))
+        actual_clip_durs: list[float] = []
         for idx, clip in enumerate(timeline.clips):
-            clip_out = tmp / f"seg_{idx:03d}.mp4"
+            clip_out = tmp / f"seg_{idx:03d}.mkv"
             dur = max(0.25, clip.source_end_sec - clip.source_start_sec)
             spd = max(0.25, min(4.0, float(clip.playback_speed or 1.0)))
             z = max(1.0, clip.zoom_scale)
-            speed_vf = f"setpts=(PTS-STARTPTS)/{spd:.4f}," if abs(spd - 1.0) >= 1e-3 else ""
+            speed_vf = f"setpts=(PTS-STARTPTS)/{spd:.4f}," if abs(spd - 1.0) >= 1e-3 else "setpts=PTS-STARTPTS,"
             trans_vf = ""
             if clip.transition_in and clip.transition_in.type != "cut" and idx > 0:
                 td = min(0.35, max(0.12, float(clip.transition_in.duration_sec or 0.22)))
                 trans_vf = f",fade=t=in:st=0:d={td:.2f}"
 
+            math_dur = clip.timeline_end_sec - clip.timeline_start_sec
+            nominal_out_dur = math_dur if math_dur > 0.10 else (dur / spd)
+            target_frames = max(6, int(round(nominal_out_dur * fps_int)))
+            exact_dur = target_frames / float(fps_int)
+            target_audio_samples = max(9600, int(round(exact_dur * 48000)))
+            out_frames = target_frames
+
             push_fx = next((fx for fx in clip.effects if fx.preset_id == "smooth_push_in"), None)
-            out_frames = max(2, int(round((dur / spd) * fps_int)))
 
             if is_vertical:
                 base_crop = (
@@ -117,40 +235,49 @@ def render_timeline(
                     f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.32,"
                     f"zoompan=z='{z:.3f}+{z_delta:.3f}*min(1\\,on/{out_frames})':"
                     f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*0.34':d=1:s={w}x{h}:fps={fps_int},"
-                    f"setsar=1,{grade_vf}{trans_vf}"
+                    f"setsar=1,{grade_vf}{trans_vf},"
+                    f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
                 )
             else:
                 vf = (
                     f"{speed_vf}{base_crop}"
                     f"scale={int(round(w * z))}:{int(round(h * z))}:force_original_aspect_ratio=increase,"
-                    f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.34,setsar=1,{grade_vf}{trans_vf}"
+                    f"crop={w}:{h}:(iw-{w})/2:(ih-{h})*0.34,setsar=1,{grade_vf}{trans_vf},"
+                    f"fps={fps_int},trim=start_frame=0:end_frame={target_frames},setpts=PTS-STARTPTS"
                 )
 
             atempo_chain = _build_atempo_chain(spd)
+            afade_d = min(0.025, exact_dur * 0.12)
+            afade_out_st = max(0.0, exact_dur - afade_d)
             af = (
                 f"highpass=f=80{atempo_chain},"
                 "acompressor=threshold=-20dB:ratio=2.4:attack=10:release=120,"
-                "loudnorm=I=-14:TP=-1.5:LRA=11"
+                f"afade=t=in:st=0:d={afade_d:.3f},"
+                f"afade=t=out:st={afade_out_st:.3f}:d={afade_d:.3f},"
+                f"aresample=48000,apad=whole_len={target_audio_samples},"
+                f"atrim=start_sample=0:end_sample={target_audio_samples},asetpts=PTS-STARTPTS"
             )
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-ss", f"{clip.source_start_sec:.3f}",
-                "-t", f"{dur:.3f}",
+                "-t", f"{dur + 0.12:.3f}",
                 "-i", clip.source_path,
                 "-vf", vf,
                 "-af", af,
                 "-r", str(fps_int),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+                "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
                 str(clip_out),
             ]
             subprocess.run(cmd, check=True)
             clip_files.append(clip_out)
+            probed_d = _probe_media_duration(clip_out)
+            actual_clip_durs.append(probed_d if probed_d is not None else exact_dur)
 
-        # 2. Concatenate segments cleanly
-        concat_mp4 = tmp / "concat.mp4"
+        # 2. Concatenate segments cleanly into lossless PCM-audio MKV and remap events to exact probed cuts
+        concat_mkv = tmp / "concat.mkv"
         if len(clip_files) == 1:
-            concat_mp4 = clip_files[0]
+            concat_mkv = clip_files[0]
         else:
             list_txt = tmp / "concat_list.txt"
             list_txt.write_text("\n".join(f"file '{p.as_posix()}'" for p in clip_files), encoding="utf-8")
@@ -158,25 +285,38 @@ def render_timeline(
                 [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     "-f", "concat", "-safe", "0", "-i", str(list_txt),
+                    "-fflags", "+genpts",
                     "-c", "copy",
-                    str(concat_mp4),
+                    str(concat_mkv),
                 ],
                 check=True,
             )
 
-        # 3. Composite original animation overlays + mix SFX + burn safe-zone ASS captions
+        render_tl = _remap_timeline_to_actual_durations(timeline, actual_clip_durs)
+
+        # 2.5 Align word-level captions against the FINAL edited audio before burning subtitles
+        final_speech_wav = tmp / "final_speech_16k.wav"
+        try:
+            extract_raw_mono_wav(concat_mkv, final_speech_wav, sample_rate=16000)
+            render_tl = align_captions_to_final_audio(render_tl, final_speech_wav)
+            integrity = validate_subtitle_integrity(render_tl, final_audio_wav=final_speech_wav)
+        except Exception:
+            integrity = validate_subtitle_integrity(render_tl)
+        render_tl.subtitle_integrity = integrity
+
+        # 3. Composite original animation overlays + mix SFX + single loudnorm + burn safe-zone ASS captions
         ass_path = workspace_dir / "timelines" / f"{timeline.timeline_id}.ass"
         srt_path = workspace_dir / "timelines" / f"{timeline.timeline_id}.srt"
-        write_srt(timeline, srt_path)
-        write_ass(timeline, ass_path)
+        write_srt(render_tl, srt_path)
+        write_ass(render_tl, ass_path)
 
-        inputs = ["-i", str(concat_mp4)]
+        inputs = ["-fflags", "+genpts", "-i", str(concat_mkv)]
         filter_parts: list[str] = []
         v_label = "[0:v]"
         a_label = "[0:a]"
         input_idx = 1
 
-        for ov_i, ov in enumerate(timeline.overlays):
+        for ov_i, ov in enumerate(render_tl.overlays):
             ov_path = Path(ov.asset_path)
             if not ov_path.exists():
                 continue
@@ -205,12 +345,12 @@ def render_timeline(
                 )
                 filter_parts.append(
                     f"{mbg_lbl}scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
-                    f"gblur=sigma=28,eq=brightness=-0.22:saturation=1.15{bg_lbl}"
+                    f"gblur=sigma=30,eq=brightness=-0.26:saturation=1.10{bg_lbl}"
                 )
                 filter_parts.append(
                     f"{mfg_lbl}scale={fg_w}:{fg_h}:force_original_aspect_ratio=decrease,"
                     f"scale=trunc(iw/2)*2:trunc(ih/2)*2,"
-                    f"pad=iw+12:ih+12:6:6:color=black@0.88{fg_lbl}"
+                    f"pad=iw+12:ih+12:6:6:color=#0B1120@0.92{fg_lbl}"
                 )
                 filter_parts.append(
                     f"{bg_lbl}{fg_lbl}overlay=(W-w)/2:(H-h)/2,"
@@ -255,22 +395,23 @@ def render_timeline(
             v_label = next_v
             input_idx += 1
 
-        if timeline.caption_settings.enabled and timeline.captions:
+        if render_tl.caption_settings.enabled and render_tl.captions:
             next_v = "[v_cap]"
             filter_parts.append(f"{v_label}ass='{_escape_ffmpeg_path(ass_path)}'{next_v}")
             v_label = next_v
 
         # Mix SFX + optional sidechain-ducked ambient music beds without attenuating speech
         sfx_inputs_labels: list[str] = []
-        music_events = [au for au in timeline.audio_events if au.role == "music" and Path(au.source_path).exists()]
-        sfx_events = [au for au in timeline.audio_events if au.role != "music" and Path(au.source_path).exists()]
+        music_events = [au for au in render_tl.audio_events if au.role == "music" and Path(au.source_path).exists()]
+        sfx_events = [au for au in render_tl.audio_events if au.role != "music" and Path(au.source_path).exists()]
         has_ducked_music = any(au.duck_under_speech for au in music_events)
 
         if has_ducked_music:
-            filter_parts.append(f"{a_label}asplit=2[a_main][a_sc]")
+            filter_parts.append("[0:a]loudnorm=I=-14:TP=-2.0:LRA=9,asplit=2[a_main][a_sc]")
             speech_mix_label = "[a_main]"
         else:
-            speech_mix_label = a_label
+            filter_parts.append("[0:a]loudnorm=I=-14:TP=-2.0:LRA=9[a_main]")
+            speech_mix_label = "[a_main]"
 
         ducked_total = sum(1 for au in music_events if au.duck_under_speech)
         ducked_seen = 0
@@ -315,9 +456,11 @@ def render_timeline(
             all_a = speech_mix_label + "".join(sfx_inputs_labels)
             filter_parts.append(
                 f"{all_a}amix=inputs={1 + len(sfx_inputs_labels)}:duration=first:normalize=0,"
-                f"loudnorm=I=-14:TP=-1.5:LRA=11[a_final]"
+                f"alimiter=limit=0.89:attack=2:release=40[a_final]"
             )
             a_label = "[a_final]"
+        else:
+            a_label = speech_mix_label
 
         if filter_parts:
             filter_complex = ";".join(filter_parts)
@@ -337,7 +480,10 @@ def render_timeline(
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", str(concat_mp4), "-c", "copy", "-movflags", "+faststart", str(output_mp4),
+                    "-i", str(concat_mkv),
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+                    "-movflags", "+faststart", str(output_mp4),
                 ],
                 check=True,
             )
@@ -346,6 +492,8 @@ def render_timeline(
         "video_path": str(output_mp4),
         "srt_path": str(srt_path),
         "ass_path": str(ass_path),
+        "subtitle_integrity": integrity,
+        "rendered_timeline": render_tl,
     }
 
 

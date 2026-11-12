@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from symposium_studio.config import StudioConfig
-from symposium_studio.engines.analysis import run_full_media_analysis
+from symposium_studio.engines.analysis import (
+    align_transcript_to_audio,
+    apply_transcript_corrections,
+    extract_raw_mono_wav,
+    run_full_media_analysis,
+)
+from symposium_studio.engines.analysis.semantics import detect_repetitions, score_highlights, segment_topics
 from symposium_studio.engines.analysis.styles import analyze_reference_style
 from symposium_studio.engines.animation import AnimationEngineRegistry, build_scene_spec
 from symposium_studio.engines.distribution import (
@@ -38,6 +44,7 @@ from symposium_studio.engines.research import (
     import_explicit_item,
     import_items_from_json,
     infer_platform_from_url,
+    score_meme_for_beat,
 )
 from symposium_studio.engines.symposium import AGENT_ROSTER, SymposiumOrchestrator
 from symposium_studio.models.animation import AnimationDomain, AnimationRenderResult, FactualityMode, SceneSpec
@@ -143,6 +150,86 @@ class SymposiumStudio:
         if not p.exists():
             raise FileNotFoundError(f"No media analysis yet for {project_id}. Run analyze first.")
         return MediaAnalysisBundle.model_validate_json(p.read_text(encoding="utf-8"))
+
+    def update_transcript_segments(
+        self,
+        project_id: str,
+        corrections: dict[str, Any],
+        language_overrides: dict[str, str] | None = None,
+        mark_confirmed: bool = True,
+        align_audio: bool = True,
+    ) -> MediaAnalysisBundle:
+        """Apply verified/manual transcript segment edits and re-index semantics without re-running ASR."""
+        bundle = self.load_analysis(project_id)
+        with self.workspaces.track_run(
+            project_id,
+            "update_transcript_segments",
+            {"edited_segments": sorted(corrections.keys()), "mark_confirmed": mark_confirmed},
+        ) as (manifest, run):
+            bundle.transcript = apply_transcript_corrections(
+                bundle.transcript,
+                corrections=corrections,
+                language_overrides=language_overrides,
+                mark_confirmed=mark_confirmed,
+            )
+            src_media = Path(bundle.probe.path)
+            if align_audio and src_media.exists():
+                raw_wav = Path(manifest.project.workspace_dir) / "transcripts" / "source_raw_16k.wav"
+                if not raw_wav.exists() or raw_wav.stat().st_mtime < src_media.stat().st_mtime:
+                    extract_raw_mono_wav(src_media, raw_wav)
+                target_ids = set(corrections.keys()) if corrections else None
+                bundle.transcript = align_transcript_to_audio(
+                    bundle.transcript,
+                    raw_wav,
+                    segment_ids=target_ids,
+                    force_all=True,
+                )
+            bundle.topics = segment_topics(bundle.transcript.segments)
+            bundle.repetitions_flagged = detect_repetitions(bundle.transcript.segments)
+            bundle.highlights = score_highlights(
+                bundle.transcript.segments,
+                bundle.topics,
+                bundle.visual_samples,
+                bundle.probe.duration_sec,
+            )
+            ws_dir = Path(manifest.project.workspace_dir)
+            transcript_path = ws_dir / "transcripts" / "analysis_bundle.json"
+            transcript_path.write_text(bundle.model_dump_json(indent=2), encoding="utf-8")
+
+            self.db.index_transcript_segments(
+                project_id,
+                [s.model_dump(mode="json") for s in bundle.transcript.segments],
+            )
+            asset = self.workspaces.register_asset(
+                manifest,
+                run_id=run.run_id,
+                role=AssetRole.TRANSCRIPT,
+                path=transcript_path,
+                metadata={
+                    "detected_language": bundle.transcript.detected_language,
+                    "segments": len(bundle.transcript.segments),
+                    "uncertain_segments": len(bundle.transcript.uncertain_segment_ids),
+                    "highlights": len(bundle.highlights),
+                    "human_confirmed_segments": sum(
+                        1 for s in bundle.transcript.segments if s.verification_status == "human_confirmed"
+                    ),
+                },
+            )
+            run.output_asset_ids.append(asset.asset_id)
+            self.workspaces.add_decision(
+                run,
+                step="transcript_correction",
+                actor="human_editor" if mark_confirmed else "transcript_verifier",
+                decision=(
+                    f"Updated {len(corrections)} transcript segment(s) "
+                    f"and recomputed {len(bundle.highlights)} highlights"
+                ),
+                rationale=(
+                    "Propagated edits to word timestamps, FTS5 search index, topics, "
+                    "and highlight windows without re-running ASR."
+                ),
+            )
+        return bundle
 
     # ------------------------------------------------------------------
     # Research & Symposium
@@ -304,12 +391,18 @@ class SymposiumStudio:
     # ------------------------------------------------------------------
     def _latest_symposium_and_anim(self, manifest: ProjectManifest) -> tuple[SymposiumSession, AnimationRenderResult | None]:
         ws_dir = Path(manifest.project.workspace_dir)
-        sym_files = sorted((ws_dir / "symposium").glob("sym_*.json"))
+        sym_files = sorted(
+            (ws_dir / "symposium").glob("sym_*.json"),
+            key=lambda p: (p.stat().st_mtime_ns, p.name),
+        )
         if not sym_files:
             raise FileNotFoundError("No symposium session found; run symposium first.")
         session = SymposiumSession.model_validate_json(sym_files[-1].read_text(encoding="utf-8"))
 
-        anim_specs = sorted((ws_dir / "animations").glob("anim_*.spec.json"))
+        anim_specs = sorted(
+            (ws_dir / "animations").glob("anim_*.spec.json"),
+            key=lambda p: (p.stat().st_mtime_ns, p.name),
+        )
         anim_res: AnimationRenderResult | None = None
         if anim_specs:
             spec = SceneSpec.model_validate_json(anim_specs[-1].read_text(encoding="utf-8"))
@@ -340,7 +433,8 @@ class SymposiumStudio:
         for sp in sorted(anim_dir.glob("anim_*.spec.json")):
             try:
                 spec = SceneSpec.model_validate_json(sp.read_text(encoding="utf-8"))
-                if spec.template_id not in {"meme_reaction_card", "meme_cutaway"}:
+                is_beat_callout = spec.template_id == "kinetic_callout" and "beat_index" in spec.parameters
+                if spec.template_id not in {"meme_reaction_card", "meme_cutaway"} and not is_beat_callout:
                     continue
                 out_file = next(
                     (
@@ -370,32 +464,58 @@ class SymposiumStudio:
                 continue
         return found[-max_count:]
 
+    @staticmethod
+    def _compact_excerpt(text: str, max_words: int = 8, max_chars: int = 52) -> str:
+        cleaned = " ".join((text or "").replace("\n", " ").split()).strip(" ,;:-")
+        if not cleaned:
+            return ""
+        for sep in (". ", "! ", "? ", " — "):
+            if sep in cleaned and cleaned.index(sep) >= 10:
+                cleaned = cleaned.split(sep, 1)[0].strip()
+                break
+        words = cleaned.split()
+        out_words: list[str] = []
+        for w in words[:max_words]:
+            cand = " ".join(out_words + [w])
+            if out_words and len(cand) > max_chars:
+                break
+            out_words.append(w)
+        out = " ".join(out_words).strip()
+        if len(words) > len(out_words) and out and not out.endswith((".", "!", "?", "...")):
+            out = f"{out}..."
+        return out
+
     def _build_meme_card_text(
         self,
         slot_idx: int,
         beat_excerpt: str,
         meme_topic: str,
+        beat_purpose: str = "",
     ) -> tuple[str, str, str]:
         low = (beat_excerpt or "").lower()
-        accents = ["#FACC15", "#38BDF8", "#F43F5E"]
+        purpose_low = (beat_purpose or "").lower()
+        accents = ["#FACC15", "#38BDF8", "#F43F5E", "#A855F7"]
         accent = accents[slot_idx % len(accents)]
-        if slot_idx == 0:
-            if any(k in low for k in ("ожида", "реальн", "капсул", "два года", "2 года", "жыл", "expect")):
-                return "ОЖИДАНИЕ vs РЕАЛЬНОСТЬ 👀", "Капсула времени на 2 года: не сдуйся!", accent
-            words = beat_excerpt.strip().split()
-            short = " ".join(words[:7]) if words else meme_topic
-            return "POV: HOOK 👀", short, accent
-        if slot_idx == 1:
-            if any(k in low for k in ("семестр", "тяжел", "слож", "major", "резюм", "интерн", "qi", "quiz", "data struct")):
-                return "STUDENT REALITY CHECK 💀", "1 семестр + резюме + стажировки 💀", accent
-            words = beat_excerpt.strip().split()
-            short = " ".join(words[:7]) if words else meme_topic
-            return "WAIT A SECOND ⚡", short, accent
-        if any(k in low for k in ("деньг", "зараб", "стипенд", "gpa", "dean", "ақша", "бизнес", "quiz")):
-            return "LOCK IN MODE 🎯", "GPA 3.8 + свой доход + Quiz завтра 🔥", accent
-        words = beat_excerpt.strip().split()
-        short = " ".join(words[:7]) if words else meme_topic
-        return "NO CAP 🔥", short, accent
+        short = self._compact_excerpt(beat_excerpt, max_words=8, max_chars=52)
+        if not short:
+            short = self._compact_excerpt(meme_topic, max_words=6, max_chars=44) or "KEY MOMENT"
+
+        if any(k in low for k in ("ожида", "реальн", "салыстыр", "expect")):
+            top_label = "EXPECTATIONS vs REALITY"
+        elif "hook" in purpose_low or slot_idx == 0:
+            top_label = "POV: HOOK"
+        elif any(k in low for k in ("қиын", "сложн", "тяжел", "problem", "quiz", "deadline", "страш")):
+            top_label = "REALITY CHECK"
+        elif any(
+            k in low
+            for k in ("зараб", "стипенд", "gpa", "dean", "дисциплин", "үміт", "надеюсь", "ойлаймын", "goal", "мамандық", "резюме")
+        ):
+            top_label = "LOCK IN MODE"
+        elif "payoff" in purpose_low or "ending" in purpose_low or any(k in low for k in ("туған күн", "екі жыл", "рахмет", "хорошо")):
+            top_label = "PAYOFF"
+        else:
+            top_label = "KEY POINT"
+        return top_label, short, accent
 
     def _generate_zoomer_meme_cards(
         self,
@@ -406,55 +526,88 @@ class SymposiumStudio:
     ) -> tuple[list[AnimationRenderResult], list[dict[str, Any]]]:
         ws_dir = Path(manifest.project.workspace_dir)
         pid = manifest.project.project_id
-        full_text = " ".join(s.text for s in analysis.transcript.segments)
-        query_seed = f"{manifest.project.name} {' '.join(k for t in analysis.topics for k in t.keywords[:6])} {full_text[:600]}"
-        live_memes = MemeTrendConnector().fetch_public_items(query=query_seed, limit=24)
-        for it in live_memes:
-            self.db.upsert_viral_item(it)
-        downloaded = download_trending_meme_assets(live_memes, ws_dir / "memes", max_count=max(max_cards, 4))
-
         beats = session.storyboard.beats
         hl_map = {h.highlight_id: h.transcript_excerpt for h in analysis.highlights}
-        if not beats:
-            beat_indices = [0]
-        elif len(beats) == 1:
-            beat_indices = [0]
-        elif len(beats) == 2:
-            beat_indices = [0, 1]
-        elif max_cards >= 4 and len(beats) >= 4:
-            beat_indices = [0, 1, len(beats) - 2, len(beats) - 1]
-        else:
-            beat_indices = [0, len(beats) // 2, len(beats) - 1]
 
-        slot_count = min(max_cards, max(len(beat_indices), min(4, len(downloaded))))
+        def _beat_excerpt(beat_start: float, beat_end: float, evidence_ids: list[str]) -> str:
+            for eid in evidence_ids:
+                if eid in hl_map and hl_map[eid]:
+                    return hl_map[eid]
+            if analysis.transcript.segments:
+                overlapping = [
+                    s.text
+                    for s in analysis.transcript.segments
+                    if s.end_sec >= beat_start and s.start_sec <= beat_end
+                ]
+                if overlapping:
+                    return " ".join(overlapping[:2])
+                return analysis.transcript.segments[0].text
+            return ""
+
+        slots: list[tuple[int, float, float, str, str, str]] = []
+        if not beats:
+            seg0 = analysis.transcript.segments[0] if analysis.transcript.segments else None
+            b_s = seg0.start_sec if seg0 else 0.0
+            b_e = min(analysis.probe.duration_sec, b_s + 8.0)
+            slots.append((0, b_s, b_e, "hook", "", seg0.text if seg0 else manifest.project.name))
+        else:
+            if len(beats) == 1:
+                raw_indices = [0]
+            elif len(beats) == 2:
+                raw_indices = [0, 1]
+            elif max_cards >= 4 and len(beats) >= 4:
+                raw_indices = [0, 1, len(beats) // 2, len(beats) - 1]
+            else:
+                raw_indices = [0, len(beats) // 2, len(beats) - 1]
+            seen_b: list[int] = []
+            for bi in raw_indices:
+                if bi not in seen_b and len(seen_b) < max_cards:
+                    seen_b.append(bi)
+            for bi in seen_b:
+                b = beats[bi]
+                ex = _beat_excerpt(b.source_start_sec, b.source_end_sec, b.evidence_ids)
+                slots.append((bi, b.source_start_sec, b.source_end_sec, b.role, b.visual_treatment, ex))
+
+        beat_text_blob = " ".join(s[5] for s in slots)
+        full_text = " ".join(s.text for s in analysis.transcript.segments)
+        query_seed = (
+            f"{manifest.project.name} "
+            f"{' '.join(k for t in analysis.topics for k in t.keywords[:6])} "
+            f"{beat_text_blob[:500]} {full_text[:400]}"
+        )
+        live_memes = MemeTrendConnector().fetch_public_items(query=query_seed, limit=28)
+        for it in live_memes:
+            self.db.upsert_viral_item(it)
+        downloaded = download_trending_meme_assets(live_memes, ws_dir / "memes", max_count=max(max_cards * 2, 8))
+
         anim_dir = ws_dir / "animations"
         anim_dir.mkdir(parents=True, exist_ok=True)
         rendered_anims: list[AnimationRenderResult] = []
-        for slot_i in range(slot_count):
-            b_idx = beat_indices[slot_i % len(beat_indices)]
-            beat = beats[b_idx]
-            excerpt = ""
-            for eid in beat.evidence_ids:
-                if eid in hl_map and hl_map[eid]:
-                    excerpt = hl_map[eid]
-                    break
-            if not excerpt and analysis.transcript.segments:
-                excerpt = next(
-                    (
-                        s.text
-                        for s in analysis.transcript.segments
-                        if s.end_sec >= beat.source_start_sec and s.start_sec <= beat.source_end_sec
-                    ),
-                    analysis.transcript.segments[0].text,
-                )
+        used_meme_indices: set[int] = set()
 
-            meme_meta = downloaded[slot_i % len(downloaded)] if downloaded else {}
+        for slot_i, (b_idx, b_start, b_end, b_purpose, b_vis, excerpt) in enumerate(slots):
+            best_idx: int | None = None
+            best_score = 0.0
+            match_context = f"{excerpt} {b_vis}".strip()
+            for cand_i, cand in enumerate(downloaded):
+                if cand_i in used_meme_indices:
+                    continue
+                cw = int(cand.get("width") or 0)
+                ch = int(cand.get("height") or 0)
+                if cw > 0 and ch > 0 and ch > cw * 1.45 and cw < 500:
+                    continue
+                sc = score_meme_for_beat(cand, match_context)
+                if sc > best_score:
+                    best_score = sc
+                    best_idx = cand_i
+
+            meme_meta = downloaded[best_idx] if (best_idx is not None and best_score >= 0.42) else {}
             asset_raw = str(meme_meta.get("asset_path") or meme_meta.get("image_path") or "").strip()
-            meme_topic = str(meme_meta.get("topic") or meme_meta.get("title") or "Reaction Meme")
+            meme_topic = str(meme_meta.get("topic") or meme_meta.get("title") or "Visual Beat")
             src_asset = Path(asset_raw) if asset_raw else None
 
-            # Use real animated MP4/GIF or finished Reddit meme directly (clean cutaway/sticker, no SaaS UI box)
-            if src_asset is not None and src_asset.is_file():
+            if src_asset is not None and src_asset.is_file() and best_idx is not None:
+                used_meme_indices.add(best_idx)
                 scene_id = f"anim_m_{slot_i}_{uuid.uuid4().hex[:6]}"
                 ext = src_asset.suffix.lower() or ".mp4"
                 dest_asset = anim_dir / f"{scene_id}{ext}"
@@ -477,6 +630,10 @@ class SymposiumStudio:
                         "meme_name": meme_topic[:48],
                         "media_kind": str(meme_meta.get("media_kind") or "video"),
                         "source_url": str(meme_meta.get("original_url") or ""),
+                        "match_score": best_score,
+                        "beat_index": b_idx,
+                        "beat_source_start": b_start,
+                        "beat_source_end": b_end,
                     },
                 )
                 spec_path = anim_dir / f"{scene_id}.spec.json"
@@ -496,22 +653,24 @@ class SymposiumStudio:
                 )
                 rendered_anims.append(anim)
             else:
-                top_label, reaction_text, accent = self._build_meme_card_text(slot_i, excerpt, meme_topic)
+                top_label, reaction_text, _accent = self._build_meme_card_text(
+                    slot_i, excerpt, meme_topic, beat_purpose=b_purpose
+                )
                 anim = self.generate_animation(
                     pid,
-                    template_id="meme_reaction_card",
-                    title=f"Meme Card #{slot_i + 1}: {meme_topic[:36]}",
+                    template_id="kinetic_callout",
+                    title=f"Beat Callout #{slot_i + 1}: {top_label}",
                     duration_sec=2.6,
                     width=960,
-                    height=720,
+                    height=540,
                     transparent_background=True,
+                    preferred_adapter="chromium_canvas",
                     parameters={
-                        "top_label": top_label,
-                        "meme_name": meme_topic[:32],
-                        "reaction_text": reaction_text,
-                        "image_path": asset_raw,
-                        "image_url": str(meme_meta.get("original_url") or ""),
-                        "accent_color": accent,
+                        "headline": top_label,
+                        "subtitle": reaction_text,
+                        "beat_index": b_idx,
+                        "beat_source_start": b_start,
+                        "beat_source_end": b_end,
                     },
                 )
                 rendered_anims.append(anim)
@@ -526,18 +685,25 @@ class SymposiumStudio:
         short_variants_per_platform: int = 1,
         extra_animations: list[AnimationRenderResult] | None = None,
         download_click_sounds: bool = False,
+        animation_result: AnimationRenderResult | None = None,
     ) -> dict[str, Any]:
         analysis = self.load_analysis(project_id)
         manifest = self.workspaces.get_manifest(project_id)
-        session, anim_res = self._latest_symposium_and_anim(manifest)
+        session, latest_anim = self._latest_symposium_and_anim(manifest)
+        anim_res = animation_result or latest_anim
         ws_dir = Path(manifest.project.workspace_dir)
 
         resolved_extra = list(extra_animations or [])
-        if extra_animations is None and manifest.project.editing_style == "zoomer_vlog":
+        if manifest.project.editing_style == "zoomer_vlog" and (
+            extra_animations is None
+            or (anim_res is not None and any(a.scene_id == anim_res.scene_id for a in resolved_extra))
+        ):
             meme_batch = self._meme_batch_animations(ws_dir, max_count=4)
             if meme_batch:
                 anim_res = meme_batch[0]
                 resolved_extra = meme_batch[1:]
+        elif anim_res is not None:
+            resolved_extra = [a for a in resolved_extra if a.scene_id != anim_res.scene_id]
 
         with self.workspaces.track_run(project_id, "build_and_render_deliverables") as (manifest, run):
             sfx_map = ensure_project_sfx(ws_dir / "effects", download_clicks=download_click_sounds)
@@ -560,6 +726,9 @@ class SymposiumStudio:
 
             yt_mp4 = ws_dir / "renders" / f"{manifest.project.slug}_youtube_1080p.mp4"
             render_files = render_timeline(yt_tl, yt_mp4, ws_dir)
+            if isinstance(render_files.get("rendered_timeline"), RenderTimeline):
+                yt_tl = render_files["rendered_timeline"]
+                yt_tl_json.write_text(yt_tl.model_dump_json(indent=2), encoding="utf-8")
             thumb_png = ws_dir / "thumbnails" / f"{manifest.project.slug}_thumbnail.png"
             thumb_capture = yt_tl.clips[0].source_start_sec + min(2.0, max(0.5, (yt_tl.clips[0].source_end_sec - yt_tl.clips[0].source_start_sec) * 0.25))
             render_thumbnail(
@@ -575,6 +744,7 @@ class SymposiumStudio:
                 video_path=yt_mp4,
                 timeline=yt_tl,
                 frames_out_dir=ws_dir / "reports" / "qa_frames",
+                analysis=analysis,
             )
             qa_path = ws_dir / "reports" / f"qa_{yt_tl.timeline_id}.json"
             qa_path.write_text(yt_qa.model_dump_json(indent=2), encoding="utf-8")
@@ -615,8 +785,17 @@ class SymposiumStudio:
                     v_otio = ws_dir / "timelines" / f"{vtl.timeline_id}_{fmt.value}.otio"
                     export_otio(vtl, v_otio)
                     v_mp4 = ws_dir / "shorts" / f"{manifest.project.slug}_{fmt.value}_{idx + 1}.mp4"
-                    render_timeline(vtl, v_mp4, ws_dir)
-                    v_qa = run_quality_assurance(project_id, v_mp4, vtl, ws_dir / "reports" / "qa_frames")
+                    v_render_files = render_timeline(vtl, v_mp4, ws_dir)
+                    if isinstance(v_render_files.get("rendered_timeline"), RenderTimeline):
+                        vtl = v_render_files["rendered_timeline"]
+                        v_json.write_text(vtl.model_dump_json(indent=2), encoding="utf-8")
+                    v_qa = run_quality_assurance(
+                        project_id,
+                        v_mp4,
+                        vtl,
+                        ws_dir / "reports" / "qa_frames",
+                        analysis=analysis,
+                    )
                     self.workspaces.register_asset(manifest, run.run_id, role, v_mp4)
                     self.workspaces.register_asset(manifest, run.run_id, AssetRole.TIMELINE_OTIO, v_otio)
                     short_outputs[fmt.value].append(
@@ -682,7 +861,9 @@ class SymposiumStudio:
         yt_mp4 = ws_dir / "renders" / f"{manifest.project.slug}_youtube_1080p.mp4"
         yt_qa_payload: dict[str, Any] | None = None
         if render_video:
-            render_timeline(updated_yt, yt_mp4, ws_dir)
+            yt_rf = render_timeline(updated_yt, yt_mp4, ws_dir)
+            if isinstance(yt_rf.get("rendered_timeline"), RenderTimeline):
+                updated_yt = yt_rf["rendered_timeline"]
             yt_qa = run_quality_assurance(project_id, yt_mp4, updated_yt, ws_dir / "reports" / "qa_frames")
             (ws_dir / "reports" / f"qa_{updated_yt.timeline_id}.json").write_text(
                 yt_qa.model_dump_json(indent=2), encoding="utf-8"
@@ -718,7 +899,9 @@ class SymposiumStudio:
                     export_otio(ustl, ws_dir / "timelines" / f"{ustl.timeline_id}_{fmt}.otio")
                     s_mp4 = ws_dir / "shorts" / f"{manifest.project.slug}_{fmt}_{idx + 1}.mp4"
                     if render_video:
-                        render_timeline(ustl, s_mp4, ws_dir)
+                        s_rf = render_timeline(ustl, s_mp4, ws_dir)
+                        if isinstance(s_rf.get("rendered_timeline"), RenderTimeline):
+                            ustl = s_rf["rendered_timeline"]
                     short_updates.append(
                         {
                             "platform": fmt,
@@ -819,7 +1002,10 @@ class SymposiumStudio:
         tl_files[-1].write_text(updated_tl.model_dump_json(indent=2), encoding="utf-8")
         export_otio(updated_tl, ws_dir / "timelines" / f"{updated_tl.timeline_id}_youtube.otio")
         yt_mp4 = ws_dir / "renders" / f"{manifest.project.slug}_youtube_1080p.mp4"
-        render_timeline(updated_tl, yt_mp4, ws_dir)
+        it_rf = render_timeline(updated_tl, yt_mp4, ws_dir)
+        if isinstance(it_rf.get("rendered_timeline"), RenderTimeline):
+            updated_tl = it_rf["rendered_timeline"]
+            tl_files[-1].write_text(updated_tl.model_dump_json(indent=2), encoding="utf-8")
         qa = run_quality_assurance(project_id, yt_mp4, updated_tl, ws_dir / "reports" / "qa_frames")
         return {
             "command": "edit_timeline",
@@ -1039,6 +1225,7 @@ class SymposiumStudio:
         renders = self.build_and_render_deliverables(
             pid,
             short_variants_per_platform=short_variants_per_platform,
+            animation_result=anim,
             extra_animations=extra_anims,
             download_click_sounds=resolved_download_clicks,
         )

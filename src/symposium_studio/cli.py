@@ -72,6 +72,39 @@ def cmd_analyze(
     _emit(bundle.model_dump(mode="json"))
 
 
+@cli.command("edit-transcript")
+def cmd_edit_transcript(
+    project_id: str,
+    corrections_json: Path | None = typer.Option(None, help="JSON file mapping segment_id -> corrected text"),
+    segment_id: str | None = typer.Option(None, help="Single segment_id to update"),
+    text: str | None = typer.Option(None, help="Replacement text when --segment-id is provided"),
+    language: str | None = typer.Option(None, help="Optional language override for --segment-id"),
+    confirm: bool = typer.Option(True, help="Mark edited segments as human_confirmed"),
+) -> None:
+    """Update transcript segment texts cleanly without re-running ASR."""
+    corrections: dict[str, str] = {}
+    lang_overrides: dict[str, str] = {}
+    if corrections_json is not None:
+        raw = json.loads(corrections_json.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                corrections[str(k)] = str(v)
+    if segment_id is not None and text is not None:
+        corrections[segment_id] = text
+        if language:
+            lang_overrides[segment_id] = language
+    if not corrections and not lang_overrides:
+        raise typer.BadParameter("Provide --corrections-json or both --segment-id and --text.")
+    studio = SymposiumStudio()
+    bundle = studio.update_transcript_segments(
+        project_id,
+        corrections=corrections,
+        language_overrides=lang_overrides or None,
+        mark_confirmed=confirm,
+    )
+    _emit(bundle.model_dump(mode="json"))
+
+
 @cli.command("research-search")
 def cmd_research_search(
     query: str | None = typer.Option(None),
