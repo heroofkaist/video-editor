@@ -66,15 +66,22 @@ def synthesize_sfx(preset_id: str, out_path: Path, duration_sec: float = 0.65, s
         sig = np.sin(phase) * np.exp(-24.0 * t) * 0.5
         return _write_wav(out_path, sig, sample_rate)
 
-    if preset_id in {"mouse_click", "mechanical_click", "switch_click", "camera_shutter", "typewriter_key", "pop_click"}:
-        click_cfg = {
-            "mouse_click": (0.11, 1850.0, 62.0),
-            "mechanical_click": (0.13, 1320.0, 52.0),
-            "switch_click": (0.12, 2350.0, 68.0),
-            "camera_shutter": (0.16, 1520.0, 44.0),
-            "typewriter_key": (0.10, 2600.0, 74.0),
-            "pop_click": (0.12, 920.0, 42.0),
-        }
+    click_cfg = {
+        "mouse_click": (0.11, 1850.0, 62.0),
+        "mechanical_click": (0.13, 1320.0, 52.0),
+        "switch_click": (0.12, 2350.0, 68.0),
+        "camera_shutter": (0.16, 1520.0, 44.0),
+        "typewriter_key": (0.10, 2600.0, 74.0),
+        "pop_click": (0.12, 920.0, 42.0),
+        "bubble_pop": (0.14, 1140.0, 38.0),
+        "scroll_tick": (0.09, 2850.0, 82.0),
+        "ui_tick": (0.09, 3100.0, 86.0),
+        "glitch_tick": (0.11, 2180.0, 65.0),
+        "creamy_key": (0.12, 1180.0, 48.0),
+        "pluck_pop": (0.13, 1420.0, 40.0),
+        "kaching_ding": (0.24, 2480.0, 18.0),
+    }
+    if preset_id in click_cfg:
         dur, body_hz, decay = click_cfg[preset_id]
         dur = max(0.08, min(dur, duration_sec))
         n = int(round(dur * sample_rate))
@@ -84,7 +91,7 @@ def synthesize_sfx(preset_id: str, out_path: Path, duration_sec: float = 0.65, s
             rng.normal(0.0, 1.0, n),
         ) * np.exp(-95.0 * t)
         body = np.sin(2.0 * np.pi * body_hz * t) * np.exp(-decay * t)
-        return _write_wav(out_path, (snap * 0.65 + body * 0.35) * 0.72, sample_rate)
+        return _write_wav(out_path, (snap * 0.65 + body * 0.35) * 0.78, sample_rate)
 
     if preset_id == "vine_boom":
         dur = min(0.85, max(0.55, duration_sec))

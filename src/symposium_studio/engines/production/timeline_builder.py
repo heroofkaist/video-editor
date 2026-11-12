@@ -720,8 +720,8 @@ def build_timeline_from_storyboard(
                             source_path=hook_sfx,
                             role="sfx",
                             timeline_start_sec=0.05,
-                            duration_sec=0.65,
-                            gain_db=-9.5 if is_zoomer else -11.0,
+                            duration_sec=0.85 if is_zoomer else 0.65,
+                            gain_db=-7.5 if is_zoomer else -9.5,
                         )
                     )
             cur_t = tl_end
@@ -780,8 +780,8 @@ def build_timeline_from_storyboard(
                             source_path=sfx_map[sfx_key],
                             role="sfx",
                             timeline_start_sec=ov_start,
-                            duration_sec=0.45,
-                            gain_db=-10.0 if is_meme else -12.0,
+                            duration_sec=0.55 if sfx_key == "vine_boom" else 0.40,
+                            gain_db=-7.5 if is_meme else -9.5,
                         )
                     )
         else:
@@ -800,7 +800,20 @@ def build_timeline_from_storyboard(
                 fracs = [0.18]
             min_gap_ov = 1.65 if is_zoomer else 3.0
             last_ov_end = -min_gap_ov
-            meme_sfx_cycle = [k for k in ("vine_boom", "ui_pop", "pop_click", "camera_shutter") if k in sfx_map]
+            meme_sfx_cycle = [
+                k
+                for k in (
+                    "vine_boom",
+                    "ui_pop",
+                    "bubble_pop",
+                    "whoosh_transition",
+                    "pop_click",
+                    "pluck_pop",
+                    "camera_shutter",
+                    "kaching_ding",
+                )
+                if k in sfx_map
+            ]
             for a_i, anim in enumerate(usable_anims[:n_items]):
                 b_src_s, b_src_e = _anim_beat_metadata(anim)
                 matched_clip: VideoClipNode | None = None
@@ -872,8 +885,8 @@ def build_timeline_from_storyboard(
                             source_path=sfx_map[sfx_key],
                             role="sfx",
                             timeline_start_sec=ov_start,
-                            duration_sec=0.55 if sfx_key == "vine_boom" else 0.35,
-                            gain_db=-9.5 if is_meme else -12.0,
+                            duration_sec=0.75 if sfx_key in {"vine_boom", "kaching_ding"} else 0.40,
+                            gain_db=-7.0 if is_meme else -9.5,
                         )
                     )
                 last_ov_end = ov_end
@@ -939,15 +952,29 @@ def build_timeline_from_storyboard(
 
 
 CLICK_SFX_PRIORITY = (
-    "mouse_click",
-    "mechanical_click",
-    "camera_shutter",
     "pop_click",
+    "bubble_pop",
+    "mechanical_click",
+    "creamy_key",
+    "mouse_click",
+    "scroll_tick",
+    "ui_tick",
+    "camera_shutter",
+    "glitch_tick",
+    "pluck_pop",
     "switch_click",
     "typewriter_key",
     "mouse_double_click",
 )
-_EXCLUDED_NON_CLICK_SFX = {"ambient_bed", "vine_boom", "whoosh_transition", "sub_impact", "riser_tension"}
+_EXCLUDED_NON_CLICK_SFX = {
+    "ambient_bed",
+    "vine_boom",
+    "whoosh_transition",
+    "sub_impact",
+    "riser_tension",
+    "kaching_ding",
+    "ui_pop",
+}
 
 
 def add_click_sounds_to_timeline(
@@ -979,7 +1006,7 @@ def add_click_sounds_to_timeline(
     ]
     eff_style = style_name or tl.style_profile or "educational_explainer"
     fast_edit = eff_style in {"zoomer_vlog", "short_form_viral", "comedy"}
-    spacing = float(min_spacing_sec) if min_spacing_sec is not None else (0.85 if fast_edit else 3.2)
+    spacing = float(min_spacing_sec) if min_spacing_sec is not None else (0.65 if fast_edit else 3.2)
 
     tl_end = max((c.timeline_end_sec for c in tl.clips), default=0.0)
     conflict_times = [
@@ -990,31 +1017,33 @@ def add_click_sounds_to_timeline(
 
     # Collect prioritized candidate timestamps: (priority, timestamp, reason, preferred_key, gain_db)
     candidates: list[tuple[int, float, str, str, float]] = []
+    entry_keys = ("pop_click", "bubble_pop", "pluck_pop", "mouse_click")
+    dismiss_keys = ("switch_click", "scroll_tick", "camera_shutter")
 
     for o_i, ov in enumerate(tl.overlays):
         s0 = float(ov.timeline_start_sec)
         s1 = float(ov.timeline_end_sec)
         if not any(abs(s0 - ct) <= 0.40 for ct in conflict_times):
-            pref_in = "pop_click" if o_i % 2 == 0 else "mouse_click"
-            candidates.append((1, round(s0, 3), "overlay_entry", pref_in, -11.5))
+            pref_in = entry_keys[o_i % len(entry_keys)]
+            candidates.append((1, round(s0, 3), "overlay_entry", pref_in, -5.5))
         if s1 - s0 >= 2.4:
             mid_t = round(s0 + min(1.4, (s1 - s0) * 0.45), 3)
-            candidates.append((2, mid_t, "overlay_emphasis", "mouse_double_click", -12.5))
-        pref_out = "switch_click" if o_i % 2 == 0 else "camera_shutter"
-        candidates.append((1, round(max(0.5, s1 - 0.05), 3), "overlay_dismiss", pref_out, -12.0))
+            candidates.append((2, mid_t, "overlay_emphasis", "mouse_double_click", -6.5))
+        pref_out = dismiss_keys[o_i % len(dismiss_keys)]
+        candidates.append((1, round(max(0.5, s1 - 0.05), 3), "overlay_dismiss", pref_out, -6.5))
 
-    zoom_keys = ("camera_shutter", "mouse_click", "mechanical_click")
-    cut_keys = ("mechanical_click", "typewriter_key", "mouse_click")
-    cap_keys = ("typewriter_key", "pop_click", "mechanical_click")
+    zoom_keys = ("camera_shutter", "glitch_tick", "mechanical_click", "mouse_click")
+    cut_keys = ("mechanical_click", "creamy_key", "typewriter_key", "mouse_click", "mouse_double_click")
+    cap_keys = ("ui_tick", "scroll_tick", "bubble_pop", "creamy_key", "pop_click", "pluck_pop")
 
     for c_i, clip in enumerate(tl.clips):
         if c_i == 0 or clip.timeline_start_sec < 0.55:
             continue
         t_cut = round(float(clip.timeline_start_sec), 3)
         if clip.zoom_scale >= 1.03:
-            candidates.append((1, t_cut, "punch_zoom_cut", zoom_keys[c_i % len(zoom_keys)], -12.0))
+            candidates.append((1, t_cut, "punch_zoom_cut", zoom_keys[c_i % len(zoom_keys)], -5.5))
         elif fast_edit or clip.transition_in.type == "cut":
-            candidates.append((2, t_cut, "jump_cut", cut_keys[c_i % len(cut_keys)], -13.0))
+            candidates.append((2, t_cut, "jump_cut", cut_keys[c_i % len(cut_keys)], -6.5))
 
     for cap_i, cue in enumerate(tl.captions):
         t_cap = round(float(cue.start_sec), 3)
@@ -1023,7 +1052,7 @@ def add_click_sounds_to_timeline(
         txt = cue.text.strip()
         is_emph = bool(re.search(r"[?!%#]|\d+", txt)) or (fast_edit and (len(txt.split()) <= 2 or cap_i % 2 == 0))
         if is_emph:
-            candidates.append((3, t_cap, "caption_emphasis", cap_keys[cap_i % len(cap_keys)], -13.5))
+            candidates.append((3, t_cap, "caption_emphasis", cap_keys[cap_i % len(cap_keys)], -7.5))
 
     # Greedily select highest-priority non-overlapping clicks separated cleanly from existing SFX
     candidates.sort(key=lambda item: (item[0], item[1]))

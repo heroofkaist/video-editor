@@ -12,7 +12,12 @@ from symposium_studio.engines.analysis.probe import probe_media
 from symposium_studio.engines.analysis.transcribe import extract_raw_mono_wav
 from symposium_studio.engines.effects.library import EFFECTS_CATALOG
 from symposium_studio.engines.effects.sfx_synth import synthesize_ambient_bed, synthesize_sfx
-from symposium_studio.engines.effects.sound_downloader import DEFAULT_CLICK_SOUNDS, download_click_sounds
+from symposium_studio.engines.effects.sound_downloader import (
+    DEFAULT_ACCENT_SOUNDS,
+    DEFAULT_CLICK_SOUNDS,
+    download_accent_sounds,
+    download_click_sounds,
+)
 from symposium_studio.engines.production.captions import (
     align_captions_to_final_audio,
     validate_subtitle_integrity,
@@ -37,8 +42,10 @@ def ensure_project_sfx(effects_dir: Path, download_clicks: bool = False) -> dict
     if download_clicks:
         dl = download_click_sounds(effects_dir, allow_network=True)
         sfx_map.update(dl["click_paths"])
+        acc = download_accent_sounds(effects_dir, allow_network=True)
+        sfx_map.update(acc["accent_paths"])
     else:
-        for click_preset in DEFAULT_CLICK_SOUNDS:
+        for click_preset in (*DEFAULT_CLICK_SOUNDS.keys(), *DEFAULT_ACCENT_SOUNDS.keys()):
             cp = effects_dir / f"{click_preset}.wav"
             if cp.is_file():
                 sfx_map[click_preset] = str(cp.resolve())

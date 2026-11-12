@@ -15,61 +15,144 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from symposium_studio.engines.effects.sfx_synth import synthesize_sfx
 
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 USER_AGENT = "SymposiumStudio/0.2 (https://github.com/heroofkaist/video-editor; open-source-studio)"
+_SFX_NORM_VERSION = "norm_v2_peak08"
 
-# Curated CC0 / Public Domain click sounds hosted on Wikimedia Commons
+# Curated open-license (CC0 / MIT / Public Domain) punchy ADHD click/pop/key SFX
+# hosted on Kenney Audio (CC0), Glitch MMO Tiny Speck / Internet Archive (CC0),
+# and Keesound mechanical switches (MIT).
 DEFAULT_CLICK_SOUNDS: dict[str, dict[str, str]] = {
     "mouse_click": {
-        "title": "Computer Mouse Click",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/a/ac/Computer_Mouse_Click.wav",
-        "license": "CC0",
-        "search_query": "computer mouse click",
-        "description": "Crisp real computer mouse button click",
+        "title": "Kenney Crisp Mouse Click",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-ui-audio/master/addons/kenney_ui_audio/mouseclick1.wav",
+        "license": "CC0-1.0",
+        "search_query": "mouse click",
+        "description": "Ultra-crisp dry tactile mouse click",
     },
     "mouse_double_click": {
-        "title": "Computer Mouse Double Click",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/9/9f/Computer_mouse_double_click.ogg",
-        "license": "CC0",
-        "search_query": "computer mouse double click",
-        "description": "Snappy double mouse click accent",
+        "title": "Kenney Snappy Double Switch",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-ui-audio/master/addons/kenney_ui_audio/switch2.wav",
+        "license": "CC0-1.0",
+        "search_query": "mouse double click",
+        "description": "Fast double-impulse switch tap for mid-card beats",
     },
     "mechanical_click": {
-        "title": "Mechanical Switch Tack",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/5/56/Mechanical_tack.ogg",
-        "license": "Public domain",
-        "search_query": "mechanical tack",
-        "description": "Short tactile mechanical switch click",
+        "title": "Keesound Holy Panda Tactile Thock",
+        "url": "https://raw.githubusercontent.com/nirajrajgor/keesound/main/Samples/holy-panda/down/generic_1.wav",
+        "license": "MIT",
+        "search_query": "mechanical switch",
+        "description": "Punchy deep Holy Panda mechanical keycap thock",
     },
     "switch_click": {
-        "title": "UI Tactile Switch Click",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/8/8e/Clickick_switch.ogg",
-        "license": "Public domain",
+        "title": "Kenney Tactile UI Switch",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-ui-audio/master/addons/kenney_ui_audio/switch10.wav",
+        "license": "CC0-1.0",
         "search_query": "switch click",
-        "description": "Clean toggle switch click for card dismissals and cuts",
+        "description": "Snappy toggle switch click for card dismissals and cuts",
     },
     "camera_shutter": {
-        "title": "Holga Shutter Click",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/e/ec/Holga_shuttersound.ogg",
-        "license": "Public domain",
+        "title": "Glitch MMO Studio Camera Shutter",
+        "url": "https://archive.org/download/glitch-mmo-sfx-tiny-speck/camera%20shutter.mp3",
+        "license": "CC0-1.0",
         "search_query": "camera shutter",
-        "description": "Crisp mechanical shutter snap for zoom punch-ins and reveals",
+        "description": "Crisp DSLR shutter snap for zoom punch-ins and reveals",
     },
     "typewriter_key": {
-        "title": "Mechanical Typewriter Key Click",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/2/25/WWS_Typewriter.ogg",
-        "license": "CC BY 4.0",
-        "search_query": "typewriter key",
-        "description": "Rapid mechanical key tap for kinetic text & fast cuts",
+        "title": "Keesound Cherry MX Blue Key Click",
+        "url": "https://raw.githubusercontent.com/nirajrajgor/keesound/main/Samples/cherry-mx-blue/down/generic_1.wav",
+        "license": "MIT",
+        "search_query": "cherry mx click",
+        "description": "Single crisp Cherry MX Blue keystroke click for rapid cuts",
     },
     "pop_click": {
-        "title": "Short Broadcast 2-Pop Click",
-        "url": "https://upload.wikimedia.org/wikipedia/commons/8/8b/2-pop_1frame_of_1khz.ogg",
-        "license": "Public domain",
-        "search_query": "pop sound",
-        "description": "Short snappy UI pop accent for meme cards and callouts",
+        "title": "Kenney Clean UI Bubble Drop",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-interface-sounds/master/addons/kenney_interface_sounds/drop_001.wav",
+        "license": "CC0-1.0",
+        "search_query": "bubble pop",
+        "description": "Snappy CapCut-style UI pop accent for meme cards and callouts",
+    },
+    "bubble_pop": {
+        "title": "Kenney Rising Bubble Pop",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-interface-sounds/master/addons/kenney_interface_sounds/drop_003.wav",
+        "license": "CC0-1.0",
+        "search_query": "bubble pop",
+        "description": "Upward bouncy bubble pop for ADHD captions and reactions",
+    },
+    "scroll_tick": {
+        "title": "Glitch MMO Scroll Wheel Tick",
+        "url": "https://archive.org/download/glitch-mmo-sfx-tiny-speck/scroll%20clicking%202.mp3",
+        "license": "CC0-1.0",
+        "search_query": "scroll click",
+        "description": "Hyper-snappy mouse scroll ratchet tick for kinetic phrasing",
+    },
+    "ui_tick": {
+        "title": "Kenney Stopwatch UI Tick",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-interface-sounds/master/addons/kenney_interface_sounds/tick_001.wav",
+        "license": "CC0-1.0",
+        "search_query": "ui tick",
+        "description": "Tight digital UI tick for 2-word subtitle bursts",
+    },
+    "glitch_tick": {
+        "title": "Kenney Glitch Micro-Hit",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-interface-sounds/master/addons/kenney_interface_sounds/glitch_001.wav",
+        "license": "CC0-1.0",
+        "search_query": "glitch tick",
+        "description": "Sharp glitch transient for aggressive punch-zoom cuts",
+    },
+    "creamy_key": {
+        "title": "Keesound NK Cream Keycap Tap",
+        "url": "https://raw.githubusercontent.com/nirajrajgor/keesound/main/Samples/nk-cream/down/generic_1.wav",
+        "license": "MIT",
+        "search_query": "mechanical keyboard tap",
+        "description": "Creamy linear mechanical switch tap for rapid pacing",
+    },
+    "pluck_pop": {
+        "title": "Kenney Bouncy UI Pluck",
+        "url": "https://raw.githubusercontent.com/Calinou/kenney-interface-sounds/master/addons/kenney_interface_sounds/pluck_001.wav",
+        "license": "CC0-1.0",
+        "search_query": "pluck pop",
+        "description": "Tactile harmonic UI pluck for hook words and meme pops",
+    },
+}
+
+# Real open-license accent/meme/whoosh SFX that upgrade DSP fallbacks when network is enabled
+DEFAULT_ACCENT_SOUNDS: dict[str, dict[str, str]] = {
+    "vine_boom": {
+        "title": "Viral Meme Vine Boom",
+        "url": "https://raw.githubusercontent.com/Vamsiindugu/vine-boom-extension/main/sounds/vine-boom.mp3",
+        "license": "MIT",
+        "search_query": "vine boom",
+        "description": "Punchy viral bass boom impact for shock/meme beats",
+        "max_duration_sec": "1.30",
+    },
+    "ui_pop": {
+        "title": "Glitch MMO Cartoon Plop",
+        "url": "https://archive.org/download/glitch-mmo-sfx-tiny-speck/piggy%20plop.mp3",
+        "license": "CC0-1.0",
+        "search_query": "cartoon plop",
+        "description": "Squishy bubbly pop-in sound for overlays and reactions",
+        "max_duration_sec": "0.45",
+    },
+    "whoosh_transition": {
+        "title": "Glitch MMO Whip Shoop",
+        "url": "https://archive.org/download/glitch-mmo-sfx-tiny-speck/friend-exits%20%28shoop%29.mp3",
+        "license": "CC0-1.0",
+        "search_query": "whoosh swipe",
+        "description": "Snappy cartoon swipe/whoosh transition",
+        "max_duration_sec": "0.55",
+    },
+    "kaching_ding": {
+        "title": "Glitch MMO Ka-Ching Reward Bell",
+        "url": "https://archive.org/download/glitch-mmo-sfx-tiny-speck/buy%20kaching.mp3",
+        "license": "CC0-1.0",
+        "search_query": "kaching ding",
+        "description": "Bright jackpot cash-register chime for unboxing/reveal wins",
+        "max_duration_sec": "0.95",
     },
 }
 
@@ -157,57 +240,78 @@ def search_internet_clicks(
     return results
 
 
-def _normalize_audio_to_wav(raw_path: Path, out_wav: Path, trim_silence: bool = True, max_duration_sec: float = 0.75) -> float:
-    """Decode arbitrary audio file into 48kHz mono PCM WAV with trimmed leading silence and clean fade-out."""
+def _normalize_audio_to_wav(raw_path: Path, out_wav: Path, trim_silence: bool = True, max_duration_sec: float = 0.55) -> float:
+    """Decode audio file to 48kHz mono PCM WAV, strip dead air, peak-normalize to -0.8 dBFS."""
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    filters = []
-    if trim_silence:
-        filters.append("silenceremove=start_periods=1:start_silence=0.005:start_threshold=-42dB")
-    filters.extend(
-        [
-            "aresample=48000",
-            "loudnorm=I=-14:TP=-1.5:LRA=7",
+    dur_limit = f"{max(0.12, min(2.0, max_duration_sec)):.3f}"
+
+    def _run_decode(strip_silence: bool) -> np.ndarray:
+        filters: list[str] = []
+        if strip_silence:
+            filters.append(
+                "silenceremove=start_periods=1:start_silence=0.002:start_threshold=-45dB,"
+                "areverse,silenceremove=start_periods=1:start_silence=0.010:start_threshold=-48dB,areverse"
+            )
+        filters.append("aresample=48000")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(raw_path),
+            "-af",
+            ",".join(filters),
+            "-ac",
+            "1",
+            "-t",
+            dur_limit,
+            "-c:a",
+            "pcm_s16le",
+            str(out_wav),
         ]
-    )
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(raw_path),
-        "-af",
-        ",".join(filters),
-        "-ac",
-        "1",
-        "-t",
-        f"{max(0.12, min(2.0, max_duration_sec)):.3f}",
-        "-c:a",
-        "pcm_s16le",
-        str(out_wav),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    with wave.open(str(out_wav), "rb") as wf:
-        frames = wf.getnframes()
-        rate = wf.getframerate() or 48000
-        dur = frames / float(rate)
-    if frames < 240:
-        raise ValueError(f"Decoded SFX {out_wav} is empty ({frames} frames)")
-    return round(dur, 3)
+        subprocess.run(cmd, check=True, capture_output=True)
+        with wave.open(str(out_wav), "rb") as wf:
+            return np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+
+    pcm = _run_decode(trim_silence)
+    if trim_silence and len(pcm) < 240:
+        pcm = _run_decode(False)
+    if len(pcm) < 240:
+        raise ValueError(f"Decoded SFX {out_wav} is empty ({len(pcm)} frames)")
+
+    peak = float(np.max(np.abs(pcm)))
+    if peak > 1e-4:
+        # Peak-normalize to -0.8 dBFS so short 20-120ms transients punch through speech cleanly
+        pcm = pcm * (0.912 / peak)
+
+    fade_n = min(192, max(16, len(pcm) // 6))
+    if fade_n > 0 and len(pcm) > fade_n:
+        tail = np.linspace(1.0, 0.0, fade_n, dtype=np.float32)
+        pcm[-fade_n:] *= tail
+
+    out_pcm = (np.clip(pcm, -0.96, 0.96) * 32767.0).astype(np.int16)
+    with wave.open(str(out_wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(48000)
+        wf.writeframes(out_pcm.tobytes())
+    return round(len(out_pcm) / 48000.0, 3)
 
 
 def download_internet_sound(
     url: str,
     out_wav: Path,
     trim_silence: bool = True,
-    max_duration_sec: float = 0.75,
+    max_duration_sec: float = 0.55,
     cache_dir: Path | None = None,
     timeout_sec: float = 15.0,
 ) -> dict[str, Any]:
-    """Download an internet audio file (cached by URL hash) and convert it into 48kHz mono WAV."""
+    """Download an internet audio file (cached by URL + norm hash) and convert it into 48kHz mono WAV."""
     out_wav = Path(out_wav)
-    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    cache_key = f"{url}|{_SFX_NORM_VERSION}|{max_duration_sec:.2f}|{int(trim_silence)}"
+    url_hash = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
     resolved_cache = cache_dir if cache_dir is not None else default_sfx_cache_dir()
     resolved_cache.mkdir(parents=True, exist_ok=True)
     cached_wav = resolved_cache / f"net_{url_hash}.wav"
@@ -248,6 +352,104 @@ def download_internet_sound(
     }
 
 
+def _download_preset_map(
+    effects_dir: Path,
+    targets: dict[str, dict[str, str]],
+    *,
+    allow_network: bool = True,
+    cache_dir: Path | None = None,
+    fallback_duration_sec: float = 0.14,
+    merge_manifest: bool = False,
+) -> dict[str, Any]:
+    """Download a preset map into effects_dir with safe DSP fallback and provenance manifest."""
+    effects_dir = Path(effects_dir)
+    effects_dir.mkdir(parents=True, exist_ok=True)
+
+    paths: dict[str, str] = {}
+    sources: dict[str, dict[str, Any]] = {}
+    downloaded_count = 0
+    cached_count = 0
+    fallback_count = 0
+
+    for idx, (preset, meta) in enumerate(targets.items()):
+        out_wav = effects_dir / f"{preset}.wav"
+        max_dur = float(meta.get("max_duration_sec", 0.55))
+        if allow_network:
+            try:
+                if idx > 0 and cached_count == 0 and "wikimedia.org" in str(meta.get("url", "")):
+                    time.sleep(0.25)
+                info = download_internet_sound(
+                    meta["url"],
+                    out_wav,
+                    max_duration_sec=max_dur,
+                    cache_dir=cache_dir,
+                )
+                info["license"] = meta.get("license", "Unknown")
+                info["title"] = meta.get("title", preset)
+                if info["origin"] == "internet_download":
+                    downloaded_count += 1
+                else:
+                    cached_count += 1
+                paths[preset] = str(out_wav.resolve())
+                sources[preset] = info
+                continue
+            except Exception as exc:
+                err_msg = str(exc)
+        else:
+            err_msg = "network_disabled"
+
+        if not out_wav.exists() or out_wav.stat().st_size < 1000:
+            synth_key = (
+                preset
+                if preset in set(DEFAULT_CLICK_SOUNDS.keys()) | {"ui_pop", "vine_boom", "whoosh_transition", "kaching_ding"}
+                else "mouse_click"
+            )
+            synthesize_sfx(synth_key, out_wav, duration_sec=fallback_duration_sec)
+        fallback_count += 1
+        paths[preset] = str(out_wav.resolve())
+        sources[preset] = {
+            "path": str(out_wav.resolve()),
+            "source_url": meta.get("url"),
+            "title": meta.get("title", preset),
+            "license": meta.get("license", "Unknown"),
+            "origin": "synthesized_fallback",
+            "fallback_reason": err_msg,
+        }
+
+    manifest_path = effects_dir / "sfx_sources.json"
+    merged_sources = dict(sources)
+    if merge_manifest and manifest_path.is_file():
+        try:
+            prev = json.loads(manifest_path.read_text(encoding="utf-8"))
+            prev_sources = prev.get("sources") or {}
+            merged_sources = {**prev_sources, **sources}
+        except Exception:
+            merged_sources = dict(sources)
+
+    manifest_payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "downloaded_count": sum(1 for v in merged_sources.values() if v.get("origin") == "internet_download")
+        if merge_manifest
+        else downloaded_count,
+        "cached_count": sum(1 for v in merged_sources.values() if v.get("origin") == "cached_internet")
+        if merge_manifest
+        else cached_count,
+        "fallback_count": sum(1 for v in merged_sources.values() if v.get("origin") == "synthesized_fallback")
+        if merge_manifest
+        else fallback_count,
+        "sources": merged_sources,
+    }
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+    return {
+        "click_paths": paths,
+        "downloaded_count": downloaded_count,
+        "cached_count": cached_count,
+        "fallback_count": fallback_count,
+        "manifest_path": str(manifest_path),
+        "sources": sources,
+    }
+
+
 def download_click_sounds(
     effects_dir: Path,
     presets: list[str] | None = None,
@@ -257,9 +459,6 @@ def download_click_sounds(
     cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Download open-license click SFX from the internet into effects_dir with safe DSP fallback."""
-    effects_dir = Path(effects_dir)
-    effects_dir.mkdir(parents=True, exist_ok=True)
-
     targets: dict[str, dict[str, str]] = {}
     selected = presets or list(DEFAULT_CLICK_SOUNDS.keys())
     for preset in selected:
@@ -288,75 +487,32 @@ def download_click_sounds(
         except Exception:
             pass
 
-    click_paths: dict[str, str] = {}
-    sources: dict[str, dict[str, Any]] = {}
-    downloaded_count = 0
-    cached_count = 0
-    fallback_count = 0
+    return _download_preset_map(
+        effects_dir,
+        targets,
+        allow_network=allow_network,
+        cache_dir=cache_dir,
+        fallback_duration_sec=0.14,
+        merge_manifest=False,
+    )
 
-    for idx, (preset, meta) in enumerate(targets.items()):
-        out_wav = effects_dir / f"{preset}.wav"
-        if allow_network:
-            try:
-                if idx > 0 and cached_count == 0:
-                    time.sleep(0.35)
-                info = download_internet_sound(meta["url"], out_wav, cache_dir=cache_dir)
-                info["license"] = meta.get("license", "Unknown")
-                info["title"] = meta.get("title", preset)
-                if info["origin"] == "internet_download":
-                    downloaded_count += 1
-                else:
-                    cached_count += 1
-                click_paths[preset] = str(out_wav.resolve())
-                sources[preset] = info
-                continue
-            except Exception as exc:
-                err_msg = str(exc)
-        else:
-            err_msg = "network_disabled"
 
-        # Graceful fallback if network unavailable or preset download failed
-        if not out_wav.exists() or out_wav.stat().st_size < 1000:
-            synth_key = (
-                preset
-                if preset
-                in {
-                    "mouse_click",
-                    "mechanical_click",
-                    "switch_click",
-                    "ui_pop",
-                    "camera_shutter",
-                    "typewriter_key",
-                    "pop_click",
-                }
-                else "mouse_click"
-            )
-            synthesize_sfx(synth_key, out_wav, duration_sec=0.14)
-        fallback_count += 1
-        click_paths[preset] = str(out_wav.resolve())
-        sources[preset] = {
-            "path": str(out_wav.resolve()),
-            "source_url": meta.get("url"),
-            "title": meta.get("title", preset),
-            "license": meta.get("license", "Unknown"),
-            "origin": "synthesized_fallback",
-            "fallback_reason": err_msg,
-        }
-
-    manifest_path = effects_dir / "sfx_sources.json"
-    manifest_payload = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "downloaded_count": downloaded_count,
-        "cached_count": cached_count,
-        "fallback_count": fallback_count,
-        "sources": sources,
-    }
-    manifest_path.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
-    return {
-        "click_paths": click_paths,
-        "downloaded_count": downloaded_count,
-        "cached_count": cached_count,
-        "fallback_count": fallback_count,
-        "manifest_path": str(manifest_path),
-        "sources": sources,
-    }
+def download_accent_sounds(
+    effects_dir: Path,
+    presets: list[str] | None = None,
+    allow_network: bool = True,
+    cache_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Download open-license viral accent SFX (vine boom, cartoon plop, whoosh, ka-ching)."""
+    selected = presets or list(DEFAULT_ACCENT_SOUNDS.keys())
+    targets = {p: dict(DEFAULT_ACCENT_SOUNDS[p]) for p in selected if p in DEFAULT_ACCENT_SOUNDS}
+    res = _download_preset_map(
+        effects_dir,
+        targets,
+        allow_network=allow_network,
+        cache_dir=cache_dir,
+        fallback_duration_sec=0.55,
+        merge_manifest=True,
+    )
+    res["accent_paths"] = res["click_paths"]
+    return res

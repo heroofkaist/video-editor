@@ -24,7 +24,7 @@ from symposium_studio.engines.distribution import (
     execute_publish,
     generate_threads_posts,
 )
-from symposium_studio.engines.effects import download_click_sounds, search_effects
+from symposium_studio.engines.effects import download_accent_sounds, download_click_sounds, search_effects
 from symposium_studio.engines.growth import GrowthIntelligenceEngine
 from symposium_studio.engines.production import (
     add_click_sounds_to_timeline,
@@ -864,6 +864,8 @@ class SymposiumStudio:
             search_query=search_query,
             allow_network=allow_network,
         )
+        if allow_network:
+            download_accent_sounds(ws_dir / "effects", allow_network=True)
         click_paths = dl["click_paths"]
 
         tl_files = sorted((ws_dir / "timelines").glob("*_youtube.json"))

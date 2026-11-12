@@ -396,7 +396,7 @@ def test_internet_click_downloader_search_cache_and_fallback(tmp_path: Path, mon
         fetch_log.append(url)
         if "w/api.php" in url:
             return wiki_json
-        if "Mouse_Click" in url or "Search_Click" in url:
+        if any(tok in url.lower() for tok in ("mouse_click", "mouseclick", "search_click")):
             return raw_wav_bytes
         raise RuntimeError("simulated transient 429/network failure")
 
@@ -421,6 +421,11 @@ def test_internet_click_downloader_search_cache_and_fallback(tmp_path: Path, mon
     assert Path(dl1["click_paths"]["mouse_click"]).is_file()
     assert Path(dl1["click_paths"]["mechanical_click"]).is_file()
     assert Path(dl1["manifest_path"]).is_file()
+    import wave
+    import numpy as np
+    with wave.open(dl1["click_paths"]["mouse_click"], "rb") as wf:
+        pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+    assert float(np.max(np.abs(pcm))) >= 0.85
 
     # Second run against another effects_dir hits local internet cache without re-downloading mouse_click
     eff_dir2 = tmp_path / "proj2_effects"
@@ -853,7 +858,12 @@ def test_rotated_portrait_blur_pillar_phantom_cleanup_and_expanded_clicks(tmp_pa
     """Verify rotation-aware probe, portrait-in-16:9 blur stage render, phantom cleanup, and 7 click SFX presets."""
     from symposium_studio.engines.analysis.probe import probe_media
     from symposium_studio.engines.analysis.transcribe import audit_and_verify_transcript
-    from symposium_studio.engines.effects.sound_downloader import DEFAULT_CLICK_SOUNDS, download_click_sounds
+    from symposium_studio.engines.effects.sound_downloader import (
+        DEFAULT_ACCENT_SOUNDS,
+        DEFAULT_CLICK_SOUNDS,
+        download_accent_sounds,
+        download_click_sounds,
+    )
     from symposium_studio.engines.production.renderer import render_timeline
     from symposium_studio.engines.research.connectors import _derive_meme_reaction_queries
     from symposium_studio.models.symposium import Storyboard, StoryboardBeat
@@ -933,7 +943,19 @@ def test_rotated_portrait_blur_pillar_phantom_cleanup_and_expanded_clicks(tmp_pa
         check=True,
     )
     dl = download_click_sounds(tmp_path / "fx", presets=list(DEFAULT_CLICK_SOUNDS.keys()), allow_network=False)
-    assert {"camera_shutter", "typewriter_key", "pop_click"}.issubset(set(dl["click_paths"].keys()))
+    assert {
+        "camera_shutter",
+        "typewriter_key",
+        "pop_click",
+        "bubble_pop",
+        "scroll_tick",
+        "ui_tick",
+        "glitch_tick",
+        "creamy_key",
+        "pluck_pop",
+    }.issubset(set(dl["click_paths"].keys()))
+    acc = download_accent_sounds(tmp_path / "fx", presets=list(DEFAULT_ACCENT_SOUNDS.keys()), allow_network=False)
+    assert {"vine_boom", "ui_pop", "whoosh_transition", "kaching_ding"}.issubset(set(acc["accent_paths"].keys()))
 
     bundle = MediaAnalysisBundle(
         project_id="proj_port",

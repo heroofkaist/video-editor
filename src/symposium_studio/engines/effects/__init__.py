@@ -3,16 +3,20 @@
 from symposium_studio.engines.effects.library import EFFECTS_CATALOG, EffectPreset, search_effects
 from symposium_studio.engines.effects.sfx_synth import synthesize_ambient_bed, synthesize_sfx
 from symposium_studio.engines.effects.sound_downloader import (
+    DEFAULT_ACCENT_SOUNDS,
     DEFAULT_CLICK_SOUNDS,
+    download_accent_sounds,
     download_click_sounds,
     download_internet_sound,
     search_internet_clicks,
 )
 
 __all__ = [
+    "DEFAULT_ACCENT_SOUNDS",
     "DEFAULT_CLICK_SOUNDS",
     "EFFECTS_CATALOG",
     "EffectPreset",
+    "download_accent_sounds",
     "download_click_sounds",
     "download_internet_sound",
     "search_effects",
